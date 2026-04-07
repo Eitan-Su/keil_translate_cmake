@@ -1,0 +1,22 @@
+CMakeFiles/foc_esc.dir/D_/singlechip/AT32/f415/FOC_AT32F415/AT32_ESC/foc_lib/foc_math.c.obj: \
+ D:/singlechip/AT32/f415/FOC_AT32F415/AT32_ESC/foc_lib/foc_math.c \
+ D:/singlechip/AT32/f415/FOC_AT32F415/AT32_ESC/foc_lib/foc_math.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/lib/gcc/arm-none-eabi/13.3.1/include/stdint.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/stdint.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/machine/_default_types.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/sys/features.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/_newlib_version.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/sys/_intsup.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/sys/_stdint.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/math.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/sys/reent.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/_ansi.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/newlib.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/sys/config.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/machine/ieeefp.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/lib/gcc/arm-none-eabi/13.3.1/include/stddef.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/sys/cdefs.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/sys/_types.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/machine/_types.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/sys/lock.h \
+ D:/singlechip/gcc+gdb+openocd/tools/arm-gnu-toolchain-13.3.rel1-ming/arm-none-eabi/include/_ansi.h
