@@ -29,15 +29,24 @@ SUPPORTED_HOST_SYSTEMS = {
     "macos": "macOS",
 }
 
-SUPPORTED_DEBUGGERS = {
+SUPPORTED_DEBUG_PROBES = {
+    "default": "Auto",
+    "stlink": "ST-Link",
+    "jlink": "J-Link",
+}
+
+SUPPORTED_DEBUG_BACKENDS = {
     "default": "Default",
     "all": "All",
     "openocd": "OpenOCD",
-    "jlink": "J-Link",
+    "jlink": "J-Link GDB Server",
     "pyocd": "PyOCD",
     "keil": "Keil MDK",
     "none": "None",
 }
+
+# Backward-compatible alias for historical code and imports.
+SUPPORTED_DEBUGGERS = SUPPORTED_DEBUG_BACKENDS
 
 SUPPORTED_GENERATORS = {
     "windows": ["Ninja", "MinGW Makefiles", "NMake Makefiles", "Unix Makefiles"],
@@ -68,6 +77,8 @@ class GenerationOptions:
     generator: str = DEFAULT_GENERATOR_BY_HOST["windows"]
     host_os: str = "windows"
     debugger: str = "default"
+    debug_probe: str = "default"
+    debug_backend: str = "default"
     build_dir: Optional[str] = None
     export_vsc_settings: bool = False
 
@@ -80,9 +91,32 @@ class GenerationOptions:
         if host_os not in SUPPORTED_HOST_SYSTEMS:
             raise ValueError(f"Unsupported host OS: {self.host_os}")
 
-        debugger = (self.debugger or "default").strip().lower()
-        if debugger not in SUPPORTED_DEBUGGERS:
-            raise ValueError(f"Unsupported debugger: {self.debugger}")
+        debug_probe = (self.debug_probe or "default").strip().lower()
+        if debug_probe not in SUPPORTED_DEBUG_PROBES:
+            raise ValueError(f"Unsupported debug probe: {self.debug_probe}")
+
+        raw_backend_field = (self.debug_backend or "").strip().lower()
+        legacy_debugger = (self.debugger or "").strip().lower()
+        if raw_backend_field and raw_backend_field != "default":
+            backend_raw = raw_backend_field
+        else:
+            backend_raw = legacy_debugger or "default"
+
+        if (
+            raw_backend_field in {"", "default"}
+            and backend_raw == "stlink"
+            and debug_probe == "default"
+        ):
+            # Compatibility with historical value debugger=stlink.
+            debug_probe = "stlink"
+            backend_raw = "default"
+
+        if backend_raw not in SUPPORTED_DEBUG_BACKENDS:
+            raise ValueError(
+                f"Unsupported debug backend: {self.debug_backend or self.debugger}"
+            )
+        if debug_probe == "stlink" and backend_raw == "jlink":
+            raise ValueError("ST-Link probe is incompatible with J-Link backend.")
 
         generator = (self.generator or DEFAULT_GENERATOR_BY_HOST[host_os]).strip()
         if not generator:
@@ -96,7 +130,9 @@ class GenerationOptions:
             compiler=compiler,
             generator=generator,
             host_os=host_os,
-            debugger=debugger,
+            debugger=backend_raw,
+            debug_probe=debug_probe,
+            debug_backend=backend_raw,
             build_dir=build_dir,
             export_vsc_settings=bool(self.export_vsc_settings),
         )
@@ -744,6 +780,8 @@ class KeilProjectToCMake:
                 generator=generation_options.generator,
                 host_os=generation_options.host_os,
                 debugger=generation_options.debugger,
+                debug_probe=generation_options.debug_probe,
+                debug_backend=generation_options.debug_backend,
                 build_dir=generation_options.build_dir,
                 export_vsc_settings=True,
             )
@@ -955,28 +993,57 @@ class KeilProjectToCMake:
                 return candidate
         return None
 
+    @staticmethod
+    def _name_has_token(text: str, token: str) -> bool:
+        value = text.lower()
+        needle = token.lower()
+        if needle in value:
+            return True
+        compact_value = re.sub(r"[^a-z0-9]+", "", value)
+        compact_needle = re.sub(r"[^a-z0-9]+", "", needle)
+        return bool(compact_needle and compact_needle in compact_value)
+
+    def _openocd_interface_tokens(self, probe_name: str) -> List[str]:
+        probe = (probe_name or "").strip().lower()
+        if not probe or probe == "default":
+            return ["stlink", "st-link", "jlink", "j-link", "segger"]
+        if probe == "stlink":
+            return ["stlink", "st-link"]
+        if probe == "jlink":
+            return ["jlink", "j-link", "segger"]
+        return [probe]
+
     def _guess_openocd_config(self, interface_name: str) -> Optional[Path]:
         openocd_dir = self._find_openocd_dir()
         if openocd_dir is None:
             return None
 
-        candidates = sorted(openocd_dir.glob("*.cfg"))
+        candidates = sorted(openocd_dir.rglob("*.cfg"))
         if not candidates:
             return None
+
+        interface_tokens = self._openocd_interface_tokens(interface_name)
+        interface_matched = [
+            candidate
+            for candidate in candidates
+            if any(
+                self._name_has_token(candidate.as_posix(), token)
+                for token in interface_tokens
+            )
+        ]
+        search_pool = interface_matched or candidates
 
         cpu_token = self.cpu.lower().replace("-", "") if self.cpu else ""
         best_score = -1
         best_path: Optional[Path] = None
 
-        for candidate in candidates:
+        for candidate in search_pool:
             score = 0
-            stem = candidate.stem.lower()
-            if interface_name in stem:
-                score += 6
+            candidate_text = candidate.as_posix().lower()
             for token in self._device_tokens():
-                if token.lower() in stem:
+                if self._name_has_token(candidate_text, token):
                     score += 4
-            if cpu_token and cpu_token in stem:
+            if cpu_token and self._name_has_token(candidate_text, cpu_token):
                 score += 2
 
             if score > best_score:
@@ -984,8 +1051,6 @@ class KeilProjectToCMake:
                 best_path = candidate
 
         if best_path is None:
-            return None
-        if best_score <= 0 and len(candidates) > 1:
             return None
 
         return best_path
@@ -1012,19 +1077,88 @@ class KeilProjectToCMake:
             "armclang_suffix": "",
         }
 
-    def _selected_debuggers(self, options: GenerationOptions) -> List[str]:
-        if options.debugger in {"default", "all"}:
+    def _resolved_probe(self, options: GenerationOptions) -> str:
+        probe = (options.debug_probe or "default").strip().lower()
+        if probe != "default":
+            return probe
+        backend = (options.debug_backend or options.debugger or "default").strip().lower()
+        if backend == "jlink":
+            return "jlink"
+        return "stlink"
+
+    def _probe_display_name(self, probe: str) -> str:
+        return SUPPORTED_DEBUG_PROBES.get(probe, probe.upper())
+
+    def _resolve_openocd_probe_and_config(
+        self, options: GenerationOptions
+    ) -> tuple[str, Optional[Path]]:
+        probe = self._resolved_probe(options)
+        for token in self._openocd_interface_tokens(probe):
+            openocd_cfg = self._guess_openocd_config(token)
+            if openocd_cfg is not None:
+                return probe, openocd_cfg
+        return probe, self._guess_openocd_config(probe)
+
+    def _default_openocd_interface_script(self, probe: str) -> str:
+        if probe == "jlink":
+            return "interface/jlink.cfg"
+        return "interface/stlink.cfg"
+
+    def _default_openocd_target_script(self) -> str:
+        clean_device = self._clean_device_name().upper()
+        vendor = (self.vendor or "").upper()
+
+        if "ARTERY" in vendor or clean_device.startswith("AT32"):
+            return "target/artery/at32f4x.cfg"
+        if clean_device.startswith("STM32F0"):
+            return "target/stm32f0x.cfg"
+        if clean_device.startswith("STM32F1"):
+            return "target/stm32f1x.cfg"
+        if clean_device.startswith("STM32F3"):
+            return "target/stm32f3x.cfg"
+        if clean_device.startswith("STM32F4"):
+            return "target/stm32f4x.cfg"
+        if clean_device.startswith("STM32G0"):
+            return "target/stm32g0x.cfg"
+        return "target/stm32f4x.cfg"
+
+    def _resolve_openocd_config_arguments(
+        self, output_path: Path, options: GenerationOptions
+    ) -> tuple[str, List[str]]:
+        probe, openocd_cfg = self._resolve_openocd_probe_and_config(options)
+        probe_label = self._probe_display_name(probe)
+        if openocd_cfg is not None:
+            return probe_label, [self._relative_workspace_path(openocd_cfg, output_path)]
+        return probe_label, [
+            self._default_openocd_interface_script(probe),
+            self._default_openocd_target_script(),
+        ]
+
+    @staticmethod
+    def _openocd_file_args(config_files: List[str]) -> List[str]:
+        args: List[str] = []
+        for config_file in config_files:
+            args.extend(["-f", config_file])
+        return args
+
+    def _selected_debug_backends(self, options: GenerationOptions) -> List[str]:
+        debug_backend = (options.debug_backend or options.debugger or "default").strip().lower()
+        if debug_backend in {"default", "all"}:
             if options.compiler == "gcc":
                 debuggers = ["openocd", "jlink"]
             else:
                 debuggers = ["keil", "pyocd", "jlink"]
-        elif options.debugger == "none":
+        elif debug_backend == "none":
             debuggers = []
         else:
-            debuggers = [options.debugger]
+            debuggers = [debug_backend]
 
         if options.host_os != "windows":
             debuggers = [debugger for debugger in debuggers if debugger != "keil"]
+
+        selected_probe = (options.debug_probe or "default").strip().lower()
+        if selected_probe == "stlink":
+            debuggers = [debugger for debugger in debuggers if debugger != "jlink"]
 
         return self._dedupe_keep_order(debuggers)
 
@@ -1201,6 +1335,8 @@ class KeilProjectToCMake:
         settings: Dict[str, Any] = {
             "cmake.generator": options.generator,
             "cmake.buildDirectory": f"${{workspaceFolder}}/{options.build_dir}",
+            "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json",
+            "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
         }
 
         env = self._vscode_env(options)
@@ -1210,14 +1346,27 @@ class KeilProjectToCMake:
         return settings
 
     def _build_vscode_c_cpp_properties(
-        self, options: GenerationOptions
+        self, output_path: Path, options: GenerationOptions
     ) -> Dict[str, Any]:
+        include_path: List[str] = ["${workspaceFolder}"]
+        for include_dir in sorted(self.include_paths):
+            include_path.append(
+                f"${{workspaceFolder}}/{self._normalize_path(include_dir, str(output_path))}"
+            )
+
         return {
             "configurations": [
                 {
                     "name": SUPPORTED_HOST_SYSTEMS[options.host_os],
-                    "compileCommands": f"${{workspaceFolder}}/{options.build_dir}/compile_commands.json",
-                    "configurationProvider": "ms-vscode.cmake-tools",
+                    "compilerPath": "arm-none-eabi-gcc"
+                    if options.compiler == "gcc"
+                    else "armclang",
+                    "compileCommands": "${workspaceFolder}/compile_commands.json",
+                    "includePath": include_path,
+                    "browse": {
+                        "path": include_path,
+                        "limitSymbolsToIncludedHeaders": False,
+                    },
                 }
             ],
             "version": 4,
@@ -1233,7 +1382,7 @@ class KeilProjectToCMake:
         return self.cpu or self._clean_device_name() or "Cortex-M4"
 
     def _write_jlink_scripts(self, output_path: Path, options: GenerationOptions) -> None:
-        if options.compiler != "gcc" or "jlink" not in self._selected_debuggers(options):
+        if options.compiler != "gcc" or "jlink" not in self._selected_debug_backends(options):
             return
 
         vsc_dir = output_path / ".vscode"
@@ -1276,15 +1425,19 @@ class KeilProjectToCMake:
         if task_options:
             configure_task["options"] = task_options
 
+        build_args: List[str] = [
+            "--build",
+            f"${{workspaceFolder}}/{options.build_dir}",
+        ]
+        if options.compiler == "gcc":
+            build_args.extend(["--target", f"{self.target_name}_artifacts"])
+        build_args.append("--parallel")
+
         build_task: Dict[str, Any] = {
             "label": build_label,
             "type": "shell",
             "command": commands["cmake"],
-            "args": [
-                "--build",
-                f"${{workspaceFolder}}/{options.build_dir}",
-                "--parallel",
-            ],
+            "args": build_args,
             "dependsOn": configure_label,
             "group": {"kind": "build", "isDefault": True},
             "problemMatcher": [],
@@ -1312,20 +1465,21 @@ class KeilProjectToCMake:
             rebuild_task["options"] = task_options
         tasks.append(rebuild_task)
 
-        debuggers = self._selected_debuggers(options)
+        debuggers = self._selected_debug_backends(options)
         if options.compiler == "gcc":
-            openocd_cfg = self._guess_openocd_config("stlink")
-            if openocd_cfg is not None and "openocd" in debuggers:
-                openocd_rel = self._relative_workspace_path(openocd_cfg, output_path)
+            if "openocd" in debuggers:
+                openocd_probe_label, openocd_configs = self._resolve_openocd_config_arguments(
+                    output_path, options
+                )
+                openocd_file_args = self._openocd_file_args(openocd_configs)
                 tasks.extend(
                     [
                         {
-                            "label": "Flash ST-Link ELF",
+                            "label": f"Flash {openocd_probe_label} ELF",
                             "type": "shell",
                             "command": commands["openocd"],
-                            "args": [
-                                "-f",
-                                openocd_rel,
+                            "args": openocd_file_args
+                            + [
                                 "-c",
                                 f"program {{{self._artifact_path(options, '.elf')}}} verify reset exit",
                             ],
@@ -1333,12 +1487,11 @@ class KeilProjectToCMake:
                             "problemMatcher": [],
                         },
                         {
-                            "label": "Flash ST-Link HEX",
+                            "label": f"Flash {openocd_probe_label} HEX",
                             "type": "shell",
                             "command": commands["openocd"],
-                            "args": [
-                                "-f",
-                                openocd_rel,
+                            "args": openocd_file_args
+                            + [
                                 "-c",
                                 f"program {{{self._artifact_path(options, '.hex')}}} verify reset exit",
                             ],
@@ -1346,12 +1499,11 @@ class KeilProjectToCMake:
                             "problemMatcher": [],
                         },
                         {
-                            "label": "Flash ST-Link BIN",
+                            "label": f"Flash {openocd_probe_label} BIN",
                             "type": "shell",
                             "command": commands["openocd"],
-                            "args": [
-                                "-f",
-                                openocd_rel,
+                            "args": openocd_file_args
+                            + [
                                 "-c",
                                 f"program {{{self._artifact_path(options, '.bin')}}} 0x08000000 verify reset exit",
                             ],
@@ -1359,10 +1511,10 @@ class KeilProjectToCMake:
                             "problemMatcher": [],
                         },
                         {
-                            "label": "Start ST-Link OpenOCD GDB Server",
+                            "label": f"Start {openocd_probe_label} OpenOCD GDB Server",
                             "type": "shell",
                             "command": commands["openocd"],
-                            "args": ["-f", openocd_rel],
+                            "args": openocd_file_args,
                             "dependsOn": build_label,
                             "isBackground": True,
                             "presentation": {
@@ -1421,9 +1573,47 @@ class KeilProjectToCMake:
                             "dependsOn": build_label,
                             "presentation": presentation,
                             "problemMatcher": [],
-                        }
-                    )
+                            }
+                        )
         else:
+            if "openocd" in debuggers:
+                openocd_probe_label, openocd_configs = self._resolve_openocd_config_arguments(
+                    output_path, options
+                )
+                openocd_file_args = self._openocd_file_args(openocd_configs)
+                tasks.append(
+                    {
+                        "label": f"Start {openocd_probe_label} OpenOCD GDB Server",
+                        "type": "shell",
+                        "command": commands["openocd"],
+                        "args": openocd_file_args,
+                        "dependsOn": build_label,
+                        "isBackground": True,
+                        "presentation": {
+                            "echo": True,
+                            "reveal": "always",
+                            "panel": "dedicated",
+                            "focus": False,
+                        },
+                        "problemMatcher": {
+                            "owner": "openocd",
+                            "pattern": [
+                                {
+                                    "regexp": ".",
+                                    "file": 0,
+                                    "location": 0,
+                                    "message": 0,
+                                }
+                            ],
+                            "background": {
+                                "activeOnStart": True,
+                                "beginsPattern": ".*",
+                                "endsPattern": ".*Listening on port 3333 for gdb connections.*",
+                            },
+                        },
+                    }
+                )
+
             if "keil" in debuggers and options.host_os == "windows":
                 mdk_info = self.mdk_info or {}
                 uv4_exe = mdk_info.get(
@@ -1463,37 +1653,56 @@ class KeilProjectToCMake:
         clean_device = self._clean_device_name()
         jlink_device = clean_device or self._jlink_flash_device()
         launch_configs: List[Dict[str, Any]] = []
-        debuggers = self._selected_debuggers(options)
+        debuggers = self._selected_debug_backends(options)
 
-        if options.compiler == "gcc":
-            openocd_cfg = self._guess_openocd_config("stlink")
-            if openocd_cfg is not None and "openocd" in debuggers:
+        if "openocd" in debuggers:
+            openocd_probe_label, openocd_configs = self._resolve_openocd_config_arguments(
+                output_path, options
+            )
+            launch_configs.append(
+                {
+                    "name": f"{jlink_device or self.target_name} / {openocd_probe_label} / OpenOCD",
+                    "cwd": "${workspaceFolder}",
+                    "type": "cortex-debug",
+                    "request": "launch",
+                    "servertype": "openocd",
+                    "serverpath": commands["openocd"],
+                    "gdbPath": "arm-none-eabi-gdb",
+                    "executable": executable_path,
+                    "configFiles": openocd_configs,
+                    "runToEntryPoint": "main",
+                    "preLaunchTask": build_label,
+                }
+            )
+
+        if "jlink" in debuggers:
+            launch_configs.append(
+                {
+                    "name": f"{jlink_device or self.target_name} / J-Link / GDB Server",
+                    "cwd": "${workspaceFolder}",
+                    "type": "cortex-debug",
+                    "request": "launch",
+                    "servertype": "jlink",
+                    "serverpath": commands["jlink_gdb_server"],
+                    "device": jlink_device or self._jlink_flash_device(),
+                    "interface": "swd",
+                    "gdbPath": "arm-none-eabi-gdb",
+                    "executable": executable_path,
+                    "runToEntryPoint": "main",
+                    "preLaunchTask": build_label,
+                }
+            )
+
+            if clean_device and self.cpu and clean_device != self.cpu:
                 launch_configs.append(
                     {
-                        "name": f"{jlink_device or self.target_name} / ST-Link / OpenOCD",
-                        "cwd": "${workspaceFolder}",
-                        "type": "cortex-debug",
-                        "request": "launch",
-                        "servertype": "openocd",
-                        "serverpath": commands["openocd"],
-                        "gdbPath": "arm-none-eabi-gdb",
-                        "executable": executable_path,
-                        "configFiles": [self._relative_workspace_path(openocd_cfg, output_path)],
-                        "runToEntryPoint": "main",
-                        "preLaunchTask": build_label,
-                    }
-                )
-
-            if "jlink" in debuggers:
-                launch_configs.append(
-                    {
-                        "name": f"{jlink_device or self.target_name} / J-Link / GDB Server",
+                        "name": f"{self.cpu} / J-Link / Fallback",
                         "cwd": "${workspaceFolder}",
                         "type": "cortex-debug",
                         "request": "launch",
                         "servertype": "jlink",
                         "serverpath": commands["jlink_gdb_server"],
-                        "device": jlink_device or self._jlink_flash_device(),
+                        "device": self.cpu,
                         "interface": "swd",
                         "gdbPath": "arm-none-eabi-gdb",
                         "executable": executable_path,
@@ -1502,57 +1711,21 @@ class KeilProjectToCMake:
                     }
                 )
 
-                if clean_device and self.cpu and clean_device != self.cpu:
-                    launch_configs.append(
-                        {
-                            "name": f"{self.cpu} / J-Link / Fallback",
-                            "cwd": "${workspaceFolder}",
-                            "type": "cortex-debug",
-                            "request": "launch",
-                            "servertype": "jlink",
-                            "serverpath": commands["jlink_gdb_server"],
-                            "device": self.cpu,
-                            "interface": "swd",
-                            "gdbPath": "arm-none-eabi-gdb",
-                            "executable": executable_path,
-                            "runToEntryPoint": "main",
-                            "preLaunchTask": build_label,
-                        }
-                    )
-        else:
-            if "pyocd" in debuggers:
-                launch_configs.append(
-                    {
-                        "name": "Debug with PyOCD",
-                        "cwd": "${workspaceFolder}",
-                        "type": "cortex-debug",
-                        "request": "launch",
-                        "servertype": "pyocd",
-                        "gdbPath": "arm-none-eabi-gdb",
-                        "executable": executable_path,
-                        "runToEntryPoint": "main",
-                        "showDevDebugOutput": "none",
-                        "preLaunchTask": build_label,
-                    }
-                )
-
-            if "jlink" in debuggers:
-                launch_configs.append(
-                    {
-                        "name": "Cortex Debug",
-                        "cwd": "${workspaceFolder}",
-                        "type": "cortex-debug",
-                        "request": "launch",
-                        "servertype": "jlink",
-                        "serverpath": commands["jlink_gdb_server"],
-                        "device": jlink_device or self._jlink_flash_device(),
-                        "interface": "swd",
-                        "gdbPath": "arm-none-eabi-gdb",
-                        "executable": executable_path,
-                        "runToEntryPoint": "main",
-                        "preLaunchTask": build_label,
-                    }
-                )
+        if "pyocd" in debuggers:
+            launch_configs.append(
+                {
+                    "name": "Debug with PyOCD",
+                    "cwd": "${workspaceFolder}",
+                    "type": "cortex-debug",
+                    "request": "launch",
+                    "servertype": "pyocd",
+                    "gdbPath": "arm-none-eabi-gdb",
+                    "executable": executable_path,
+                    "runToEntryPoint": "main",
+                    "showDevDebugOutput": "none",
+                    "preLaunchTask": build_label,
+                }
+            )
 
         return {"version": "0.2.0", "configurations": launch_configs}
 
@@ -1762,6 +1935,15 @@ class KeilProjectToCMake:
     DEPENDS ${{HEX_FILE}} ${{BIN_FILE}} ${{ARTIFACT_STAMP}}
 )\n"""
         )
+        f.write(
+            """add_custom_target(copy_compile_commands
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_BINARY_DIR}/compile_commands.json"
+            "${CMAKE_SOURCE_DIR}/compile_commands.json"
+    VERBATIM
+)\n"""
+        )
+        f.write(f"add_dependencies({self.target_name}_artifacts copy_compile_commands)\n")
 
     def _write_cmake_content_with_options(
         self, f: TextIOWrapper, dest: str, options: GenerationOptions
@@ -1796,7 +1978,9 @@ class KeilProjectToCMake:
                     "settings.json": self._build_vscode_settings(options),
                     "tasks.json": self._build_vscode_tasks(output_path, options),
                     "launch.json": self._build_vscode_launch(output_path, options),
-                    "c_cpp_properties.json": self._build_vscode_c_cpp_properties(options),
+                    "c_cpp_properties.json": self._build_vscode_c_cpp_properties(
+                        output_path, options
+                    ),
                 }.items():
                     with open(vsc_dir / file_name, "w", encoding="utf-8") as f:
                         json.dump(content, f, indent=4, ensure_ascii=False)
@@ -1864,6 +2048,8 @@ def main(
     host_os: str = "windows",
     debugger: str = "default",
     build_dir: Optional[str] = None,
+    debug_probe: str = "default",
+    debug_backend: str = "default",
 ):
     if verbose:
         print(f"Keil 项目文件: {filepath}")
@@ -1881,6 +2067,8 @@ def main(
         generator=generator or DEFAULT_GENERATOR_BY_HOST.get(host_os, "Ninja"),
         host_os=host_os,
         debugger=debugger,
+        debug_probe=debug_probe,
+        debug_backend=debug_backend,
         build_dir=build_dir,
         export_vsc_settings=export_vsc_settings,
     )
@@ -1937,7 +2125,19 @@ if __name__ == "__main__":
         "--debugger",
         choices=sorted(SUPPORTED_DEBUGGERS.keys()),
         default="default",
-        help="调试/烧录后端配置",
+        help="调试后端配置（兼容旧参数）",
+    )
+    parser.add_argument(
+        "--debug-probe",
+        choices=sorted(SUPPORTED_DEBUG_PROBES.keys()),
+        default="default",
+        help="硬件探针选项",
+    )
+    parser.add_argument(
+        "--debug-backend",
+        choices=sorted(SUPPORTED_DEBUG_BACKENDS.keys()),
+        default=None,
+        help="调试后端选项",
     )
     parser.add_argument(
         "--build-dir",
@@ -1974,6 +2174,7 @@ if __name__ == "__main__":
     generator = args.generator or DEFAULT_GENERATOR_BY_HOST[args.host_os]
     if generator not in get_supported_generators(args.host_os) and args.verbose:
         print(f'使用自定义 Generator: "{generator}"')
+    debug_backend = args.debug_backend or args.debugger
 
     main(
         args.path,
@@ -1986,4 +2187,6 @@ if __name__ == "__main__":
         args.host_os,
         args.debugger,
         args.build_dir,
+        args.debug_probe,
+        debug_backend,
     )

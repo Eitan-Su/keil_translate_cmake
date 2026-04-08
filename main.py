@@ -26,7 +26,8 @@ from keil_to_cmake import (
     GenerationOptions,
     KeilProjectToCMake,
     SUPPORTED_COMPILERS,
-    SUPPORTED_DEBUGGERS,
+    SUPPORTED_DEBUG_BACKENDS,
+    SUPPORTED_DEBUG_PROBES,
     SUPPORTED_HOST_SYSTEMS,
     get_supported_generators,
 )
@@ -56,6 +57,7 @@ class Widget(QWidget):
         label_compiler = QLabel("编译器:")
         label_host = QLabel("宿主系统:")
         label_generator = QLabel("Generator:")
+        label_probe = QLabel("硬件探针:")
         label_debugger = QLabel("调试后端:")
         label_build_dir = QLabel("构建目录:")
         label_info = QLabel("当前配置:")
@@ -77,9 +79,14 @@ class Widget(QWidget):
         self.comboGenerator = QComboBox()
         self.comboGenerator.setEditable(True)
 
+        self.comboDebugProbe = QComboBox()
+        for key, label in SUPPORTED_DEBUG_PROBES.items():
+            self.comboDebugProbe.addItem(label, key)
+
         self.comboDebugger = QComboBox()
-        for key, label in SUPPORTED_DEBUGGERS.items():
+        for key, label in SUPPORTED_DEBUG_BACKENDS.items():
             self.comboDebugger.addItem(label, key)
+        self._sync_debug_backend_options()
 
         self.checkboxExportVSCode = QCheckBox("生成 VS Code 配置")
 
@@ -116,6 +123,8 @@ class Widget(QWidget):
         layout_profile_2 = QHBoxLayout()
         layout_profile_2.addWidget(label_generator)
         layout_profile_2.addWidget(self.comboGenerator)
+        layout_profile_2.addWidget(label_probe)
+        layout_profile_2.addWidget(self.comboDebugProbe)
         layout_profile_2.addWidget(label_debugger)
         layout_profile_2.addWidget(self.comboDebugger)
         layout_profile_2.addWidget(label_build_dir)
@@ -157,11 +166,31 @@ class Widget(QWidget):
         self.pushbuttonConvert.clicked.connect(self.on_pushbuttonConvert_clicked)
         self.comboHostOs.currentIndexChanged.connect(self.on_host_os_changed)
         self.comboCompiler.currentIndexChanged.connect(self.on_compiler_changed)
+        self.comboDebugProbe.currentIndexChanged.connect(self.on_debug_probe_changed)
+        self.comboDebugger.currentIndexChanged.connect(self.refresh_original_info)
 
     def _set_combo_data(self, combo: QComboBox, value: str):
         index = combo.findData(value)
         if index >= 0:
             combo.setCurrentIndex(index)
+
+    def _sync_debug_backend_options(self):
+        probe = self.comboDebugProbe.currentData() or "default"
+        current_backend = self.comboDebugger.currentData() or "default"
+        if probe == "stlink" and current_backend == "jlink":
+            current_backend = "default"
+
+        self.comboDebugger.blockSignals(True)
+        self.comboDebugger.clear()
+        for key, label in SUPPORTED_DEBUG_BACKENDS.items():
+            if probe == "stlink" and key == "jlink":
+                continue
+            self.comboDebugger.addItem(label, key)
+
+        self._set_combo_data(self.comboDebugger, current_backend)
+        if self.comboDebugger.currentIndex() < 0:
+            self._set_combo_data(self.comboDebugger, "default")
+        self.comboDebugger.blockSignals(False)
 
     def _update_generator_options(self, preferred: str = ""):
         preferred = preferred or self.comboGenerator.currentText().strip()
@@ -206,6 +235,8 @@ class Widget(QWidget):
             or DEFAULT_GENERATOR_BY_HOST.get(self.comboHostOs.currentData(), "Ninja"),
             host_os=self.comboHostOs.currentData() or "windows",
             debugger=self.comboDebugger.currentData() or "default",
+            debug_probe=self.comboDebugProbe.currentData() or "default",
+            debug_backend=self.comboDebugger.currentData() or "default",
             build_dir=self.lineeditBuildDir.text().strip() or None,
             export_vsc_settings=self.checkboxExportVSCode.isChecked(),
         ).normalized()
@@ -224,6 +255,10 @@ class Widget(QWidget):
             settings.value("generator", DEFAULT_GENERATOR_BY_HOST.get(host_os, "Ninja"))
         )
         debugger = str(settings.value("debugger", "default"))
+        debug_probe = str(settings.value("debug_probe", "default"))
+        debug_backend = str(settings.value("debug_backend", ""))
+        if not debug_backend:
+            debug_backend = debugger or "default"
         build_dir = str(settings.value("build_dir", ""))
         export_vsc = str(settings.value("export_vsc_settings", "true")).lower() in {
             "1",
@@ -240,7 +275,9 @@ class Widget(QWidget):
         self._set_combo_data(self.comboCompiler, compiler)
         self._set_combo_data(self.comboHostOs, host_os)
         self._update_generator_options(generator)
-        self._set_combo_data(self.comboDebugger, debugger)
+        self._set_combo_data(self.comboDebugProbe, debug_probe)
+        self._sync_debug_backend_options()
+        self._set_combo_data(self.comboDebugger, debug_backend)
         self.refresh_original_info()
 
     def save_config(self):
@@ -254,6 +291,8 @@ class Widget(QWidget):
         settings.setValue("host_os", self.comboHostOs.currentData())
         settings.setValue("generator", self.comboGenerator.currentText().strip())
         settings.setValue("debugger", self.comboDebugger.currentData())
+        settings.setValue("debug_probe", self.comboDebugProbe.currentData())
+        settings.setValue("debug_backend", self.comboDebugger.currentData())
         settings.setValue("build_dir", self.lineeditBuildDir.text().strip())
         settings.setValue(
             "export_vsc_settings", "true" if self.checkboxExportVSCode.isChecked() else "false"
@@ -269,6 +308,7 @@ class Widget(QWidget):
             ("编译器", self.comboCompiler.currentText()),
             ("Generator", self.comboGenerator.currentText().strip()),
             ("宿主系统", self.comboHostOs.currentText()),
+            ("硬件探针", self.comboDebugProbe.currentText()),
             ("调试后端", self.comboDebugger.currentText()),
             ("构建目录", self.lineeditBuildDir.text().strip() or "(默认)"),
             ("VS Code", "启用" if self.checkboxExportVSCode.isChecked() else "关闭"),
@@ -282,6 +322,10 @@ class Widget(QWidget):
 
     def on_host_os_changed(self):
         self._update_generator_options()
+        self.refresh_original_info()
+
+    def on_debug_probe_changed(self):
+        self._sync_debug_backend_options()
         self.refresh_original_info()
 
     def on_compiler_changed(self):
@@ -385,7 +429,12 @@ class Widget(QWidget):
             return
 
         self.show_message(
-            f"转换完成: compiler={options.compiler}, generator={options.generator}, host={options.host_os}, debugger={options.debugger}"
+            "转换完成: "
+            f"compiler={options.compiler}, "
+            f"generator={options.generator}, "
+            f"host={options.host_os}, "
+            f"probe={options.debug_probe}, "
+            f"backend={options.debug_backend}"
         )
 
         if (
