@@ -177,13 +177,13 @@ class Widget(QWidget):
     def _sync_debug_backend_options(self):
         probe = self.comboDebugProbe.currentData() or "default"
         current_backend = self.comboDebugger.currentData() or "default"
-        if probe == "stlink" and current_backend == "jlink":
+        if probe not in {"default", "all", "jlink"} and current_backend == "jlink":
             current_backend = "default"
 
         self.comboDebugger.blockSignals(True)
         self.comboDebugger.clear()
         for key, label in SUPPORTED_DEBUG_BACKENDS.items():
-            if probe == "stlink" and key == "jlink":
+            if probe not in {"default", "all", "jlink"} and key == "jlink":
                 continue
             self.comboDebugger.addItem(label, key)
 

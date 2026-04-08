@@ -31,8 +31,12 @@ SUPPORTED_HOST_SYSTEMS = {
 
 SUPPORTED_DEBUG_PROBES = {
     "default": "Auto",
+    "all": "All",
     "stlink": "ST-Link",
     "jlink": "J-Link",
+    "daplink": "DAPLink",
+    "nulink": "Nu-Link",
+    "ulink": "ULINK",
 }
 
 SUPPORTED_DEBUG_BACKENDS = {
@@ -115,8 +119,10 @@ class GenerationOptions:
             raise ValueError(
                 f"Unsupported debug backend: {self.debug_backend or self.debugger}"
             )
-        if debug_probe == "stlink" and backend_raw == "jlink":
-            raise ValueError("ST-Link probe is incompatible with J-Link backend.")
+        if backend_raw == "jlink" and debug_probe not in {"default", "all", "jlink"}:
+            raise ValueError(
+                f"Probe '{debug_probe}' is incompatible with J-Link backend."
+            )
 
         generator = (self.generator or DEFAULT_GENERATOR_BY_HOST[host_os]).strip()
         if not generator:
@@ -1006,11 +1012,30 @@ class KeilProjectToCMake:
     def _openocd_interface_tokens(self, probe_name: str) -> List[str]:
         probe = (probe_name or "").strip().lower()
         if not probe or probe == "default":
-            return ["stlink", "st-link", "jlink", "j-link", "segger"]
+            return ["stlink", "st-link"]
+        if probe == "all":
+            return [
+                "stlink",
+                "st-link",
+                "jlink",
+                "j-link",
+                "segger",
+                "daplink",
+                "cmsis-dap",
+                "nulink",
+                "nu-link",
+                "ulink",
+            ]
         if probe == "stlink":
             return ["stlink", "st-link"]
         if probe == "jlink":
             return ["jlink", "j-link", "segger"]
+        if probe == "daplink":
+            return ["daplink", "cmsis-dap", "cmsis_dap", "cmsisdap"]
+        if probe == "nulink":
+            return ["nulink", "nu-link", "nu_link"]
+        if probe == "ulink":
+            return ["ulink", "cmsis-dap", "cmsis_dap"]
         return [probe]
 
     def _guess_openocd_config(self, interface_name: str) -> Optional[Path]:
@@ -1089,10 +1114,27 @@ class KeilProjectToCMake:
     def _probe_display_name(self, probe: str) -> str:
         return SUPPORTED_DEBUG_PROBES.get(probe, probe.upper())
 
+    def _selected_probes(self, options: GenerationOptions) -> List[str]:
+        probe = (options.debug_probe or "default").strip().lower()
+        if probe == "all":
+            return ["stlink", "jlink", "daplink", "nulink", "ulink"]
+        if probe == "default":
+            return [self._resolved_probe(options)]
+        return [probe]
+
+    @staticmethod
+    def _probe_supports_backend(probe: str, backend: str) -> bool:
+        if backend == "jlink":
+            return probe == "jlink"
+        if backend == "openocd":
+            return probe in {"stlink", "jlink", "daplink", "nulink", "ulink"}
+        if backend == "pyocd":
+            return probe in {"daplink", "ulink"}
+        return True
+
     def _resolve_openocd_probe_and_config(
-        self, options: GenerationOptions
+        self, probe: str
     ) -> tuple[str, Optional[Path]]:
-        probe = self._resolved_probe(options)
         for token in self._openocd_interface_tokens(probe):
             openocd_cfg = self._guess_openocd_config(token)
             if openocd_cfg is not None:
@@ -1102,6 +1144,10 @@ class KeilProjectToCMake:
     def _default_openocd_interface_script(self, probe: str) -> str:
         if probe == "jlink":
             return "interface/jlink.cfg"
+        if probe in {"daplink", "ulink"}:
+            return "interface/cmsis-dap.cfg"
+        if probe == "nulink":
+            return "interface/nulink.cfg"
         return "interface/stlink.cfg"
 
     def _default_openocd_target_script(self) -> str:
@@ -1123,9 +1169,9 @@ class KeilProjectToCMake:
         return "target/stm32f4x.cfg"
 
     def _resolve_openocd_config_arguments(
-        self, output_path: Path, options: GenerationOptions
+        self, output_path: Path, probe: str
     ) -> tuple[str, List[str]]:
-        probe, openocd_cfg = self._resolve_openocd_probe_and_config(options)
+        probe, openocd_cfg = self._resolve_openocd_probe_and_config(probe)
         probe_label = self._probe_display_name(probe)
         if openocd_cfg is not None:
             return probe_label, [self._relative_workspace_path(openocd_cfg, output_path)]
@@ -1157,7 +1203,7 @@ class KeilProjectToCMake:
             debuggers = [debugger for debugger in debuggers if debugger != "keil"]
 
         selected_probe = (options.debug_probe or "default").strip().lower()
-        if selected_probe == "stlink":
+        if selected_probe not in {"default", "all", "jlink"}:
             debuggers = [debugger for debugger in debuggers if debugger != "jlink"]
 
         return self._dedupe_keep_order(debuggers)
@@ -1382,7 +1428,14 @@ class KeilProjectToCMake:
         return self.cpu or self._clean_device_name() or "Cortex-M4"
 
     def _write_jlink_scripts(self, output_path: Path, options: GenerationOptions) -> None:
-        if options.compiler != "gcc" or "jlink" not in self._selected_debug_backends(options):
+        if options.compiler != "gcc":
+            return
+        if "jlink" not in self._selected_debug_backends(options):
+            return
+        if not any(
+            self._probe_supports_backend(probe, "jlink")
+            for probe in self._selected_probes(options)
+        ):
             return
 
         vsc_dir = output_path / ".vscode"
@@ -1466,84 +1519,91 @@ class KeilProjectToCMake:
         tasks.append(rebuild_task)
 
         debuggers = self._selected_debug_backends(options)
+        selected_probes = self._selected_probes(options)
         if options.compiler == "gcc":
             if "openocd" in debuggers:
-                openocd_probe_label, openocd_configs = self._resolve_openocd_config_arguments(
-                    output_path, options
-                )
-                openocd_file_args = self._openocd_file_args(openocd_configs)
-                tasks.extend(
-                    [
-                        {
-                            "label": f"Flash {openocd_probe_label} ELF",
-                            "type": "shell",
-                            "command": commands["openocd"],
-                            "args": openocd_file_args
-                            + [
-                                "-c",
-                                f"program {{{self._artifact_path(options, '.elf')}}} verify reset exit",
-                            ],
-                            "dependsOn": build_label,
-                            "problemMatcher": [],
-                        },
-                        {
-                            "label": f"Flash {openocd_probe_label} HEX",
-                            "type": "shell",
-                            "command": commands["openocd"],
-                            "args": openocd_file_args
-                            + [
-                                "-c",
-                                f"program {{{self._artifact_path(options, '.hex')}}} verify reset exit",
-                            ],
-                            "dependsOn": build_label,
-                            "problemMatcher": [],
-                        },
-                        {
-                            "label": f"Flash {openocd_probe_label} BIN",
-                            "type": "shell",
-                            "command": commands["openocd"],
-                            "args": openocd_file_args
-                            + [
-                                "-c",
-                                f"program {{{self._artifact_path(options, '.bin')}}} 0x08000000 verify reset exit",
-                            ],
-                            "dependsOn": build_label,
-                            "problemMatcher": [],
-                        },
-                        {
-                            "label": f"Start {openocd_probe_label} OpenOCD GDB Server",
-                            "type": "shell",
-                            "command": commands["openocd"],
-                            "args": openocd_file_args,
-                            "dependsOn": build_label,
-                            "isBackground": True,
-                            "presentation": {
-                                "echo": True,
-                                "reveal": "always",
-                                "panel": "dedicated",
-                                "focus": False,
-                            },
-                            "problemMatcher": {
-                                "owner": "openocd",
-                                "pattern": [
-                                    {
-                                        "regexp": ".",
-                                        "file": 0,
-                                        "location": 0,
-                                        "message": 0,
-                                    }
+                for probe in selected_probes:
+                    if not self._probe_supports_backend(probe, "openocd"):
+                        continue
+                    openocd_probe_label, openocd_configs = (
+                        self._resolve_openocd_config_arguments(output_path, probe)
+                    )
+                    openocd_file_args = self._openocd_file_args(openocd_configs)
+                    tasks.extend(
+                        [
+                            {
+                                "label": f"Flash {openocd_probe_label} ELF",
+                                "type": "shell",
+                                "command": commands["openocd"],
+                                "args": openocd_file_args
+                                + [
+                                    "-c",
+                                    f"program {{{self._artifact_path(options, '.elf')}}} verify reset exit",
                                 ],
-                                "background": {
-                                    "activeOnStart": True,
-                                    "beginsPattern": ".*",
-                                    "endsPattern": ".*Listening on port 3333 for gdb connections.*",
+                                "dependsOn": build_label,
+                                "problemMatcher": [],
+                            },
+                            {
+                                "label": f"Flash {openocd_probe_label} HEX",
+                                "type": "shell",
+                                "command": commands["openocd"],
+                                "args": openocd_file_args
+                                + [
+                                    "-c",
+                                    f"program {{{self._artifact_path(options, '.hex')}}} verify reset exit",
+                                ],
+                                "dependsOn": build_label,
+                                "problemMatcher": [],
+                            },
+                            {
+                                "label": f"Flash {openocd_probe_label} BIN",
+                                "type": "shell",
+                                "command": commands["openocd"],
+                                "args": openocd_file_args
+                                + [
+                                    "-c",
+                                    f"program {{{self._artifact_path(options, '.bin')}}} 0x08000000 verify reset exit",
+                                ],
+                                "dependsOn": build_label,
+                                "problemMatcher": [],
+                            },
+                            {
+                                "label": f"Start {openocd_probe_label} OpenOCD GDB Server",
+                                "type": "shell",
+                                "command": commands["openocd"],
+                                "args": openocd_file_args,
+                                "dependsOn": build_label,
+                                "isBackground": True,
+                                "presentation": {
+                                    "echo": True,
+                                    "reveal": "always",
+                                    "panel": "dedicated",
+                                    "focus": False,
+                                },
+                                "problemMatcher": {
+                                    "owner": "openocd",
+                                    "pattern": [
+                                        {
+                                            "regexp": ".",
+                                            "file": 0,
+                                            "location": 0,
+                                            "message": 0,
+                                        }
+                                    ],
+                                    "background": {
+                                        "activeOnStart": True,
+                                        "beginsPattern": ".*",
+                                        "endsPattern": ".*Listening on port 3333 for gdb connections.*",
+                                    },
                                 },
                             },
-                        },
-                    ]
-                )
+                        ]
+                    )
 
-            if "jlink" in debuggers:
+            if "jlink" in debuggers and any(
+                self._probe_supports_backend(probe, "jlink")
+                for probe in selected_probes
+            ):
                 presentation = {
                     "echo": True,
                     "reveal": "always",
@@ -1577,42 +1637,45 @@ class KeilProjectToCMake:
                         )
         else:
             if "openocd" in debuggers:
-                openocd_probe_label, openocd_configs = self._resolve_openocd_config_arguments(
-                    output_path, options
-                )
-                openocd_file_args = self._openocd_file_args(openocd_configs)
-                tasks.append(
-                    {
-                        "label": f"Start {openocd_probe_label} OpenOCD GDB Server",
-                        "type": "shell",
-                        "command": commands["openocd"],
-                        "args": openocd_file_args,
-                        "dependsOn": build_label,
-                        "isBackground": True,
-                        "presentation": {
-                            "echo": True,
-                            "reveal": "always",
-                            "panel": "dedicated",
-                            "focus": False,
-                        },
-                        "problemMatcher": {
-                            "owner": "openocd",
-                            "pattern": [
-                                {
-                                    "regexp": ".",
-                                    "file": 0,
-                                    "location": 0,
-                                    "message": 0,
-                                }
-                            ],
-                            "background": {
-                                "activeOnStart": True,
-                                "beginsPattern": ".*",
-                                "endsPattern": ".*Listening on port 3333 for gdb connections.*",
+                for probe in selected_probes:
+                    if not self._probe_supports_backend(probe, "openocd"):
+                        continue
+                    openocd_probe_label, openocd_configs = (
+                        self._resolve_openocd_config_arguments(output_path, probe)
+                    )
+                    openocd_file_args = self._openocd_file_args(openocd_configs)
+                    tasks.append(
+                        {
+                            "label": f"Start {openocd_probe_label} OpenOCD GDB Server",
+                            "type": "shell",
+                            "command": commands["openocd"],
+                            "args": openocd_file_args,
+                            "dependsOn": build_label,
+                            "isBackground": True,
+                            "presentation": {
+                                "echo": True,
+                                "reveal": "always",
+                                "panel": "dedicated",
+                                "focus": False,
                             },
-                        },
-                    }
-                )
+                            "problemMatcher": {
+                                "owner": "openocd",
+                                "pattern": [
+                                    {
+                                        "regexp": ".",
+                                        "file": 0,
+                                        "location": 0,
+                                        "message": 0,
+                                    }
+                                ],
+                                "background": {
+                                    "activeOnStart": True,
+                                    "beginsPattern": ".*",
+                                    "endsPattern": ".*Listening on port 3333 for gdb connections.*",
+                                },
+                            },
+                        }
+                    )
 
             if "keil" in debuggers and options.host_os == "windows":
                 mdk_info = self.mdk_info or {}
@@ -1654,28 +1717,35 @@ class KeilProjectToCMake:
         jlink_device = clean_device or self._jlink_flash_device()
         launch_configs: List[Dict[str, Any]] = []
         debuggers = self._selected_debug_backends(options)
+        selected_probes = self._selected_probes(options)
 
         if "openocd" in debuggers:
-            openocd_probe_label, openocd_configs = self._resolve_openocd_config_arguments(
-                output_path, options
-            )
-            launch_configs.append(
-                {
-                    "name": f"{jlink_device or self.target_name} / {openocd_probe_label} / OpenOCD",
-                    "cwd": "${workspaceFolder}",
-                    "type": "cortex-debug",
-                    "request": "launch",
-                    "servertype": "openocd",
-                    "serverpath": commands["openocd"],
-                    "gdbPath": "arm-none-eabi-gdb",
-                    "executable": executable_path,
-                    "configFiles": openocd_configs,
-                    "runToEntryPoint": "main",
-                    "preLaunchTask": build_label,
-                }
-            )
+            for probe in selected_probes:
+                if not self._probe_supports_backend(probe, "openocd"):
+                    continue
+                openocd_probe_label, openocd_configs = (
+                    self._resolve_openocd_config_arguments(output_path, probe)
+                )
+                launch_configs.append(
+                    {
+                        "name": f"{jlink_device or self.target_name} / {openocd_probe_label} / OpenOCD",
+                        "cwd": "${workspaceFolder}",
+                        "type": "cortex-debug",
+                        "request": "launch",
+                        "servertype": "openocd",
+                        "serverpath": commands["openocd"],
+                        "gdbPath": "arm-none-eabi-gdb",
+                        "executable": executable_path,
+                        "configFiles": openocd_configs,
+                        "runToEntryPoint": "main",
+                        "preLaunchTask": build_label,
+                    }
+                )
 
-        if "jlink" in debuggers:
+        if "jlink" in debuggers and any(
+            self._probe_supports_backend(probe, "jlink")
+            for probe in selected_probes
+        ):
             launch_configs.append(
                 {
                     "name": f"{jlink_device or self.target_name} / J-Link / GDB Server",
@@ -1712,20 +1782,24 @@ class KeilProjectToCMake:
                 )
 
         if "pyocd" in debuggers:
-            launch_configs.append(
-                {
-                    "name": "Debug with PyOCD",
-                    "cwd": "${workspaceFolder}",
-                    "type": "cortex-debug",
-                    "request": "launch",
-                    "servertype": "pyocd",
-                    "gdbPath": "arm-none-eabi-gdb",
-                    "executable": executable_path,
-                    "runToEntryPoint": "main",
-                    "showDevDebugOutput": "none",
-                    "preLaunchTask": build_label,
-                }
-            )
+            for probe in selected_probes:
+                if not self._probe_supports_backend(probe, "pyocd"):
+                    continue
+                probe_label = self._probe_display_name(probe)
+                launch_configs.append(
+                    {
+                        "name": f"Debug with PyOCD ({probe_label})",
+                        "cwd": "${workspaceFolder}",
+                        "type": "cortex-debug",
+                        "request": "launch",
+                        "servertype": "pyocd",
+                        "gdbPath": "arm-none-eabi-gdb",
+                        "executable": executable_path,
+                        "runToEntryPoint": "main",
+                        "showDevDebugOutput": "none",
+                        "preLaunchTask": build_label,
+                    }
+                )
 
         return {"version": "0.2.0", "configurations": launch_configs}
 
