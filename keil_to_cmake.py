@@ -1920,30 +1920,18 @@ class KeilProjectToCMake:
         f.write(")\n\n")
 
         f.write(
-            f"""add_custom_command(
-    OUTPUT ${{HEX_FILE}} ${{BIN_FILE}} ${{ARTIFACT_STAMP}}
+            f"""add_custom_target({self.target_name}_artifacts ALL
     COMMAND ${{CMAKE_OBJCOPY}} -O ihex $<TARGET_FILE:{self.target_name}> ${{HEX_FILE}}
     COMMAND ${{CMAKE_OBJCOPY}} -O binary $<TARGET_FILE:{self.target_name}> ${{BIN_FILE}}
     COMMAND ${{CMAKE_SIZE}} --format=berkeley $<TARGET_FILE:{self.target_name}>
     COMMAND ${{CMAKE_COMMAND}} -E touch ${{ARTIFACT_STAMP}}
+    COMMAND ${{CMAKE_COMMAND}} -E copy_if_different
+            "${{CMAKE_BINARY_DIR}}/compile_commands.json"
+            "${{CMAKE_SOURCE_DIR}}/compile_commands.json"
     DEPENDS {self.target_name}
     VERBATIM
-)\n\n"""
-        )
-        f.write(
-            f"""add_custom_target({self.target_name}_artifacts ALL
-    DEPENDS ${{HEX_FILE}} ${{BIN_FILE}} ${{ARTIFACT_STAMP}}
 )\n"""
         )
-        f.write(
-            """add_custom_target(copy_compile_commands
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_BINARY_DIR}/compile_commands.json"
-            "${CMAKE_SOURCE_DIR}/compile_commands.json"
-    VERBATIM
-)\n"""
-        )
-        f.write(f"add_dependencies({self.target_name}_artifacts copy_compile_commands)\n")
 
     def _write_cmake_content_with_options(
         self, f: TextIOWrapper, dest: str, options: GenerationOptions
