@@ -215,6 +215,7 @@ class KeilProjectToCMake:
         self.project_dir = self.uvprojx_path.parent
         self.project_name = self.uvprojx_path.stem
         self.verbose = verbose
+        self.last_error: str = ""
 
         # 项目信息
         self.output_directory = ""
@@ -223,6 +224,11 @@ class KeilProjectToCMake:
         self.device_name = ""
         self.vendor = ""
         self.cpu = ""
+        self.cpu_type = ""
+        self.flash_origin: Optional[int] = None
+        self.flash_length: Optional[int] = None
+        self.ram_origin: Optional[int] = None
+        self.ram_length: Optional[int] = None
 
         # 源文件和头文件
         self.source_files: List[str] = []
@@ -245,17 +251,17 @@ class KeilProjectToCMake:
 
     def parse(self) -> bool:
         """解析uVision项目文件"""
+        self.last_error = ""
 
         if self.mdk_info is None:
-            print(
-                f"错误: 无法获取 Keil MDK 信息，请检查路径: {self.uv4_path}",
-                file=sys.stderr,
-            )
+            self.last_error = f"无法获取 Keil MDK 信息，请检查路径: {self.uv4_path}"
+            print(f"错误: {self.last_error}", file=sys.stderr)
             return False
 
         try:
             if not self.uvprojx_path.exists():
-                print(f"错误: 项目文件不存在 {self.uvprojx_path}", file=sys.stderr)
+                self.last_error = f"项目文件不存在: {self.uvprojx_path}"
+                print(f"错误: {self.last_error}", file=sys.stderr)
                 return False
 
             # 解析XML文件
@@ -287,10 +293,12 @@ class KeilProjectToCMake:
             return True
 
         except ET.ParseError as e:
-            print(f"XML解析错误: {e}", file=sys.stderr)
+            self.last_error = f"XML解析错误: {e}"
+            print(self.last_error, file=sys.stderr)
             return False
         except Exception as e:
-            print(f"解析项目文件时发生错误: {e}", file=sys.stderr)
+            self.last_error = f"解析项目文件时发生错误: {e}"
+            print(self.last_error, file=sys.stderr)
             return False
 
     def _parse_project_info(self, root: ET.Element):
@@ -321,9 +329,39 @@ class KeilProjectToCMake:
 
         # CPU类型
         self.cpu_type = self._get_element_text(root, ".//Cpu")
+        self.flash_origin, self.flash_length = self._extract_memory_region(
+            self.cpu_type, "IROM"
+        )
+        self.ram_origin, self.ram_length = self._extract_memory_region(
+            self.cpu_type, "IRAM"
+        )
 
         if self.cpu_type == "":
             return
+
+    @staticmethod
+    def _extract_memory_region(cpu_desc: str, prefix: str) -> tuple[Optional[int], Optional[int]]:
+        if not cpu_desc:
+            return None, None
+
+        pattern = re.compile(
+            rf"{prefix}\d*\((0x[0-9a-fA-F]+),(0x[0-9a-fA-F]+)\)", re.IGNORECASE
+        )
+        match = pattern.search(cpu_desc)
+        if match is None:
+            return None, None
+        try:
+            return int(match.group(1), 16), int(match.group(2), 16)
+        except ValueError:
+            return None, None
+
+    @staticmethod
+    def _normalize_gcc_cpu_name(cpu_name: str) -> str:
+        name = (cpu_name or "").strip().lower()
+        aliases = {
+            "cortex-m0+": "cortex-m0plus",
+        }
+        return aliases.get(name, name)
 
     def _parse_source_files(self, root: ET.Element):
         """解析源文件和头文件"""
@@ -436,7 +474,8 @@ class KeilProjectToCMake:
                             print(f"未知特性: {key} = {value}")
 
         cpu = self.cpu.lower()
-        features = [f"-mcpu={cpu}"]
+        gcc_cpu = self._normalize_gcc_cpu_name(cpu)
+        features = [f"-mcpu={gcc_cpu}"]
 
         # FPU
         fpu_txt = self._get_element_text(root, ".//RvdsVP")
@@ -446,7 +485,7 @@ class KeilProjectToCMake:
         else:
             self.cpu_flags += ["-mfloat-abi=soft"]
 
-        match (cpu):
+        match (gcc_cpu):
             case "cortex-m52" | "cortex-m55" | "cortex-m85":
                 # MVE
                 mve_txt = self._get_element_text(root, ".//RvdsMve")
@@ -861,6 +900,19 @@ class KeilProjectToCMake:
     def _artifact_name(self) -> str:
         return self.output_name or self.target_name
 
+    def _cmake_target_name(self) -> str:
+        raw = self.target_name or self.project_name or "target"
+        safe = re.sub(r"[^A-Za-z0-9_]", "_", raw)
+        safe = re.sub(r"_+", "_", safe).strip("_")
+        if not safe:
+            safe = "target"
+        if safe[0].isdigit():
+            safe = f"T_{safe}"
+        return safe
+
+    def _cmake_artifacts_target_name(self) -> str:
+        return f"{self._cmake_target_name()}_artifacts"
+
     def _map_source_for_gcc(self, source_path: str) -> str:
         normalized = Path(source_path).as_posix()
         if "/startup/mdk/" in normalized:
@@ -874,6 +926,283 @@ class KeilProjectToCMake:
     def _gcc_source_files(self) -> List[str]:
         mapped = [self._map_source_for_gcc(source) for source in self.source_files]
         return sorted(self._dedupe_keep_order(mapped))
+
+    @staticmethod
+    def _format_stm32_startup_define(token: str) -> Optional[str]:
+        value = (token or "").strip().lower()
+        if not value.startswith("stm32"):
+            return None
+
+        if value.startswith("stm32f10x_"):
+            return value.upper()
+
+        formatted = ["STM32"]
+        for char in value[5:]:
+            if char.isalpha():
+                formatted.append("x" if char == "x" else char.upper())
+            else:
+                formatted.append(char)
+        return "".join(formatted)
+
+    def _startup_device_define(self) -> Optional[str]:
+        startup_sources = self._gcc_source_files() + sorted(self.source_files)
+        seen: Set[str] = set()
+        for source in startup_sources:
+            stem = Path(source).stem.lower()
+            if not stem.startswith("startup_") or stem in seen:
+                continue
+            seen.add(stem)
+            macro = self._format_stm32_startup_define(stem.replace("startup_", "", 1))
+            if macro:
+                return macro
+        return None
+
+    def _device_flash_kb(self) -> Optional[int]:
+        if self.flash_length:
+            return self.flash_length // 1024
+
+        memory_code = self._device_memory_code().upper()
+        memory_by_code = {
+            "4": 16,
+            "6": 32,
+            "8": 64,
+            "B": 128,
+            "C": 256,
+            "D": 384,
+            "E": 512,
+            "F": 768,
+            "G": 1024,
+        }
+        return memory_by_code.get(memory_code)
+
+    def _infer_stm32f1_stdperiph_define(self) -> Optional[str]:
+        startup_define = self._startup_device_define()
+        if startup_define and re.fullmatch(r"STM32F10X_[A-Z0-9_]+", startup_define):
+            return startup_define
+
+        clean_device = self._clean_device_name().upper()
+        if not clean_device.startswith("STM32F10"):
+            return None
+
+        if clean_device.startswith(("STM32F105", "STM32F107")):
+            return "STM32F10X_CL"
+
+        flash_kb = self._device_flash_kb()
+        if flash_kb is None:
+            return None
+
+        if flash_kb <= 32:
+            density = "LD"
+        elif flash_kb <= 128:
+            density = "MD"
+        elif flash_kb <= 512:
+            density = "HD"
+        else:
+            density = "XL"
+
+        if clean_device.startswith("STM32F100"):
+            return f"STM32F10X_{density}_VL" if density != "XL" else "STM32F10X_HD_VL"
+
+        if clean_device.startswith(("STM32F101", "STM32F102", "STM32F103")):
+            return f"STM32F10X_{density}"
+
+        return None
+
+    def _inferred_device_defines(self) -> List[str]:
+        inferred: List[str] = []
+
+        startup_define = self._startup_device_define()
+        if startup_define:
+            inferred.append(startup_define)
+
+        stm32f1_define = self._infer_stm32f1_stdperiph_define()
+        if stm32f1_define:
+            inferred.append(stm32f1_define)
+
+        device_name = self._clean_device_name()
+        if device_name:
+            inferred.append(device_name)
+
+        return self._dedupe_keep_order(inferred)
+
+    @staticmethod
+    def _is_armasm_startup_source(path: Path) -> bool:
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+
+        head = content[:4096].upper()
+        armasm_tokens = (" AREA ", " EXPORT ", " PROC", " ENDP", " DCD ", " PRESERVE8")
+        return all(token in head for token in armasm_tokens[:3]) and any(
+            token in head for token in armasm_tokens[3:]
+        )
+
+    @staticmethod
+    def _parse_armasm_vector_entries(path: Path) -> List[str]:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            return []
+
+        entries: List[str] = []
+        in_vectors = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("__Vectors_End"):
+                break
+            if stripped.startswith("__Vectors"):
+                in_vectors = True
+            if not in_vectors:
+                continue
+
+            match = re.search(r"\bDCD\b\s+([A-Za-z_][A-Za-z0-9_]*|0)\b", stripped)
+            if match:
+                entries.append(match.group(1))
+
+        return entries
+
+    def _generate_gnu_startup_from_armasm(self, source_path: Path, dest: str) -> Optional[str]:
+        vector_entries = self._parse_armasm_vector_entries(source_path)
+        if len(vector_entries) < 2:
+            return None
+
+        cpu_name = self._normalize_gcc_cpu_name(self.cpu or "cortex-m3")
+        generated_path = Path(dest) / "cmake" / f"{source_path.stem}_gcc.S"
+        handlers: List[str] = []
+        for entry in vector_entries[1:]:
+            if entry in {"0", "Reset_Handler"}:
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", entry):
+                handlers.append(entry)
+        handlers = self._dedupe_keep_order(handlers)
+
+        vector_lines = ["    .word _estack"]
+        for entry in vector_entries[1:]:
+            vector_lines.append(f"    .word {entry}" if entry != "0" else "    .word 0")
+
+        alias_lines: List[str] = []
+        for handler in handlers:
+            alias_lines.append(f"    .weak {handler}")
+            alias_lines.append(f"    .thumb_set {handler}, Default_Handler")
+
+        content = "\n".join(
+            [
+                "/* Auto-generated GNU startup file converted from a Keil ARMASM startup file. */",
+                ".syntax unified",
+                f".cpu {cpu_name}",
+                ".thumb",
+                "",
+                ".global __Vectors",
+                ".global g_pfnVectors",
+                ".global __Vectors_End",
+                ".global __Vectors_Size",
+                ".global Reset_Handler",
+                ".extern SystemInit",
+                ".extern __libc_init_array",
+                ".extern main",
+                "",
+                '.section .isr_vector,"a",%progbits',
+                ".type __Vectors, %object",
+                "__Vectors:",
+                "g_pfnVectors:",
+                *vector_lines,
+                "__Vectors_End:",
+                ".equ __Vectors_Size, __Vectors_End - __Vectors",
+                "",
+                '.section .text.Reset_Handler,"ax",%progbits',
+                ".type Reset_Handler, %function",
+                "Reset_Handler:",
+                "    ldr r0, =_estack",
+                "    mov sp, r0",
+                "    bl SystemInit",
+                "    ldr r0, =_sidata",
+                "    ldr r1, =_sdata",
+                "    ldr r2, =_edata",
+                ".Lcopy_data:",
+                "    cmp r1, r2",
+                "    bcs .Lzero_bss",
+                "    ldr r3, [r0], #4",
+                "    str r3, [r1], #4",
+                "    b .Lcopy_data",
+                ".Lzero_bss:",
+                "    ldr r1, =_sbss",
+                "    ldr r2, =_ebss",
+                "    movs r3, #0",
+                ".Lfill_bss:",
+                "    cmp r1, r2",
+                "    bcs .Linit_runtime",
+                "    str r3, [r1], #4",
+                "    b .Lfill_bss",
+                ".Linit_runtime:",
+                "    bl __libc_init_array",
+                "    bl main",
+                ".Lhang:",
+                "    b .Lhang",
+                ".size Reset_Handler, .-Reset_Handler",
+                "",
+                '.section .text.Default_Handler,"ax",%progbits',
+                ".type Default_Handler, %function",
+                "Default_Handler:",
+                "    b .",
+                ".size Default_Handler, .-Default_Handler",
+                "",
+                *alias_lines,
+                "",
+            ]
+        )
+        self._write_text_file(generated_path, content)
+        return str(generated_path.resolve(strict=False))
+
+    def _generate_patched_core_cm3_source(self, source_path: Path, dest: str) -> Optional[str]:
+        try:
+            content = source_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+
+        replacements = {
+            '__ASM volatile ("strexb %0, %2, [%1]" : "=r" (result) : "r" (addr), "r" (value) );':
+            '__ASM volatile ("strexb %0, %2, [%1]" : "=&r" (result) : "r" (addr), "r" (value) );',
+            '__ASM volatile ("strexh %0, %2, [%1]" : "=r" (result) : "r" (addr), "r" (value) );':
+            '__ASM volatile ("strexh %0, %2, [%1]" : "=&r" (result) : "r" (addr), "r" (value) );',
+            '__ASM volatile ("strex %0, %2, [%1]" : "=r" (result) : "r" (addr), "r" (value) );':
+            '__ASM volatile ("strex %0, %2, [%1]" : "=&r" (result) : "r" (addr), "r" (value) );',
+        }
+
+        patched = content
+        replaced = False
+        for original, updated in replacements.items():
+            if original in patched:
+                patched = patched.replace(original, updated)
+                replaced = True
+
+        if not replaced:
+            return None
+
+        generated_path = Path(dest) / "cmake" / f"{source_path.stem}_gcc.c"
+        self._write_text_file(generated_path, patched)
+        return str(generated_path.resolve(strict=False))
+
+    def _prepared_gcc_source_files(self, dest: str) -> List[str]:
+        prepared: List[str] = []
+        for source in self._gcc_source_files():
+            source_path = Path(source)
+            if source_path.name.lower() == "core_cm3.c":
+                generated = self._generate_patched_core_cm3_source(source_path, dest)
+                if generated is not None:
+                    prepared.append(generated)
+                    continue
+            if (
+                source_path.name.lower().startswith("startup_")
+                and source_path.suffix.lower() in {".s", ".asm"}
+                and self._is_armasm_startup_source(source_path)
+            ):
+                generated = self._generate_gnu_startup_from_armasm(source_path, dest)
+                if generated is not None:
+                    prepared.append(generated)
+                    continue
+            prepared.append(source)
+        return self._dedupe_keep_order(prepared)
 
     def _score_linker_script_candidate(self, path: Path) -> int:
         score = 0
@@ -924,6 +1253,125 @@ class KeilProjectToCMake:
         best = max(candidates, key=self._score_linker_script_candidate)
         return str(best)
 
+    def _generate_fallback_gcc_linker_script(self, dest: str) -> Optional[str]:
+        flash_origin = self.flash_origin
+        flash_length = self.flash_length
+        ram_origin = self.ram_origin
+        ram_length = self.ram_length
+        if (
+            flash_origin is None
+            or flash_length is None
+            or ram_origin is None
+            or ram_length is None
+        ):
+            return None
+
+        cmake_dir = Path(dest) / "cmake"
+        cmake_dir.mkdir(parents=True, exist_ok=True)
+        fallback_path = cmake_dir / "generated_linker.ld"
+
+        content = f"""/* Auto-generated fallback linker script from uvprojx memory info */
+ENTRY(Reset_Handler)
+
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+_Min_Heap_Size = 0x400;
+_Min_Stack_Size = 0x400;
+
+MEMORY
+{{
+  FLASH (rx)  : ORIGIN = 0x{flash_origin:08X}, LENGTH = 0x{flash_length:X}
+  RAM   (xrw) : ORIGIN = 0x{ram_origin:08X}, LENGTH = 0x{ram_length:X}
+}}
+
+SECTIONS
+{{
+  .isr_vector :
+  {{
+    . = ALIGN(4);
+    KEEP(*(.isr_vector))
+    . = ALIGN(4);
+  }} > FLASH
+
+  .text :
+  {{
+    . = ALIGN(4);
+    *(.text*)
+    *(.rodata*)
+    *(.glue_7)
+    *(.glue_7t)
+    *(.eh_frame)
+    KEEP (*(.init))
+    KEEP (*(.fini))
+    . = ALIGN(4);
+    _etext = .;
+  }} > FLASH
+
+  .ARM.extab : {{ *(.ARM.extab* .gnu.linkonce.armextab.*) }} > FLASH
+  .ARM.exidx :
+  {{
+    __exidx_start = .;
+    *(.ARM.exidx*)
+    __exidx_end = .;
+  }} > FLASH
+
+  .preinit_array :
+  {{
+    PROVIDE_HIDDEN (__preinit_array_start = .);
+    KEEP (*(.preinit_array*))
+    PROVIDE_HIDDEN (__preinit_array_end = .);
+  }} > FLASH
+
+  .init_array :
+  {{
+    PROVIDE_HIDDEN (__init_array_start = .);
+    KEEP (*(SORT(.init_array.*)))
+    KEEP (*(.init_array*))
+    PROVIDE_HIDDEN (__init_array_end = .);
+  }} > FLASH
+
+  .fini_array :
+  {{
+    PROVIDE_HIDDEN (__fini_array_start = .);
+    KEEP (*(SORT(.fini_array.*)))
+    KEEP (*(.fini_array*))
+    PROVIDE_HIDDEN (__fini_array_end = .);
+  }} > FLASH
+
+  _sidata = LOADADDR(.data);
+  .data :
+  {{
+    . = ALIGN(4);
+    _sdata = .;
+    *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  }} > RAM AT > FLASH
+
+  .bss :
+  {{
+    . = ALIGN(4);
+    _sbss = .;
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+  }} > RAM
+
+  ._user_heap_stack :
+  {{
+    . = ALIGN(8);
+    PROVIDE(end = .);
+    . = . + _Min_Heap_Size;
+    . = . + _Min_Stack_Size;
+    . = ALIGN(8);
+  }} > RAM
+
+  /DISCARD/ : {{ *(.note.GNU-stack) }}
+}}
+"""
+        self._write_text_file(fallback_path, content)
+        return str(fallback_path.resolve(strict=False))
+
     def _extract_first_flag(self, flags: List[str], prefix: str) -> Optional[str]:
         for flag in self._flatten_flags(flags):
             if flag.startswith(prefix):
@@ -960,7 +1408,7 @@ class KeilProjectToCMake:
         return standard or "-std=gnu++14"
 
     def _effective_defines(self, compiler: str) -> List[str]:
-        defines = []
+        defines: List[str] = []
         for define in sorted(self.defines):
             value = define.strip()
             if value.startswith("-D"):
@@ -969,29 +1417,7 @@ class KeilProjectToCMake:
                 defines.append(value)
 
         defines = self._dedupe_keep_order(defines)
-        if compiler != "gcc":
-            return defines
-
-        device_name = self._clean_device_name()
-        if not device_name:
-            return defines
-
-        tokens = self._device_tokens()
-        filtered: List[str] = []
-        for define in defines:
-            if define == device_name:
-                filtered.append(define)
-                continue
-
-            if re.fullmatch(r"[A-Za-z0-9_]+", define) and any(
-                define.upper().startswith(token) for token in tokens
-            ):
-                continue
-
-            filtered.append(define)
-
-        filtered.append(device_name)
-        return self._dedupe_keep_order(filtered)
+        return self._dedupe_keep_order(defines + self._inferred_device_defines())
 
     def _find_openocd_dir(self) -> Optional[Path]:
         for candidate in [self.project_dir / "openocd", self.project_dir.parent / "openocd"]:
@@ -1483,7 +1909,7 @@ class KeilProjectToCMake:
             f"${{workspaceFolder}}/{options.build_dir}",
         ]
         if options.compiler == "gcc":
-            build_args.extend(["--target", f"{self.target_name}_artifacts"])
+            build_args.extend(["--target", self._cmake_artifacts_target_name()])
         build_args.append("--parallel")
 
         build_task: Dict[str, Any] = {
@@ -1806,11 +2232,12 @@ class KeilProjectToCMake:
     def _write_cmake_header(
         self, f: TextIOWrapper, toolchain_include: str, languages: List[str]
     ) -> None:
+        project_name = (self.target_name or self.project_name or "project").replace('"', "_")
         f.write("# CMake file generated from Keil uVision project\n")
         f.write("# Generated by keil_uvprojx2cmake.py\n\n")
         f.write("cmake_minimum_required(VERSION 3.20)\n\n")
         f.write(f"include({toolchain_include})\n\n")
-        f.write(f"project({self.target_name} LANGUAGES {' '.join(languages)})\n")
+        f.write(f'project("{project_name}" LANGUAGES {" ".join(languages)})\n')
         f.write("set(CMAKE_EXPORT_COMPILE_COMMANDS ON)\n")
         f.write("if(NOT CMAKE_BUILD_TYPE)\n")
         f.write('    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)\n')
@@ -1827,6 +2254,7 @@ class KeilProjectToCMake:
     def _write_armclang_cmake_content(
         self, f: TextIOWrapper, dest: str, options: GenerationOptions
     ) -> None:
+        cmake_target = self._cmake_target_name()
         self._write_cmake_header(f, "cmake/armclang.cmake", self._project_languages())
 
         cpu_flags = self._dedupe_keep_order(self.cpu_flags + ["-gdwarf-4"])
@@ -1879,14 +2307,14 @@ class KeilProjectToCMake:
             f.write(f'    "{self._normalize_path(source_file, dest)}"\n')
         f.write(")\n\n")
 
-        f.write(f"add_executable({self.target_name} ${{SOURCES}})\n")
+        f.write(f"add_executable({cmake_target} ${{SOURCES}})\n")
         f.write(
-            f'set_target_properties({self.target_name} PROPERTIES OUTPUT_NAME "{self._artifact_name()}" SUFFIX ".axf")\n\n'
+            f'set_target_properties({cmake_target} PROPERTIES OUTPUT_NAME "{self._artifact_name()}" SUFFIX ".axf")\n\n'
         )
 
         if self.libraries:
             f.write("# Link libraries\n")
-            f.write(f"target_link_libraries({self.target_name} PRIVATE\n")
+            f.write(f"target_link_libraries({cmake_target} PRIVATE\n")
             for lib in self.libraries:
                 f.write(f"    {lib}\n")
             f.write(")\n\n")
@@ -1897,8 +2325,8 @@ class KeilProjectToCMake:
         f.write(
             f"""add_custom_target(always_copy ALL
     COMMAND ${{CMAKE_COMMAND}} -E make_directory "${{DEST_DIR}}"
-    COMMAND ${{CMAKE_COMMAND}} -E copy_if_different "$<TARGET_FILE:{self.target_name}>" "${{DEST_DIR}}/{self._artifact_name()}.axf"
-    DEPENDS {self.target_name}
+    COMMAND ${{CMAKE_COMMAND}} -E copy_if_different "$<TARGET_FILE:{cmake_target}>" "${{DEST_DIR}}/{self._artifact_name()}.axf"
+    DEPENDS {cmake_target}
 )\n"""
         )
         f.write('set_property(TARGET always_copy PROPERTY FOLDER "postbuild")\n')
@@ -1906,9 +2334,15 @@ class KeilProjectToCMake:
     def _write_gcc_cmake_content(
         self, f: TextIOWrapper, dest: str, options: GenerationOptions
     ) -> None:
+        cmake_target = self._cmake_target_name()
+        artifacts_target = self._cmake_artifacts_target_name()
         linker_script = self._guess_gcc_linker_script()
         if linker_script is None:
-            raise FileNotFoundError("Unable to locate a GCC linker script (.ld).")
+            linker_script = self._generate_fallback_gcc_linker_script(dest)
+        if linker_script is None:
+            raise FileNotFoundError(
+                "Unable to locate a GCC linker script (.ld), and failed to auto-generate one from uvprojx memory info."
+            )
 
         languages = self._project_languages()
         self._write_cmake_header(
@@ -1919,17 +2353,52 @@ class KeilProjectToCMake:
 
         rel_linker_script = self._normalize_path(linker_script, dest)
         artifact_name = self._artifact_name()
-        source_files = self._gcc_source_files()
+        source_files = self._prepared_gcc_source_files(dest)
         cpu_options = self._gcc_cpu_options()
 
         f.write(
             f'set(LINKER_SCRIPT "${{CMAKE_CURRENT_LIST_DIR}}/{rel_linker_script}")\n'
         )
         f.write(f'set(MAP_FILE "${{CMAKE_CURRENT_BINARY_DIR}}/{artifact_name}.map")\n')
-        f.write(f'set(HEX_FILE "${{CMAKE_CURRENT_BINARY_DIR}}/{artifact_name}.hex")\n')
-        f.write(f'set(BIN_FILE "${{CMAKE_CURRENT_BINARY_DIR}}/{artifact_name}.bin")\n')
+        f.write(f'set(ELF_FILE "{artifact_name}.elf")\n')
+        f.write(f'set(HEX_FILE "{artifact_name}.hex")\n')
+        f.write(f'set(BIN_FILE "{artifact_name}.bin")\n')
+        f.write(f'set(ARTIFACT_STAMP "{artifact_name}.artifacts.stamp")\n')
+        f.write('set(ARTIFACT_SCRIPT "run_artifacts.bat")\n')
         f.write(
-            f'set(ARTIFACT_STAMP "${{CMAKE_CURRENT_BINARY_DIR}}/{artifact_name}.artifacts.stamp")\n\n'
+            'file(RELATIVE_PATH COMPILE_COMMANDS_COPY_TARGET "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json")\n\n'
+        )
+        f.write('file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "@echo off\\r\\n")\n')
+        f.write('file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "setlocal\\r\\n")\n')
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "\\"${CMAKE_OBJCOPY}\\" -O ihex \\"${ELF_FILE}\\" \\"${HEX_FILE}\\"\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "if errorlevel 1 exit /b %errorlevel%\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "\\"${CMAKE_OBJCOPY}\\" -O binary \\"${ELF_FILE}\\" \\"${BIN_FILE}\\"\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "if errorlevel 1 exit /b %errorlevel%\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "\\"${CMAKE_SIZE}\\" --format=berkeley \\"${ELF_FILE}\\"\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "if errorlevel 1 exit /b %errorlevel%\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "\\"${CMAKE_COMMAND}\\" -E touch \\"${ARTIFACT_STAMP}\\"\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "if errorlevel 1 exit /b %errorlevel%\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "if exist \\"compile_commands.json\\" \\"${CMAKE_COMMAND}\\" -E copy_if_different \\"compile_commands.json\\" \\"${COMPILE_COMMANDS_COPY_TARGET}\\"\\r\\n")\n'
+        )
+        f.write(
+            'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "if errorlevel 1 exit /b %errorlevel%\\r\\n\\r\\n")\n'
         )
 
         f.write("set(PROJECT_SOURCES\n")
@@ -1937,13 +2406,13 @@ class KeilProjectToCMake:
             f.write(f'    "{self._normalize_path(source_file, dest)}"\n')
         f.write(")\n\n")
 
-        f.write(f"add_executable({self.target_name} ${{PROJECT_SOURCES}})\n")
+        f.write(f"add_executable({cmake_target} ${{PROJECT_SOURCES}})\n")
         f.write(
-            f'set_target_properties({self.target_name} PROPERTIES OUTPUT_NAME "{artifact_name}" SUFFIX ".elf")\n\n'
+            f'set_target_properties({cmake_target} PROPERTIES OUTPUT_NAME "{artifact_name}" SUFFIX ".elf")\n\n'
         )
 
         if self.include_paths:
-            f.write(f"target_include_directories({self.target_name} PRIVATE\n")
+            f.write(f"target_include_directories({cmake_target} PRIVATE\n")
             for include_path in sorted(self.include_paths):
                 f.write(
                     f'    "${{CMAKE_CURRENT_LIST_DIR}}/{self._normalize_path(include_path, dest)}"\n'
@@ -1952,12 +2421,12 @@ class KeilProjectToCMake:
 
         defines = self._effective_defines("gcc")
         if defines:
-            f.write(f"target_compile_definitions({self.target_name} PRIVATE\n")
+            f.write(f"target_compile_definitions({cmake_target} PRIVATE\n")
             for define in defines:
                 f.write(f"    {define}\n")
             f.write(")\n\n")
 
-        f.write(f"target_compile_options({self.target_name} PRIVATE\n")
+        f.write(f"target_compile_options({cmake_target} PRIVATE\n")
         for flag in cpu_options:
             f.write(f"    {flag}\n")
         f.write("    -ffunction-sections\n")
@@ -1974,7 +2443,7 @@ class KeilProjectToCMake:
         f.write("    $<$<COMPILE_LANGUAGE:ASM>:assembler-with-cpp>\n")
         f.write(")\n\n")
 
-        f.write(f"target_link_options({self.target_name} PRIVATE\n")
+        f.write(f"target_link_options({cmake_target} PRIVATE\n")
         for flag in cpu_options:
             f.write(f"    {flag}\n")
         f.write("    -T${LINKER_SCRIPT}\n")
@@ -1983,26 +2452,19 @@ class KeilProjectToCMake:
         f.write("    -Wl,--print-memory-usage\n")
         f.write("    -specs=nano.specs\n")
         f.write("    -specs=nosys.specs\n")
-        f.write("    -u\n")
-        f.write("    _printf_float\n")
         f.write(")\n\n")
 
         libraries = self._dedupe_keep_order(self.libraries + ["m"])
-        f.write(f"target_link_libraries({self.target_name} PRIVATE\n")
+        f.write(f"target_link_libraries({cmake_target} PRIVATE\n")
         for library in libraries:
             f.write(f"    {library}\n")
         f.write(")\n\n")
 
         f.write(
-            f"""add_custom_target({self.target_name}_artifacts ALL
-    COMMAND ${{CMAKE_OBJCOPY}} -O ihex $<TARGET_FILE:{self.target_name}> ${{HEX_FILE}}
-    COMMAND ${{CMAKE_OBJCOPY}} -O binary $<TARGET_FILE:{self.target_name}> ${{BIN_FILE}}
-    COMMAND ${{CMAKE_SIZE}} --format=berkeley $<TARGET_FILE:{self.target_name}>
-    COMMAND ${{CMAKE_COMMAND}} -E touch ${{ARTIFACT_STAMP}}
-    COMMAND ${{CMAKE_COMMAND}} -E copy_if_different
-            "${{CMAKE_BINARY_DIR}}/compile_commands.json"
-            "${{CMAKE_SOURCE_DIR}}/compile_commands.json"
-    DEPENDS {self.target_name}
+            f"""add_custom_target({artifacts_target} ALL
+    COMMAND cmd /c "${{ARTIFACT_SCRIPT}}"
+    DEPENDS {cmake_target}
+    WORKING_DIRECTORY "${{CMAKE_CURRENT_BINARY_DIR}}"
     VERBATIM
 )\n"""
         )
@@ -2018,6 +2480,7 @@ class KeilProjectToCMake:
     def _generate_configured_output(
         self, output_dir: Optional[str], options: GenerationOptions
     ) -> bool:
+        self.last_error = ""
         output_path = Path(output_dir) if output_dir else self._default_output_path(options)
         output_path.mkdir(parents=True, exist_ok=True)
 
@@ -2049,7 +2512,8 @@ class KeilProjectToCMake:
 
             return True
         except Exception as e:
-            print(f"Error generating CMake files: {e}", file=sys.stderr)
+            self.last_error = f"Error generating CMake files: {e}"
+            print(self.last_error, file=sys.stderr)
             return False
 
     def generate_cmake(
@@ -2059,9 +2523,15 @@ class KeilProjectToCMake:
         generation_options: Optional[GenerationOptions] = None,
     ) -> bool:
         """生成 CMake 文件"""
-        options = self._prepare_generation_options(
-            export_vsc_settings, generation_options
-        )
+        self.last_error = ""
+        try:
+            options = self._prepare_generation_options(
+                export_vsc_settings, generation_options
+            )
+        except Exception as e:
+            self.last_error = f"Invalid generation options: {e}"
+            print(self.last_error, file=sys.stderr)
+            return False
         return self._generate_configured_output(output_dir, options)
 
     def _normalize_path(self, path: str, dest: str) -> str:

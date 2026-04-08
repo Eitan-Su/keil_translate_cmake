@@ -409,11 +409,19 @@ class Widget(QWidget):
             self.output_directory = self._suggest_output_directory()
             self.lineeditOutputDirectory.setText(self.output_directory)
 
-        options = self._current_options()
+        try:
+            options = self._current_options()
+        except Exception as e:
+            reason = f"配置错误: {e}"
+            self.show_message(reason)
+            QMessageBox.critical(self, "配置错误", reason)
+            return
         parser = KeilProjectToCMake(self.uvproj_filepath, self.uv4_path or None)
 
         if not parser.parse():
-            self.show_message("解析失败，请检查工程路径和 Keil MDK 路径。")
+            reason = parser.last_error or "解析失败，请检查工程路径和 Keil MDK 路径。"
+            self.show_message(reason)
+            QMessageBox.critical(self, "解析失败", reason)
             return
 
         self.uv4_path = parser.uv4_path
@@ -425,7 +433,9 @@ class Widget(QWidget):
             options.export_vsc_settings,
             options,
         ):
-            self.show_message("生成 CMake 失败。")
+            reason = parser.last_error or "生成 CMake 失败。"
+            self.show_message(reason)
+            QMessageBox.critical(self, "生成失败", reason)
             return
 
         self.show_message(
