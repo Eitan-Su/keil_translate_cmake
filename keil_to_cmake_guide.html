@@ -1,0 +1,1147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Keil 转 CMake 转换器技术介绍</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --surface: #ffffff;
+      --border: #dce4ef;
+      --text: #17212b;
+      --muted: #667788;
+      --accent: #1f5ea8;
+      --accent-light: #eaf2fd;
+      --accent-2: #1d7a62;
+      --warn: #b86a00;
+      --warn-bg: #fff7eb;
+      --ok: #186b43;
+      --ok-bg: #eef9f2;
+      --err: #8c2c23;
+      --err-bg: #fdf0ef;
+      --tag-bg: #eef3f9;
+      --sidebar-w: 282px;
+      --header-h: 54px;
+      --radius: 8px;
+      --shadow: 0 10px 30px rgba(18, 38, 63, 0.05);
+      --mono: "JetBrains Mono", "Cascadia Code", "Fira Code", "Courier New", monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(31, 94, 168, 0.07), transparent 24%),
+        radial-gradient(circle at bottom right, rgba(29, 122, 98, 0.08), transparent 20%),
+        var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.72;
+    }
+    #header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: var(--header-h);
+      background: rgba(255, 255, 255, 0.92);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 0 20px;
+      z-index: 100;
+    }
+    #menu-toggle {
+      width: 36px;
+      height: 36px;
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 4px;
+      flex-shrink: 0;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    #menu-toggle:hover { background: #f1f5fa; border-color: #c9d6e6; }
+    #menu-toggle span {
+      display: block;
+      width: 16px;
+      height: 1.5px;
+      background: var(--text);
+      border-radius: 2px;
+      transition: transform 0.2s ease, opacity 0.2s ease;
+    }
+    body.menu-open #menu-toggle span:nth-child(1) { transform: translateY(5.5px) rotate(45deg); }
+    body.menu-open #menu-toggle span:nth-child(2) { opacity: 0; }
+    body.menu-open #menu-toggle span:nth-child(3) { transform: translateY(-5.5px) rotate(-45deg); }
+    #brand { font-size: 15px; font-weight: 700; letter-spacing: -0.2px; color: var(--text); }
+    #brand sup { font-size: 10px; font-weight: 500; color: var(--muted); margin-left: 6px; }
+    .header-meta { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+    .badge {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--accent-light);
+      color: var(--accent);
+      font-weight: 600;
+      border: 1px solid rgba(31, 94, 168, 0.08);
+    }
+    #sidebar {
+      position: fixed;
+      top: var(--header-h);
+      left: 0;
+      bottom: 0;
+      width: var(--sidebar-w);
+      background: rgba(255, 255, 255, 0.94);
+      backdrop-filter: blur(10px);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      transform: translateX(0);
+      transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      z-index: 90;
+      padding: 14px 0 32px;
+    }
+    body:not(.menu-open) #sidebar { transform: translateX(calc(-1 * var(--sidebar-w))); }
+    .sidebar-section { margin-bottom: 12px; }
+    .sidebar-section-title {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.9px;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 8px 20px 4px;
+    }
+    .sidebar-link {
+      display: block;
+      padding: 7px 20px;
+      color: #425365;
+      text-decoration: none;
+      font-size: 13px;
+      border-left: 2px solid transparent;
+      transition: color 0.15s ease, background 0.15s ease, border-left-color 0.15s ease;
+    }
+    .sidebar-link:hover, .sidebar-link.active {
+      color: var(--accent);
+      background: var(--accent-light);
+      border-left-color: var(--accent);
+    }
+    .sidebar-note {
+      margin: 12px 18px 0;
+      padding: 12px 14px;
+      border-radius: var(--radius);
+      background: #f1f5fa;
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    #main {
+      margin-top: var(--header-h);
+      margin-left: var(--sidebar-w);
+      transition: margin-left 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      min-height: calc(100vh - var(--header-h));
+    }
+    body:not(.menu-open) #main { margin-left: 0; }
+    .content { max-width: 980px; margin: 0 auto; padding: 48px 32px 88px; }
+    section { margin-bottom: 68px; scroll-margin-top: 74px; }
+    .section-label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 12px;
+    }
+    h1 { font-size: 34px; font-weight: 780; line-height: 1.18; letter-spacing: -0.6px; margin-bottom: 18px; }
+    h2 { font-size: 21px; font-weight: 720; margin-bottom: 18px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+    h3 { font-size: 15px; font-weight: 700; margin: 26px 0 10px; color: #203246; }
+    p { color: #415160; margin-bottom: 12px; }
+    strong { color: var(--text); }
+    .hero-desc { font-size: 16px; color: #4b5b69; max-width: 760px; line-height: 1.88; margin-bottom: 28px; }
+    .hero-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 28px; }
+    .tag {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--tag-bg);
+      color: #4a5b6e;
+      border: 1px solid #dde6f0;
+    }
+    .stats { display: flex; flex-wrap: wrap; gap: 14px; margin: 20px 0; }
+    .stat {
+      min-width: 140px;
+      padding: 18px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      text-align: center;
+    }
+    .stat-num { font-size: 28px; font-weight: 780; color: var(--accent); letter-spacing: -0.5px; }
+    .stat-label { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin: 18px 0; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+    .card-title { font-size: 14px; font-weight: 700; margin-bottom: 8px; color: #203246; }
+    .card-desc { font-size: 12.5px; color: var(--muted); line-height: 1.66; }
+    .table-wrap { overflow-x: auto; margin: 16px 0; border-radius: var(--radius); box-shadow: var(--shadow); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface); }
+    th {
+      text-align: left;
+      padding: 10px 12px;
+      background: #f2f6fb;
+      border: 1px solid var(--border);
+      font-weight: 700;
+      color: #4a5d73;
+      white-space: nowrap;
+    }
+    td { padding: 10px 12px; border: 1px solid var(--border); color: #415160; vertical-align: top; }
+    tr:hover td { background: #fbfcfe; }
+    .td-code { font-family: var(--mono); font-size: 12px; color: #b84c35; background: #faf5f3; }
+    .notice {
+      border-left: 3px solid var(--accent);
+      background: var(--accent-light);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      padding: 14px 16px;
+      margin: 16px 0;
+      font-size: 13px;
+      color: #28486c;
+    }
+    .notice.ok { border-left-color: var(--accent-2); background: var(--ok-bg); color: var(--ok); }
+    .notice.warn { border-left-color: var(--warn); background: var(--warn-bg); color: var(--warn); }
+    .notice.err { border-left-color: var(--err); background: var(--err-bg); color: var(--err); }
+    .pipeline {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin: 16px 0;
+      box-shadow: var(--shadow);
+    }
+    .pipeline-step {
+      display: flex;
+      gap: 14px;
+      padding: 14px 18px;
+      border-bottom: 1px solid #ecf1f7;
+      background: var(--surface);
+    }
+    .pipeline-step:nth-child(even) { background: #f9fbfd; }
+    .pipeline-step:last-child { border-bottom: none; }
+    .pipeline-num, .flow-num {
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      font-weight: 780;
+    }
+    .pipeline-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--accent);
+      font-size: 13px;
+      margin-top: 2px;
+    }
+    .pipeline-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 5px; }
+    .pipeline-desc { font-size: 13px; color: #4b5b69; }
+    .flow {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      margin: 16px 0;
+      box-shadow: var(--shadow);
+    }
+    .flow-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 9px 0;
+      border-bottom: 1px dashed #e7edf4;
+    }
+    .flow-step:last-child { border-bottom: none; }
+    .flow-num {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: var(--accent-2);
+      font-size: 11px;
+      margin-top: 2px;
+    }
+    .flow-text { font-size: 13px; color: #4a5b69; }
+    .arch {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin: 16px 0;
+      box-shadow: var(--shadow);
+    }
+    .arch-layer {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .arch-layer:last-child { border-bottom: none; }
+    .arch-name {
+      min-width: 120px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .arch-items { display: flex; flex-wrap: wrap; gap: 6px; }
+    .arch-chip {
+      font-size: 11.5px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #e9f0f7;
+      color: #35516f;
+      border: 1px solid #d8e2ed;
+    }
+    .arch-layer.l1 { background: #edf3fb; }
+    .arch-layer.l2 { background: #f2f8f4; }
+    .arch-layer.l3 { background: #fef9f2; }
+    .arch-layer.l4 { background: #fdf2f1; }
+    pre {
+      background: #17212b;
+      color: #d7e0ea;
+      border-radius: var(--radius);
+      padding: 20px;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.72;
+      margin: 16px 0;
+      position: relative;
+      box-shadow: var(--shadow);
+    }
+    code {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      background: #eef3f8;
+      border-radius: 4px;
+      padding: 1px 5px;
+      color: #b84c35;
+    }
+    pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 28px;
+      height: 28px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transition: opacity 0.15s ease, background 0.15s ease;
+      color: #d7e0ea;
+      padding: 0;
+    }
+    pre:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { background: rgba(255, 255, 255, 0.18); }
+    .copy-btn.copied { color: #8fe0b7; border-color: #8fe0b7; }
+    .two-col { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 16px; align-items: start; }
+    .mini-list { display: grid; gap: 10px; margin: 12px 0; }
+    .mini-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      box-shadow: var(--shadow);
+    }
+    .mini-item-title { font-size: 13px; font-weight: 700; margin-bottom: 6px; color: #203246; }
+    .mini-item-desc { font-size: 12.5px; color: var(--muted); line-height: 1.66; }
+    footer { text-align: center; padding: 32px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cfd9e6; border-radius: 999px; }
+    @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+    @media (max-width: 700px) {
+      .content { padding: 28px 18px 62px; }
+      h1 { font-size: 26px; }
+      .stats { gap: 10px; }
+      .stat { min-width: calc(50% - 5px); }
+      .arch-layer { flex-direction: column; align-items: flex-start; gap: 8px; }
+    }
+  </style>
+</head>
+<body class="menu-open">
+<header id="header">
+  <button id="menu-toggle" aria-label="切换目录">
+    <span></span><span></span><span></span>
+  </button>
+  <div id="brand">Keil 转 CMake 转换器<sup>GUI 与 CLI 共用同一生成核心</sup></div>
+  <div class="header-meta">
+    <span class="badge">Python</span>
+    <span class="badge">CMake</span>
+    <span class="badge">VS Code</span>
+  </div>
+</header>
+
+<nav id="sidebar">
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">概览</div>
+    <a class="sidebar-link active" href="#overview">项目定位</a>
+    <a class="sidebar-link" href="#stats">代码统计</a>
+    <a class="sidebar-link" href="#architecture">模块结构</a>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">转换过程</div>
+    <a class="sidebar-link" href="#workflow">处理顺序</a>
+    <a class="sidebar-link" href="#ui-cli">GUI 与 CLI</a>
+    <a class="sidebar-link" href="#vscode">VS Code 输出</a>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">芯片支持</div>
+    <a class="sidebar-link" href="#support">支持范围</a>
+    <a class="sidebar-link" href="#stm32f103">STM32F103</a>
+    <a class="sidebar-link" href="#at32f415">AT32F415</a>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">适配说明</div>
+    <a class="sidebar-link" href="#adaptation">适配位置</a>
+    <a class="sidebar-link" href="#outputs">生成文件</a>
+    <a class="sidebar-link" href="#limits">边界与限制</a>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">索引</div>
+    <a class="sidebar-link" href="#code-map">关键函数索引</a>
+  </div>
+</nav>
+
+<main id="main">
+  <div class="content">
+    <section id="overview">
+      <div class="section-label">Project Overview</div>
+      <h1>将 Keil 工程转换为可在 VS Code 中编译、烧录与调试的 CMake 工程</h1>
+      <p class="hero-desc">
+        当前程序的核心职责，是读取 <code>.uvprojx</code> 工程文件，提取目标芯片、源文件、头文件目录、宏定义、编译参数、链接脚本与 RTE 组件信息，然后生成新的 <code>CMakeLists.txt</code>、工具链文件、构建脚本以及 VS Code 配置。生成结果既保留了 Keil 工程的主要构建信息，也补上了 GCC 场景所需的启动文件、链接脚本、调试器配置与产物导出规则。
+      </p>
+      <div class="hero-tags">
+        <span class="tag">PySide6 图形界面</span>
+        <span class="tag">命令行入口</span>
+        <span class="tag">ArmClang</span>
+        <span class="tag">GNU Arm Embedded GCC</span>
+        <span class="tag">OpenOCD</span>
+        <span class="tag">J-Link</span>
+        <span class="tag">Cortex-Debug</span>
+        <span class="tag">RTE 组件解析</span>
+      </div>
+      <div class="notice">
+        当前实现的重点目标，是把 Keil 项目尽量转换为可直接使用的 CMake 工程；其中 <strong>STM32F103</strong> 与 <strong>AT32F415</strong> 已经补齐了较完整的自动处理分支，因此在 VS Code 中使用任务命令进行编译与烧录的成功率较高。其他系列通常仍可完成基础转换，但常需要补写芯片特定规则。
+      </div>
+    </section>
+
+    <section id="stats">
+      <h2>代码统计</h2>
+      <div class="stats">
+        <div class="stat"><div class="stat-num">2918</div><div class="stat-label">Python 代码总行数</div></div>
+        <div class="stat"><div class="stat-num">85</div><div class="stat-label">转换核心函数数</div></div>
+        <div class="stat"><div class="stat-num">2</div><div class="stat-label">编译器选项</div></div>
+        <div class="stat"><div class="stat-num">7</div><div class="stat-label">调试后端与探针枚举数</div></div>
+        <div class="stat"><div class="stat-num">3</div><div class="stat-label">宿主系统枚举数</div></div>
+      </div>
+      <p>代码主体集中在 <code>keil_to_cmake.py</code>。图形界面只是参数收集层，真正的解析、推断、文件写入与 VS Code 配置生成，全部由同一个类完成。</p>
+    </section>
+
+    <section id="architecture">
+      <h2>模块结构</h2>
+      <p>程序分成三个层次：配置入口、Keil 环境发现、工程解析与生成。</p>
+      <div class="arch">
+        <div class="arch-layer l1">
+          <div class="arch-name">UI 层</div>
+          <div class="arch-items">
+            <span class="arch-chip">main.py</span>
+            <span class="arch-chip">PySide6 窗口</span>
+            <span class="arch-chip">配置持久化</span>
+            <span class="arch-chip">参数组合</span>
+          </div>
+        </div>
+        <div class="arch-layer l2">
+          <div class="arch-name">环境层</div>
+          <div class="arch-items">
+            <span class="arch-chip">get_keil_mdk_info.py</span>
+            <span class="arch-chip">TOOLS.INI 检测</span>
+            <span class="arch-chip">RTEPATH</span>
+            <span class="arch-chip">ARMCLANG_PATH</span>
+          </div>
+        </div>
+        <div class="arch-layer l3">
+          <div class="arch-name">转换层</div>
+          <div class="arch-items">
+            <span class="arch-chip">KeilProjectToCMake</span>
+            <span class="arch-chip">XML 解析</span>
+            <span class="arch-chip">宏与目录提取</span>
+            <span class="arch-chip">启动文件补写</span>
+            <span class="arch-chip">链接脚本推断</span>
+          </div>
+        </div>
+        <div class="arch-layer l4">
+          <div class="arch-name">输出层</div>
+          <div class="arch-items">
+            <span class="arch-chip">CMakeLists.txt</span>
+            <span class="arch-chip">cmake/*.cmake</span>
+            <span class="arch-chip">do_build.bat</span>
+            <span class="arch-chip">.vscode/*.json</span>
+            <span class="arch-chip">J-Link 脚本</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-grid">
+        <div class="card">
+          <div class="card-title"><code>main.py</code></div>
+          <div class="card-desc">图形界面负责选择工程文件、Keil MDK 目录、输出目录、编译器、宿主系统、生成器、探针、调试后端与构建目录，并将这些参数封装为 <code>GenerationOptions</code>。</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><code>get_keil_mdk_info.py</code></div>
+          <div class="card-desc">负责发现 Keil 安装位置，读取 <code>TOOLS.INI</code>，取得 <code>RTEPATH</code>、<code>ARMCLANG_PATH</code> 与 <code>UV4.exe</code> 位置，为后续 RTE 搜索与 ArmClang 工具链生成提供依据。</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><code>keil_to_cmake.py</code></div>
+          <div class="card-desc">核心逻辑文件。既负责解析 <code>.uvprojx</code>，也负责推导 GCC 所需的附加信息，还负责写入 CMake 文件、构建脚本、任务配置与调试配置。</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="workflow">
+      <h2>处理顺序</h2>
+      <p>从输入工程文件到生成 VS Code 工程，内部处理大致分为八步。</p>
+      <div class="pipeline">
+        <div class="pipeline-step">
+          <div class="pipeline-num">1</div>
+          <div>
+            <div class="pipeline-title">定位 Keil MDK</div>
+            <div class="pipeline-desc">优先检查显式参数，其次读取环境变量，再扫描常见安装目录与盘符候选目录；最终以 <code>TOOLS.INI</code> 是否存在作为判定依据。</div>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">2</div>
+          <div>
+            <div class="pipeline-title">解析 <code>.uvprojx</code> 基本信息</div>
+            <div class="pipeline-desc">读取目标名、输出目录、输出产物名、目标芯片型号、厂商、CPU 描述串与存储器区间。</div>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">3</div>
+          <div>
+            <div class="pipeline-title">收集源文件与头文件目录</div>
+            <div class="pipeline-desc">遍历 <code>&lt;Group&gt;</code> 与 <code>&lt;File&gt;</code> 节点，将源文件、头文件目录与显式包含目录统一转换为规范绝对目录，再在写文件阶段转回相对表示。</div>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">4</div>
+          <div>
+            <div class="pipeline-title">翻译编译参数</div>
+            <div class="pipeline-desc">将 Keil 中的优化等级、C 标准、C++ 标准、FPU、大小端、R/O PI、LTO 等选项转换为 ArmClang 或 GCC 可理解的标志集合。</div>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">5</div>
+          <div>
+            <div class="pipeline-title">解析链接设置与 RTE 组件</div>
+            <div class="pipeline-desc">提取 scatter 文件、Misc 链接参数，并通过 RTE 组件信息查找 PDSC 文件，把组件自带源文件与目录一并纳入工程。</div>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">6</div>
+          <div>
+            <div class="pipeline-title">为 GCC 做额外推断</div>
+            <div class="pipeline-desc">尝试把 MDK 目录下的启动文件切换到 GCC 版本；如仅存在 ARMASM 启动文件，则自动生成 GNU 汇编版本；如缺失 <code>.ld</code> 文件，则依据 IROM 与 IRAM 自动写出回退链接脚本。</div>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">7</div>
+          <div>
+            <div class="pipeline-title">生成构建与调试文件</div>
+            <div class="pipeline-desc">写入 <code>CMakeLists.txt</code>、工具链文件、构建脚本、VS Code 设置、任务列表、启动配置与 J-Link 命令脚本。</div>
+          </div>
+        </div>
+        <div class="pipeline-step">
+          <div class="pipeline-num">8</div>
+          <div>
+            <div class="pipeline-title">在 VS Code 中执行</div>
+            <div class="pipeline-desc">生成的任务会自动调用 CMake 进行配置与编译；GCC 模式下还会额外产生 ELF、HEX、BIN 与 map 文件，并提供 OpenOCD 或 J-Link 烧录入口。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="ui-cli">
+      <h2>GUI 与 CLI</h2>
+      <div class="two-col">
+        <div>
+          <h3>图形界面负责收集参数</h3>
+          <p>图形界面包含九类主要输入项：工程文件、Keil MDK 目录、输出目录、编译器、宿主系统、Generator、硬件探针、调试后端与构建目录。勾选“生成 VS Code 配置”后，会额外输出 <code>.vscode</code> 目录。</p>
+          <div class="mini-list">
+            <div class="mini-item">
+              <div class="mini-item-title">编译器</div>
+              <div class="mini-item-desc">支持 <code>armclang</code> 与 <code>gcc</code>。二者的默认构建目录分别为 <code>build</code> 与 <code>build-gcc</code>。</div>
+            </div>
+            <div class="mini-item">
+              <div class="mini-item-title">宿主系统</div>
+              <div class="mini-item-desc">支持 Windows、Linux、macOS。调试命令名称与脚本后缀会随宿主系统变化。</div>
+            </div>
+            <div class="mini-item">
+              <div class="mini-item-title">探针与调试后端</div>
+              <div class="mini-item-desc">探针支持 ST-Link、J-Link、DAPLink、Nu-Link、ULINK；后端支持 OpenOCD、J-Link GDB Server、PyOCD、Keil MDK 与关闭调试配置。</div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <h3>命令行便于批量转换</h3>
+          <p>命令行入口覆盖了与图形界面相近的参数集合，适合脚本化批量转换与快速验证。</p>
+<pre><code>python keil_to_cmake.py project.uvprojx ^
+  --compiler gcc ^
+  --host-os windows ^
+  --generator Ninja ^
+  --debug-probe stlink ^
+  --debug-backend openocd ^
+  --build-dir build-gcc ^
+  --export-vsc-settings ^
+  --destination D:\output\demo</code></pre>
+          <div class="notice ok">图形界面与命令行最终都会调用 <code>KeilProjectToCMake.generate_cmake()</code>，因此行为保持一致，差异只在于参数输入方式。</div>
+        </div>
+      </div>
+
+      <h3>构建脚本的作用</h3>
+      <p>程序还会生成 <code>do_build.bat</code> 或 <code>do_build.sh</code>。ArmClang 模式下，Windows 脚本会尝试从 <code>KEIL_MDK_ROOT</code>、用户默认 Keil 目录或常见本地目录自动补全 <code>ARMCLANG_PATH</code>。GCC 模式下则主要负责执行 CMake 配置与编译。</p>
+    </section>
+
+    <section id="vscode">
+      <h2>VS Code 输出</h2>
+      <p>勾选 VS Code 输出后，生成器会写入四类 JSON 文件，并在 GCC 模式下补充 J-Link 命令脚本。</p>
+      <div class="table-wrap">
+        <table>
+          <tr>
+            <th>文件</th>
+            <th>作用</th>
+            <th>要点</th>
+          </tr>
+          <tr>
+            <td class="td-code">settings.json</td>
+            <td>配置 CMake 生成器与构建目录</td>
+            <td>同步 <code>compile_commands.json</code>，ArmClang 模式可写入 <code>cmake.configureEnvironment</code></td>
+          </tr>
+          <tr>
+            <td class="td-code">tasks.json</td>
+            <td>定义配置、编译、重建、烧录与 GDB Server 任务</td>
+            <td>GCC 模式的 Build 任务会指向产物目标，保证生成 <code>.hex</code> 与 <code>.bin</code></td>
+          </tr>
+          <tr>
+            <td class="td-code">launch.json</td>
+            <td>供 Cortex-Debug 扩展使用</td>
+            <td>可生成 OpenOCD、J-Link、PyOCD 启动项，ArmClang 模式下也可保留 Keil 任务</td>
+          </tr>
+          <tr>
+            <td class="td-code">c_cpp_properties.json</td>
+            <td>补全 IntelliSense</td>
+            <td>包含工程目录、解析得到的头文件目录与 <code>compile_commands.json</code></td>
+          </tr>
+        </table>
+      </div>
+
+<pre><code>典型任务名称
+
+Configure GCC Debug
+Build GCC Debug
+Rebuild
+Flash ST-Link ELF
+Flash ST-Link HEX
+Flash ST-Link BIN
+Start ST-Link OpenOCD GDB Server
+Flash J-Link ELF
+Flash J-Link HEX
+Flash J-Link BIN</code></pre>
+
+      <div class="notice warn">这里的“可直接使用”，本质上依赖三个条件同时成立：一是编译选项能成功转换，二是启动文件与链接脚本可被 GCC 使用，三是探针对应的 OpenOCD 或 J-Link 参数对目标芯片是正确的。当前仓库中对 <code>STM32F103</code> 与 <code>AT32F415</code> 已经专门补齐了这三部分中的关键缺口。</div>
+    </section>
+
+    <section id="support">
+      <h2>支持范围</h2>
+      <p>当前实现并非任意 Keil 工程均可零修改转换，而是具备通用解析能力，并对若干常见 Cortex-M 系列做了增强。支持情况可概括为下表。</p>
+      <div class="table-wrap">
+        <table>
+          <tr>
+            <th>目标系列</th>
+            <th>解析阶段</th>
+            <th>GCC 编译阶段</th>
+            <th>VS Code 烧录阶段</th>
+            <th>当前判断</th>
+          </tr>
+          <tr>
+            <td>STM32F103</td>
+            <td>完整</td>
+            <td>完整，含启动文件转换、<code>core_cm3.c</code> 修补、F1 宏推断、回退 <code>.ld</code></td>
+            <td>完整，OpenOCD 默认目标指向 <code>stm32f1x.cfg</code></td>
+            <td>可直接使用</td>
+          </tr>
+          <tr>
+            <td>AT32F415</td>
+            <td>完整</td>
+            <td>完整，支持 MDK 启动文件切换到 GCC 版本并推断 <code>AT32F415xB_FLASH.ld</code></td>
+            <td>完整，OpenOCD 默认目标指向 <code>artery/at32f4x.cfg</code>，J-Link 启动项可生成</td>
+            <td>可直接使用</td>
+          </tr>
+          <tr>
+            <td>其他 STM32 系列</td>
+            <td>大多可解析</td>
+            <td>视启动文件、链接脚本与宏约定而定</td>
+            <td>OpenOCD 目标脚本仅覆盖 F0、F1、F3、F4、G0</td>
+            <td>常需适配</td>
+          </tr>
+          <tr>
+            <td>其他 AT32 系列</td>
+            <td>大多可解析</td>
+            <td>若目录结构与 F415 相近，编译机会较高</td>
+            <td>OpenOCD 默认仅写死到 <code>at32f4x.cfg</code></td>
+            <td>常需适配</td>
+          </tr>
+          <tr>
+            <td>其他厂商 Cortex-M</td>
+            <td>基础解析通常可用</td>
+            <td>需补写宏、启动文件、链接脚本或工具链细节</td>
+            <td>探针目标脚本与器件名通常需手工补充</td>
+            <td>需要较多适配</td>
+          </tr>
+        </table>
+      </div>
+    </section>
+
+    <section id="stm32f103">
+      <h2>STM32F103 可直接使用的原因</h2>
+      <p>当前代码对 STM32F103 的兼容处理最完整，尤其照顾了 Keil 老工程中常见的标准库目录结构与 ARMASM 启动文件格式。这一分支并非只做到能解析工程，而是针对 GCC 构建与 VS Code 调试阶段补了多个细节。</p>
+
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-num">1</div>
+          <div class="flow-text"><strong>自动推断 F1 标准库宏</strong>：会从启动文件名中提取 <code>STM32F10X_MD</code> 等宏；若启动文件无法直接给出，程序还会依据芯片名与 Flash 容量推断低密度、中密度、高密度或互联型宏。</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-num">2</div>
+          <div class="flow-text"><strong>ARMASM 启动文件自动改写为 GNU 汇编</strong>：对于仅包含 <code>startup_stm32f10x_*.s</code> 的 Keil 项目，可从向量表解析中断入口并生成新的 <code>startup_..._gcc.S</code>。</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-num">3</div>
+          <div class="flow-text"><strong>修补 <code>core_cm3.c</code> 的 GCC 约束问题</strong>：检测到旧版 CMSIS 的 <code>strex/strexb/strexh</code> 内联汇编写法后，会生成修补后的 <code>core_cm3_gcc.c</code>，避免 GCC 编译报错。</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-num">4</div>
+          <div class="flow-text"><strong>缺失 <code>.ld</code> 时自动生成回退脚本</strong>：根据 <code>IROM</code> 与 <code>IRAM</code> 的地址和长度写出新的 <code>generated_linker.ld</code>，因此老式 Keil 工程即使只有 scatter 信息，也能继续生成 GCC 工程。</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-num">5</div>
+          <div class="flow-text"><strong>OpenOCD 默认目标脚本已经就位</strong>：芯片名前缀匹配到 <code>STM32F1</code> 后，会自动采用 <code>target/stm32f1x.cfg</code>。</div>
+        </div>
+      </div>
+
+<pre><code>生成结果中的典型宏
+
+USE_STDPERIPH_DRIVER
+STM32F10X_MD
+STM32F103C8
+
+生成结果中的典型 CPU 选项
+
+-mthumb
+-mcpu=cortex-m3
+-mfloat-abi=soft
+-mlittle-endian</code></pre>
+
+      <div class="notice ok">这组处理基本覆盖了 STM32F103 旧工程从 Keil 迁移到 GCC 时最常见的四个问题：宏缺失、启动文件语法不兼容、CMSIS 内联汇编报错、<code>.ld</code> 文件不存在。</div>
+    </section>
+
+    <section id="at32f415">
+      <h2>AT32F415 可直接使用的原因</h2>
+      <p><code>AT32F415</code> 分支的优势在于，很多工程本身就同时带有 GCC 启动文件与 <code>.ld</code> 文件。当前程序又针对 ArteryTek 系列补了默认 OpenOCD 目标脚本，因此整体转换难度明显低于只有 MDK 启动文件的老工程。</p>
+
+      <h3>当前实现已经覆盖的关键点</h3>
+      <div class="table-wrap">
+        <table>
+          <tr>
+            <th>处理点</th>
+            <th>当前行为</th>
+            <th>意义</th>
+          </tr>
+          <tr>
+            <td>启动文件目录切换</td>
+            <td>若检测到源文件位置包含 <code>/startup/mdk/</code>，会优先尝试切换到 <code>/startup/gcc/</code></td>
+            <td>避免继续使用仅适用于 ARMASM 的启动文件</td>
+          </tr>
+          <tr>
+            <td>链接脚本推断</td>
+            <td>会优先在启动文件同级的 <code>linker</code> 目录内搜索 <code>.ld</code>，并依据芯片名、内存码与文件名权重选出最佳候选</td>
+            <td>可自动找到类似 <code>AT32F415xB_FLASH.ld</code> 的文件</td>
+          </tr>
+          <tr>
+            <td>OpenOCD 默认目标脚本</td>
+            <td>厂商为 <code>ArteryTek</code> 或设备名前缀为 <code>AT32</code> 时，默认使用 <code>target/artery/at32f4x.cfg</code></td>
+            <td>使 ST-Link 场景能自动生成可用任务</td>
+          </tr>
+          <tr>
+            <td>本地 <code>openocd</code> 目录匹配</td>
+            <td>若工程目录或上级目录存在 <code>openocd</code> 文件夹，会对其中 <code>.cfg</code> 文件做器件名与探针名匹配</td>
+            <td>优先使用工程自带的板级配置，而不是通用目标脚本</td>
+          </tr>
+          <tr>
+            <td>J-Link 启动配置</td>
+            <td>会额外生成 J-Link 的烧录脚本与 Cortex-Debug 启动项</td>
+            <td>便于在 ST-Link 之外切换到 J-Link</td>
+          </tr>
+        </table>
+      </div>
+
+<pre><code>AT32F415 工程中常见的生成特征
+
+startup/gcc/startup_at32f415.s
+startup/gcc/linker/AT32F415xB_FLASH.ld
+openocd/at32f415_stlink.cfg
+launch.json 中的 OpenOCD 与 J-Link 启动项</code></pre>
+
+      <div class="notice ok">因此，AT32F415 系列之所以能在 VS Code 中较顺畅地执行任务命令，关键不在于程序识别了芯片名，而在于 GCC 启动文件、<code>.ld</code> 文件、OpenOCD 脚本、调试器参数四项都已有相应的自动处理。</div>
+    </section>
+
+    <section id="adaptation">
+      <h2>其他系列需要修改的位置</h2>
+      <p>如果目标不是 STM32F103 或 AT32F415，通常从下表这些位置开始修改即可。这里给出的不是笼统建议，而是当前代码中真正决定转换结果的几个关键函数。</p>
+      <div class="table-wrap">
+        <table>
+          <tr>
+            <th>适配项</th>
+            <th>当前函数</th>
+            <th>何时需要修改</th>
+            <th>修改方向</th>
+          </tr>
+          <tr>
+            <td>设备宏推断</td>
+            <td class="td-code">_format_stm32_startup_define()<br>_infer_stm32f1_stdperiph_define()<br>_inferred_device_defines()</td>
+            <td>标准库、HAL、厂商头文件依赖额外器件宏时</td>
+            <td>增加新系列的宏映射规则，例如 <code>STM32G4xx</code>、<code>AT32F437xx</code>、<code>GD32F30X_HD</code> 等</td>
+          </tr>
+          <tr>
+            <td>启动文件转换</td>
+            <td class="td-code">_map_source_for_gcc()<br>_generate_gnu_startup_from_armasm()<br>_prepared_gcc_source_files()</td>
+            <td>工程只有 MDK 启动文件，或者启动文件目录命名与当前约定不同</td>
+            <td>补充新的目录替换规则，或为新厂商的 ARMASM 启动文件写专用转换逻辑</td>
+          </tr>
+          <tr>
+            <td>链接脚本识别</td>
+            <td class="td-code">_guess_gcc_linker_script()<br>_score_linker_script_candidate()<br>_generate_fallback_gcc_linker_script()</td>
+            <td><code>.ld</code> 文件查找不到，或查到了错误文件</td>
+            <td>增加系列特征、文件名权重，必要时扩展回退脚本模板</td>
+          </tr>
+          <tr>
+            <td>OpenOCD 目标脚本</td>
+            <td class="td-code">_default_openocd_target_script()<br>_guess_openocd_config()</td>
+            <td>芯片不属于当前覆盖的 F0、F1、F3、F4、G0、AT32F4</td>
+            <td>新增设备族到目标脚本的对应关系，或优化本地 <code>.cfg</code> 匹配权重</td>
+          </tr>
+          <tr>
+            <td>探针与后端组合</td>
+            <td class="td-code">_probe_supports_backend()<br>_selected_debug_backends()</td>
+            <td>需要新增探针类型或后端组合限制时</td>
+            <td>扩展枚举，并校正允许的组合关系</td>
+          </tr>
+          <tr>
+            <td>J-Link 设备名与 BIN 烧录地址</td>
+            <td class="td-code">_jlink_flash_device()<br>_write_jlink_scripts()<br>_build_vscode_tasks()</td>
+            <td>芯片 Flash 基址不是 <code>0x08000000</code>，或 J-Link 识别名与设备名不同</td>
+            <td>改写设备名来源与 BIN 烧录地址</td>
+          </tr>
+          <tr>
+            <td>宿主系统命令名</td>
+            <td class="td-code">_host_command_names()</td>
+            <td>需要适配额外系统，或命令名在本地环境中不同</td>
+            <td>补充命令映射与脚本后缀</td>
+          </tr>
+        </table>
+      </div>
+
+      <h3>常见适配顺序</h3>
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-num">1</div>
+          <div class="flow-text">先确认生成后的 <code>CMakeLists.txt</code> 是否引用了正确的启动文件与链接脚本。</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-num">2</div>
+          <div class="flow-text">再确认 <code>target_compile_definitions()</code> 中的器件宏是否满足厂商库的头文件判断。</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-num">3</div>
+          <div class="flow-text">随后检查 <code>launch.json</code> 与 <code>tasks.json</code> 中的探针脚本、GDB Server 类型与器件名。</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-num">4</div>
+          <div class="flow-text">最后处理少量编译器差异，例如内联汇编、库函数、链接符号或厂商专用启动代码。</div>
+        </div>
+      </div>
+
+<pre><code>新增一个设备族时，常见修改点示意
+
+def _default_openocd_target_script(self) -> str:
+    clean_device = self._clean_device_name().upper()
+    if clean_device.startswith("STM32G4"):
+        return "target/stm32g4x.cfg"
+    if clean_device.startswith("GD32F30"):
+        return "target/stm32f1x.cfg"
+    ...</code></pre>
+
+      <div class="notice warn">当前代码里最容易被忽略的细节，是 BIN 烧录地址写死为 <code>0x08000000</code>。如果目标系列使用不同的程序存储区基址，这一项必须同步调整。</div>
+    </section>
+
+    <section id="outputs">
+      <h2>生成文件结构</h2>
+      <p>输出目录中的文件结构大致如下。不同编译器模式会略有差异，但主干目录相同。</p>
+<pre><code>output/
+├─ CMakeLists.txt
+├─ do_build.bat | do_build.sh
+├─ cmake/
+│  ├─ armclang.cmake
+│  ├─ arm-none-eabi-toolchain.cmake
+│  ├─ generated_linker.ld
+│  ├─ startup_xxx_gcc.S
+│  └─ core_cm3_gcc.c
+└─ .vscode/
+   ├─ settings.json
+   ├─ tasks.json
+   ├─ launch.json
+   ├─ c_cpp_properties.json
+   ├─ jlink_flash_elf.jlink
+   ├─ jlink_flash_hex.jlink
+   └─ jlink_flash_bin.jlink</code></pre>
+
+      <div class="card-grid">
+        <div class="card">
+          <div class="card-title"><code>CMakeLists.txt</code></div>
+          <div class="card-desc">这是生成结果的中心文件。ArmClang 模式会保留 Keil 风格的 scatter 文件使用方式；GCC 模式会写入 <code>target_compile_options()</code>、<code>target_link_options()</code> 与产物生成命令。</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><code>cmake/*.cmake</code></div>
+          <div class="card-desc">工具链文件按编译器分离。ArmClang 模式依赖 <code>ARMCLANG_PATH</code>，GCC 模式通过 <code>find_program()</code> 搜索 <code>arm-none-eabi-*</code> 工具集。</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><code>.vscode/tasks.json</code></div>
+          <div class="card-desc">这里定义了配置、编译、重建、烧录与启动 GDB Server 的任务，是 VS Code 内部真正触发编译与烧录的入口。</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><code>.vscode/launch.json</code></div>
+          <div class="card-desc">提供 Cortex-Debug 所需的启动项，便于直接在 VS Code 中下载程序并连接调试器。</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="limits">
+      <h2>边界与限制</h2>
+      <p>当前实现已经比只生成一个 CMakeLists.txt 更进一步，但仍有几个边界需要在阅读和使用时保持清楚。</p>
+      <div class="notice err">程序目前主要依据 Cortex-M 目录结构、器件名前缀与少量厂商特征进行判断，并没有内建一套完整的“所有厂商、所有系列”器件数据库。因此系列名称只要偏离当前规则，就可能出现宏名错误、链接脚本误选或探针脚本错误。</div>
+      <div class="table-wrap">
+        <table>
+          <tr>
+            <th>类别</th>
+            <th>当前状态</th>
+            <th>可能影响</th>
+          </tr>
+          <tr>
+            <td>OpenOCD 默认目标脚本</td>
+            <td>仅显式覆盖 STM32F0、F1、F3、F4、G0 与 AT32F4</td>
+            <td>新系列会回退到不合适的目标脚本</td>
+          </tr>
+          <tr>
+            <td>设备宏推断</td>
+            <td>对 STM32F1 做了特别处理，对其他系列较保守</td>
+            <td>标准库或 HAL 头文件可能缺少关键宏</td>
+          </tr>
+          <tr>
+            <td>J-Link 烧录脚本</td>
+            <td>BIN 下载地址固定写为 <code>0x08000000</code></td>
+            <td>非标准 Flash 基址设备无法直接使用 BIN 任务</td>
+          </tr>
+          <tr>
+            <td>回退链接脚本</td>
+            <td>依据 IROM 与 IRAM 信息生成通用模板</td>
+            <td>复杂存储器布局、外部 RAM、特殊段属性场景仍需手工调整</td>
+          </tr>
+          <tr>
+            <td>启动文件转换</td>
+            <td>针对常见 ARMASM 向量表写法</td>
+            <td>厂商自定义语法或复杂预处理时可能需要单独处理</td>
+          </tr>
+        </table>
+      </div>
+    </section>
+
+    <section id="code-map">
+      <h2>关键函数索引</h2>
+      <p>阅读代码时，按下面的顺序进入会比较高效。</p>
+      <div class="table-wrap">
+        <table>
+          <tr>
+            <th>函数</th>
+            <th>所在文件</th>
+            <th>职责</th>
+          </tr>
+          <tr>
+            <td class="td-code">find_keil_mdk_root()</td>
+            <td>get_keil_mdk_info.py</td>
+            <td>寻找 Keil 安装目录</td>
+          </tr>
+          <tr>
+            <td class="td-code">get_keil_mdk_info()</td>
+            <td>get_keil_mdk_info.py</td>
+            <td>解析 <code>TOOLS.INI</code>，提取 RTE 与 ArmClang 信息</td>
+          </tr>
+          <tr>
+            <td class="td-code">Widget._current_options()</td>
+            <td>main.py</td>
+            <td>把 GUI 选择组合成 <code>GenerationOptions</code></td>
+          </tr>
+          <tr>
+            <td class="td-code">Widget.on_pushbuttonConvert_clicked()</td>
+            <td>main.py</td>
+            <td>图形界面触发转换的实际入口</td>
+          </tr>
+          <tr>
+            <td class="td-code">KeilProjectToCMake.parse()</td>
+            <td>keil_to_cmake.py</td>
+            <td>总解析入口</td>
+          </tr>
+          <tr>
+            <td class="td-code">_parse_project_info()</td>
+            <td>keil_to_cmake.py</td>
+            <td>目标名、输出目录、输出文件名</td>
+          </tr>
+          <tr>
+            <td class="td-code">_parse_target_info()</td>
+            <td>keil_to_cmake.py</td>
+            <td>设备名、厂商、CPU 与 IROM、IRAM</td>
+          </tr>
+          <tr>
+            <td class="td-code">_parse_source_files()</td>
+            <td>keil_to_cmake.py</td>
+            <td>收集源文件、头文件与目录</td>
+          </tr>
+          <tr>
+            <td class="td-code">_parse_compiler_settings()</td>
+            <td>keil_to_cmake.py</td>
+            <td>翻译编译参数与 CPU 标志</td>
+          </tr>
+          <tr>
+            <td class="td-code">_parse_runtime_env()</td>
+            <td>keil_to_cmake.py</td>
+            <td>读取 RTE 组件与 PDSC 文件</td>
+          </tr>
+          <tr>
+            <td class="td-code">_prepared_gcc_source_files()</td>
+            <td>keil_to_cmake.py</td>
+            <td>为 GCC 准备启动文件与修补源文件</td>
+          </tr>
+          <tr>
+            <td class="td-code">_guess_gcc_linker_script()</td>
+            <td>keil_to_cmake.py</td>
+            <td>寻找最佳 <code>.ld</code> 文件</td>
+          </tr>
+          <tr>
+            <td class="td-code">_build_vscode_tasks()</td>
+            <td>keil_to_cmake.py</td>
+            <td>生成任务列表</td>
+          </tr>
+          <tr>
+            <td class="td-code">_build_vscode_launch()</td>
+            <td>keil_to_cmake.py</td>
+            <td>生成调试启动项</td>
+          </tr>
+          <tr>
+            <td class="td-code">generate_cmake()</td>
+            <td>keil_to_cmake.py</td>
+            <td>对外总生成入口</td>
+          </tr>
+        </table>
+      </div>
+
+      <div class="notice">如果关注“为何 F103 与 F415 能直接使用”，优先阅读 <code>_inferred_device_defines()</code>、<code>_generate_gnu_startup_from_armasm()</code>、<code>_generate_fallback_gcc_linker_script()</code>、<code>_default_openocd_target_script()</code> 与 <code>_build_vscode_tasks()</code> 这几组函数即可。</div>
+    </section>
+  </div>
+
+  <footer>
+    Keil 转 CMake 转换器技术介绍页 · 依据当前仓库实现整理 · 模版结构参考 AC7916.html
+  </footer>
+</main>
+
+<script>
+  const toggle = document.getElementById('menu-toggle');
+  toggle.addEventListener('click', () => {
+    document.body.classList.toggle('menu-open');
+  });
+
+  const sections = document.querySelectorAll('section[id]');
+  const links = document.querySelectorAll('.sidebar-link');
+
+  function updateActive() {
+    let current = '';
+    sections.forEach(sec => {
+      const top = sec.getBoundingClientRect().top;
+      if (top <= 88) current = sec.id;
+    });
+
+    links.forEach(a => {
+      const isActive = a.getAttribute('href') === '#' + current;
+      a.classList.toggle('active', isActive);
+      if (isActive) a.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  document.getElementById('main').addEventListener('scroll', updateActive);
+  window.addEventListener('scroll', updateActive);
+  updateActive();
+
+  document.querySelectorAll('pre').forEach(pre => {
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.title = '复制代码';
+    btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+    btn.addEventListener('click', () => {
+      const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+      navigator.clipboard.writeText(code).then(() => {
+        btn.classList.add('copied');
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+        setTimeout(() => {
+          btn.classList.remove('copied');
+          btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+        }, 2000);
+      });
+    });
+    pre.appendChild(btn);
+  });
+
+  links.forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const target = document.querySelector(a.getAttribute('href'));
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      if (window.innerWidth < 700) document.body.classList.remove('menu-open');
+    });
+  });
+</script>
+</body>
+</html>

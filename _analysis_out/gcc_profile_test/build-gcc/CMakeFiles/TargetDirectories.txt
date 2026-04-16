@@ -1,0 +1,4 @@
+D:/github/other/keil_translate_cmake/_analysis_out/gcc_profile_test/build-gcc/CMakeFiles/foc_esc.dir
+D:/github/other/keil_translate_cmake/_analysis_out/gcc_profile_test/build-gcc/CMakeFiles/foc_esc_artifacts.dir
+D:/github/other/keil_translate_cmake/_analysis_out/gcc_profile_test/build-gcc/CMakeFiles/edit_cache.dir
+D:/github/other/keil_translate_cmake/_analysis_out/gcc_profile_test/build-gcc/CMakeFiles/rebuild_cache.dir
