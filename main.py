@@ -1,20 +1,42 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import sys
+from pathlib import Path
 
-from PySide6.QtCore import QDir, QSettings, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import (
+    QEasingCurve,
+    QDir,
+    QObject,
+    QPropertyAnimation,
+    QSettings,
+    Qt,
+    QThread,
+    QUrl,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import QDesktopServices, QFont, QIcon
+from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
+    QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
+    QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
+    QStackedWidget,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -33,434 +55,1049 @@ from keil_to_cmake import (
 )
 
 
-class Widget(QWidget):
+def _config_file_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "config.ini"
+    return Path(__file__).resolve().parent / "config.ini"
+
+
+def _resource_path(relative_path: str) -> Path:
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base_path / relative_path
+
+
+APP_STYLE = """
+QWidget {
+    color: #17243a;
+    background: #edf2f7;
+    font-family: "Segoe UI Variable", "Microsoft YaHei UI";
+    font-size: 12px;
+}
+QMainWindow { background: #edf2f7; }
+QFrame#navRail { background: #ffffff; border-right: 1px solid #b9c6d3; }
+QLabel#railMark {
+    color: #ffffff; background: #126fe8; border-radius: 12px;
+    font-family: "Bahnschrift"; font-size: 21px; font-weight: 800;
+}
+QLabel#railCaption { color: #60748a; font-size: 9px; font-weight: 700; min-height: 14px; }
+QPushButton#navButton {
+    min-height: 46px; max-height: 46px;
+    color: #50657b; background: transparent; border: none; border-radius: 9px;
+    padding: 0 12px; text-align: left; font-size: 11px; font-weight: 700;
+}
+QPushButton#navButton:hover { color: #126fe8; background: #edf5ff; }
+QPushButton#navButtonActive {
+    min-height: 46px; max-height: 46px;
+    color: #ffffff; background: #126fe8; border: none; border-radius: 9px;
+    padding: 0 12px; text-align: left; font-size: 11px; font-weight: 800;
+}
+QFrame#topBar { background: #ffffff; border-bottom: 1px solid #b8c5d2; }
+QFrame#statusBar { background: #ffffff; border-top: 1px solid #b8c5d2; }
+QLabel#brand { color: #10233c; font-family: "Bahnschrift"; font-size: 22px; font-weight: 800; }
+QLabel#eyebrow { color: #1688d0; font-family: "Bahnschrift"; font-size: 10px; font-weight: 800; }
+QLabel#muted { color: #52677d; min-height: 18px; }
+QLabel#section { color: #142842; font-family: "Bahnschrift"; font-size: 15px; font-weight: 700; min-height: 22px; }
+QLabel#fieldLabel { color: #4f6378; font-size: 10px; font-weight: 700; min-height: 16px; }
+QLabel#statusPill {
+    color: #08785f; background: #e5f7f1; border: 1px solid #b9e6d9;
+    border-radius: 10px; padding: 3px 10px; font-size: 10px; font-weight: 800;
+}
+QLabel#statusPill[state="running"] {
+    color: #0b6c91; background: #e4f5fb; border-color: #b6deec;
+}
+QLabel#statusPill[state="success"] {
+    color: #08785f; background: #e5f7f1; border-color: #b9e6d9;
+}
+QLabel#statusPill[state="failed"] {
+    color: #9b3b3b; background: #fff0ef; border-color: #efc7c3;
+}
+QFrame#pipeline {
+    background: #f8fbfe; border: 1px solid #aebfd0; border-radius: 10px;
+}
+QFrame#stage { background: transparent; border: none; }
+QLabel#stageIndex {
+    color: #ffffff; background: #1688d0; border-radius: 10px;
+    min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px;
+    font-family: "Bahnschrift"; font-size: 10px; font-weight: 800;
+}
+QLabel#stageIndex[state="pending"] { color: #668096; background: #dbe7f0; }
+QLabel#stageIndex[state="running"] { color: #ffffff; background: #18a8c9; }
+QLabel#stageIndex[state="complete"] { color: #ffffff; background: #1688d0; }
+QLabel#stageIndex[state="failed"] { color: #ffffff; background: #c94b4b; }
+QLabel#stageName { color: #203954; font-size: 11px; font-weight: 700; }
+QLabel#stageName[state="pending"] { color: #71879a; }
+QLabel#stageName[state="running"] { color: #087da8; }
+QLabel#stageName[state="complete"] { color: #203954; }
+QLabel#stageName[state="failed"] { color: #a63f3f; }
+QLabel#stageName { min-height: 18px; }
+QLabel#stageDetail { color: #5d7389; font-size: 9px; min-height: 14px; }
+QFrame#inspector { background: #ffffff; border-left: 1px solid #aebdcb; }
+QScrollArea#inspectorScroll { background: #ffffff; border: none; }
+QFrame#metric { background: #f8fafc; border: 1px solid #aebdcb; border-radius: 8px; min-height: 52px; }
+QLabel#metricValue { color: #142b48; font-family: "Bahnschrift"; font-size: 14px; font-weight: 800; min-height: 20px; }
+QLineEdit, QComboBox {
+    min-height: 35px; color: #1d3048; background: #ffffff;
+    border: 1px solid #8296aa; border-radius: 6px; padding: 0 10px;
+    selection-background-color: #b9def5;
+}
+QLineEdit:hover, QComboBox:hover { border-color: #587a99; background: #fbfdff; }
+QLineEdit:focus, QComboBox:focus { border: 2px solid #0878c9; padding: 0 9px; }
+QComboBox::drop-down { border: none; width: 26px; }
+QComboBox QAbstractItemView {
+    color: #1d3048; background: #ffffff; border: 1px solid #8296aa;
+    selection-background-color: #dceefa; padding: 4px;
+}
+QPushButton {
+    min-height: 35px; color: #294158; background: #ffffff;
+    border: 1px solid #8fa2b5; border-radius: 6px; padding: 0 14px; font-weight: 650;
+}
+QPushButton:hover { color: #075f9d; background: #eaf5fc; border-color: #4f87ad; }
+QPushButton:pressed { background: #e6f1f8; }
+QPushButton#primary {
+    min-height: 40px; color: #ffffff; background: #1387d4;
+    border: 1px solid #0f79bf; border-radius: 7px; padding: 0 22px;
+    font-family: "Bahnschrift"; font-size: 13px; font-weight: 800;
+}
+QPushButton#primary:hover { background: #0879c3; }
+QPushButton#primary:disabled { color: #dceaf5; background: #8bb8d6; border-color: #8bb8d6; }
+QCheckBox { spacing: 8px; color: #425a72; }
+QCheckBox::indicator {
+    width: 16px; height: 16px; background: #ffffff;
+    border: 1px solid #7f93a7; border-radius: 3px;
+}
+QCheckBox::indicator:checked { background: #1387d4; border-color: #1387d4; }
+QFrame#console { background: #ffffff; border-top: 1px solid #aebdcb; }
+QLabel#consoleTitle { color: #22364d; font-family: "Bahnschrift"; font-size: 12px; font-weight: 700; min-height: 20px; }
+QPushButton#consoleButton { color: #63758a; background: transparent; border: none; min-height: 28px; padding: 0 8px; }
+QPushButton#consoleButton:hover { color: #126fe8; background: #edf5ff; }
+QTextBrowser {
+    color: #293f56; background: #f7fafc; border: 1px solid #aebdcb; border-radius: 4px;
+    padding: 8px 16px; font-family: "Cascadia Mono", "Consolas"; font-size: 11px;
+}
+QProgressBar#mainProgress {
+    min-height: 3px; max-height: 3px; background: #dfe9f2; border: none;
+}
+QProgressBar#mainProgress::chunk { background: #19a6d8; }
+QProgressBar#memoryBar {
+    min-height: 7px; max-height: 7px; background: #e4edf4; border: none; border-radius: 3px;
+}
+QProgressBar#memoryBar::chunk { background: #18a8c9; border-radius: 3px; }
+QScrollArea { border: none; background: #edf2f7; }
+QStackedWidget { background: #edf2f7; }
+QSplitter::handle { background: #aebdcb; }
+QSplitter::handle:hover { background: #9fc8df; }
+QSplitter::handle:horizontal { width: 2px; }
+QSplitter::handle:vertical { height: 2px; }
+"""
+
+
+class ConversionWorker(QObject):
+    log = Signal(str)
+    memory_usage = Signal(int, int, int, int)
+    finished = Signal(bool, str, str)
+
+    def __init__(
+        self,
+        project_file: str,
+        output_dir: str,
+        uv4_path: str,
+        target_name: str,
+        options: GenerationOptions,
+        validate_build: bool,
+    ):
+        super().__init__()
+        self.project_file = project_file
+        self.output_dir = output_dir
+        self.uv4_path = uv4_path
+        self.target_name = target_name
+        self.options = options
+        self.validate_build = validate_build
+
+    @staticmethod
+    def _memory_bytes(value, unit):
+        factors = {"B": 1, "KB": 1024, "MB": 1024 * 1024}
+        return int(float(value) * factors.get(unit.upper(), 1))
+
+    @classmethod
+    def _parse_memory_usage(cls, output, parser):
+        values = {}
+        pattern = re.compile(
+            r"^\s*(FLASH|RAM):\s+([0-9.]+)\s+(B|KB|MB)\s+"
+            r"([0-9.]+)\s+(B|KB|MB)",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        for match in pattern.finditer(output or ""):
+            values[match.group(1).upper()] = (
+                cls._memory_bytes(match.group(2), match.group(3)),
+                cls._memory_bytes(match.group(4), match.group(5)),
+            )
+
+        flash_used, flash_total = values.get(
+            "FLASH", (0, int(parser.flash_length or 0))
+        )
+        ram_used, ram_total = values.get("RAM", (0, int(parser.ram_length or 0)))
+        return flash_used, flash_total, ram_used, ram_total
+
+    @Slot()
+    def run(self):
+        try:
+            self.log.emit(
+                f"构建配置: 编译器={self.options.compiler} | "
+                f"生成器={self.options.generator} | 构建目录={self.options.build_dir}"
+            )
+            self.log.emit("解析 Keil 工程...")
+            parser = KeilProjectToCMake(
+                self.project_file,
+                self.uv4_path or None,
+                target_name=self.target_name or None,
+            )
+            if not parser.parse():
+                self.finished.emit(False, parser.last_error or "解析失败", "")
+                return
+
+            self.log.emit(
+                f"目标: {parser.target_name} | 设备: {parser.device_name} | 源文件: {len(parser.source_files)}"
+            )
+            self.log.emit("生成 CMake、工具链和 VS Code 配置...")
+            if not parser.generate_cmake(
+                self.output_dir,
+                self.options.export_vsc_settings,
+                self.options,
+            ):
+                self.finished.emit(False, parser.last_error or "生成失败", "")
+                return
+
+            for warning in parser.warnings:
+                self.log.emit(f"警告: {warning}")
+
+            if self.validate_build:
+                self.log.emit("执行 CMake 配置与编译验证...")
+                report = parser.validate_generated_build(
+                    self.output_dir,
+                    self.options,
+                    timeout_seconds=600,
+                )
+                if report.status != "success":
+                    categories = ", ".join(
+                        diagnostic.category for diagnostic in report.diagnostics
+                    )
+                    result = report.build or report.configure
+                    raw_detail = "\n".join(
+                        part
+                        for part in (result.error, result.stderr, result.stdout)
+                        if part
+                    )
+                    detail_lines = [
+                        line.strip() for line in raw_detail.splitlines() if line.strip()
+                    ]
+                    important_lines = [
+                        line
+                        for line in detail_lines
+                        if any(
+                            marker in line.lower()
+                            for marker in (
+                                "error",
+                                "fatal",
+                                "undefined reference",
+                                "not set",
+                                "not found",
+                                "failed",
+                            )
+                        )
+                    ]
+                    summary_lines = (important_lines or detail_lines)[-8:]
+                    summary = "\n".join(summary_lines)
+                    if summary:
+                        self.log.emit("构建错误摘要:\n" + summary)
+                    message = f"构建验证失败: {categories}"
+                    if summary:
+                        message += "\n\n" + summary
+                    self.finished.emit(False, message, self.output_dir)
+                    return
+                build_output = "\n".join(
+                    part
+                    for part in (report.build.stdout, report.build.stderr)
+                    if part
+                )
+                self.memory_usage.emit(
+                    *self._parse_memory_usage(build_output, parser)
+                )
+                self.log.emit("构建验证通过，ELF、HEX、BIN 产物生成完成。")
+
+            self.finished.emit(True, "转换完成", self.output_dir)
+        except Exception as exc:
+            self.finished.emit(False, str(exc), self.output_dir)
+
+
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.worker_thread = None
+        self.worker = None
+        self.stage_badges = []
+        self.stage_names = []
+        self.current_stage = 0
+        self._entrance_animation = None
+        self.setWindowTitle("Keil Forge · CMake Converter")
+        self.setMinimumSize(960, 520)
+        self.resize(1400, 900)
+        self._build_ui()
+        self._connect_signals()
+        self._load_config()
 
-        self.uvproj_filepath = ""
-        self.output_directory = ""
-        self.uv4_path = ""
+    def _build_ui(self):
+        root = QWidget()
+        root.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        self.setup_ui()
-        self.setWindowTitle("Keil UVPROJX to CMake Converter")
-        self.resize(960, 680)
-        self.load_config()
+        self.nav_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.nav_splitter.setChildrenCollapsible(False)
+        self.nav_splitter.setHandleWidth(2)
 
-    def closeEvent(self, event):
-        self.save_config()
-        event.accept()
+        rail = QFrame(objectName="navRail")
+        rail.setMinimumWidth(108)
+        rail.setMaximumWidth(220)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(18, 22, 18, 18)
+        rail_layout.setSpacing(10)
 
-    def setup_ui(self):
-        label_uvproj = QLabel("uvprojx 路径:")
-        label_uv4 = QLabel("Keil MDK 路径:")
-        label_output = QLabel("输出目录:")
-        label_compiler = QLabel("编译器:")
-        label_host = QLabel("宿主系统:")
-        label_generator = QLabel("Generator:")
-        label_probe = QLabel("硬件探针:")
-        label_debugger = QLabel("调试后端:")
-        label_build_dir = QLabel("构建目录:")
-        label_info = QLabel("当前配置:")
-        label_log = QLabel("转换日志:")
+        rail_mark = QSvgWidget(str(_resource_path("assets/keilforge-mark.svg")))
+        rail_mark.setFixedSize(48, 48)
+        rail_layout.addWidget(rail_mark, 0, Qt.AlignmentFlag.AlignHCenter)
+        rail_layout.addSpacing(18)
 
-        self.lineeditUvProjFilepath = QLineEdit()
-        self.lineeditUv4Path = QLineEdit()
-        self.lineeditOutputDirectory = QLineEdit()
-        self.lineeditBuildDir = QLineEdit()
-
-        self.comboCompiler = QComboBox()
-        for key, label in SUPPORTED_COMPILERS.items():
-            self.comboCompiler.addItem(label, key)
-
-        self.comboHostOs = QComboBox()
-        for key, label in SUPPORTED_HOST_SYSTEMS.items():
-            self.comboHostOs.addItem(label, key)
-
-        self.comboGenerator = QComboBox()
-        self.comboGenerator.setEditable(True)
-
-        self.comboDebugProbe = QComboBox()
-        for key, label in SUPPORTED_DEBUG_PROBES.items():
-            self.comboDebugProbe.addItem(label, key)
-
-        self.comboDebugger = QComboBox()
-        for key, label in SUPPORTED_DEBUG_BACKENDS.items():
-            self.comboDebugger.addItem(label, key)
-        self._sync_debug_backend_options()
-
-        self.checkboxExportVSCode = QCheckBox("生成 VS Code 配置")
-
-        self.pushbuttonBrowseUvProj = QPushButton("浏览")
-        self.pushbuttonBrowseUv4 = QPushButton("浏览")
-        self.pushbuttonBrowseOutput = QPushButton("浏览")
-        self.pushbuttonConvert = QPushButton("转换")
-
-        self.listWidgetOriginalInfo = QListWidget()
-        self.textBrowserLog = QTextBrowser()
-
-        layout_uvproj = QHBoxLayout()
-        layout_uvproj.addWidget(label_uvproj)
-        layout_uvproj.addWidget(self.lineeditUvProjFilepath)
-        layout_uvproj.addWidget(self.pushbuttonBrowseUvProj)
-
-        layout_uv4 = QHBoxLayout()
-        layout_uv4.addWidget(label_uv4)
-        layout_uv4.addWidget(self.lineeditUv4Path)
-        layout_uv4.addWidget(self.pushbuttonBrowseUv4)
-
-        layout_output = QHBoxLayout()
-        layout_output.addWidget(label_output)
-        layout_output.addWidget(self.lineeditOutputDirectory)
-        layout_output.addWidget(self.pushbuttonBrowseOutput)
-
-        layout_profile_1 = QHBoxLayout()
-        layout_profile_1.addWidget(label_compiler)
-        layout_profile_1.addWidget(self.comboCompiler)
-        layout_profile_1.addWidget(label_host)
-        layout_profile_1.addWidget(self.comboHostOs)
-        layout_profile_1.addWidget(self.checkboxExportVSCode)
-
-        layout_profile_2 = QHBoxLayout()
-        layout_profile_2.addWidget(label_generator)
-        layout_profile_2.addWidget(self.comboGenerator)
-        layout_profile_2.addWidget(label_probe)
-        layout_profile_2.addWidget(self.comboDebugProbe)
-        layout_profile_2.addWidget(label_debugger)
-        layout_profile_2.addWidget(self.comboDebugger)
-        layout_profile_2.addWidget(label_build_dir)
-        layout_profile_2.addWidget(self.lineeditBuildDir)
-
-        layout_actions = QHBoxLayout()
-        layout_actions.addStretch(1)
-        layout_actions.addWidget(self.pushbuttonConvert)
-
-        layout_info = QVBoxLayout()
-        layout_info.addWidget(label_info)
-        layout_info.addWidget(self.listWidgetOriginalInfo)
-
-        layout_log = QVBoxLayout()
-        layout_log.addWidget(label_log)
-        layout_log.addWidget(self.textBrowserLog)
-
-        layout_bottom = QHBoxLayout()
-        layout_bottom.addLayout(layout_info)
-        layout_bottom.addLayout(layout_log)
-
-        layout = QVBoxLayout()
-        layout.addLayout(layout_uvproj)
-        layout.addLayout(layout_uv4)
-        layout.addLayout(layout_output)
-        layout.addLayout(layout_profile_1)
-        layout.addLayout(layout_profile_2)
-        layout.addLayout(layout_actions)
-        layout.addLayout(layout_bottom)
-        self.setLayout(layout)
-
-        self.pushbuttonBrowseUvProj.clicked.connect(
-            self.on_pushbuttonBrowseUvProj_clicked
+        self.nav_buttons = []
+        self.nav_labels = (
+            ("工程", "工程转换", "工程转换"),
+            ("构建", "构建配置", "构建配置"),
+            ("调试", "调试烧录", "调试与烧录"),
+            ("日志", "运行日志", "运行日志"),
         )
-        self.pushbuttonBrowseUv4.clicked.connect(self.on_pushbuttonBrowseUv4_clicked)
-        self.pushbuttonBrowseOutput.clicked.connect(
-            self.on_pushbuttonBrowseOutput_clicked
-        )
-        self.pushbuttonConvert.clicked.connect(self.on_pushbuttonConvert_clicked)
-        self.comboHostOs.currentIndexChanged.connect(self.on_host_os_changed)
-        self.comboCompiler.currentIndexChanged.connect(self.on_compiler_changed)
-        self.comboDebugProbe.currentIndexChanged.connect(self.on_debug_probe_changed)
-        self.comboDebugger.currentIndexChanged.connect(self.refresh_original_info)
+        for index, (_, text, tooltip) in enumerate(self.nav_labels):
+            button = QPushButton(
+                text,
+                objectName="navButtonActive" if index == 0 else "navButton",
+            )
+            button.setToolTip(tooltip)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            rail_layout.addWidget(button)
+            self.nav_buttons.append(button)
+        rail_layout.addStretch(1)
+        rail_layout.addWidget(QLabel("v2.0", objectName="railCaption"), 0, Qt.AlignmentFlag.AlignHCenter)
 
-    def _set_combo_data(self, combo: QComboBox, value: str):
+        shell = QWidget()
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+
+        top_bar = QFrame(objectName="topBar")
+        top_bar.setFixedHeight(64)
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(24, 0, 24, 0)
+        top_layout.setSpacing(12)
+
+        top_layout.addStretch(1)
+        self.status_pill = QLabel("就绪", objectName="statusPill")
+        self.status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_pill.setFixedHeight(37)
+        self.status_pill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        top_layout.addWidget(self.status_pill)
+        self.open_output_button = QPushButton("打开输出目录")
+        self.open_output_button.setFixedHeight(37)
+        self.open_output_button.setEnabled(False)
+        top_layout.addWidget(self.open_output_button)
+        self.convert_button = QPushButton("转换并验证", objectName="primary")
+        self.convert_button.setFixedWidth(132)
+        top_layout.addWidget(self.convert_button)
+        shell_layout.addWidget(top_bar)
+
+        self.progress = QProgressBar(objectName="mainProgress")
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        shell_layout.addWidget(self.progress)
+
+        self.page_stack = QStackedWidget()
+
+        project_page = QWidget()
+        project_page_layout = QVBoxLayout(project_page)
+        project_page_layout.setContentsMargins(0, 0, 0, 0)
+        project_page_layout.setSpacing(0)
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        content_scroll = QScrollArea()
+        content_scroll.setWidgetResizable(True)
+        content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        content_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        content = QWidget()
+        content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(26, 22, 26, 24)
+        content_layout.setSpacing(16)
+
+        heading = QHBoxLayout()
+        heading_box = QVBoxLayout()
+        heading_box.setSpacing(2)
+        heading_box.addWidget(QLabel("转换流程", objectName="section"))
+        heading_box.addWidget(
+            QLabel("选择 Keil 工程并生成可验证的跨平台构建资产。", objectName="muted")
+        )
+        heading.addLayout(heading_box)
+        heading.addStretch(1)
+        content_layout.addLayout(heading)
+
+        pipeline = QFrame(objectName="pipeline")
+        pipeline_layout = QHBoxLayout(pipeline)
+        pipeline_layout.setContentsMargins(16, 12, 16, 12)
+        pipeline_layout.setSpacing(8)
+        stages = (
+            ("1", "INPUT", "uVision 工程"),
+            ("2", "RESOLVE", "启动与链接资产"),
+            ("3", "GENERATE", "CMake 与工具链"),
+            ("4", "VALIDATE", "GCC 编译验证"),
+        )
+        for index, (number, name, detail) in enumerate(stages):
+            stage = QFrame(objectName="stage")
+            stage_layout = QHBoxLayout(stage)
+            stage_layout.setContentsMargins(2, 0, 2, 0)
+            stage_layout.setSpacing(8)
+            badge = QLabel(number, objectName="stageIndex")
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setProperty("state", "complete" if index == 0 else "pending")
+            copy = QVBoxLayout()
+            copy.setSpacing(0)
+            name_label = QLabel(name, objectName="stageName")
+            name_label.setProperty("state", "complete" if index == 0 else "pending")
+            copy.addWidget(name_label)
+            copy.addWidget(QLabel(detail, objectName="stageDetail"))
+            stage_layout.addWidget(badge)
+            stage_layout.addLayout(copy)
+            pipeline_layout.addWidget(stage, 1)
+            self.stage_badges.append(badge)
+            self.stage_names.append(name_label)
+            if index < len(stages) - 1:
+                arrow = QLabel("›", objectName="muted")
+                arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                pipeline_layout.addWidget(arrow)
+        content_layout.addWidget(pipeline)
+
+        content_layout.addWidget(QLabel("工程资产", objectName="section"))
+
+        file_grid = QGridLayout()
+        file_grid.setHorizontalSpacing(10)
+        file_grid.setVerticalSpacing(7)
+        self.project_edit, self.project_button = self._path_field(
+            file_grid, 0, "KEIL PROJECT", "选择 .uvprojx 工程"
+        )
+        self.output_edit, self.output_button = self._path_field(
+            file_grid, 1, "OUTPUT DIRECTORY", "生成文件保存目录"
+        )
+        self.uv4_edit, self.uv4_button = self._path_field(
+            file_grid, 2, "KEIL MDK", "用于 CMSIS-Pack 与 RTE 解析，可留空自动检测"
+        )
+        content_layout.addLayout(file_grid)
+
+        self.compiler_combo = self._combo(SUPPORTED_COMPILERS)
+        self.host_combo = self._combo(SUPPORTED_HOST_SYSTEMS)
+        self.generator_combo = QComboBox()
+        self.generator_combo.setEditable(True)
+        self.probe_combo = self._combo(SUPPORTED_DEBUG_PROBES)
+        self.backend_combo = self._combo(SUPPORTED_DEBUG_BACKENDS)
+        self.target_edit = QLineEdit()
+        self.target_edit.setPlaceholderText("留空时使用第一个 Target")
+        self.build_dir_edit = QLineEdit()
+        self.build_dir_edit.setPlaceholderText("build-gcc")
+
+        output_summary = QFrame(objectName="pipeline")
+        output_summary_layout = QVBoxLayout(output_summary)
+        output_summary_layout.setContentsMargins(16, 12, 16, 12)
+        output_summary_layout.setSpacing(4)
+        output_summary_layout.addWidget(QLabel("生成内容", objectName="section"))
+        output_summary_layout.addWidget(
+            QLabel(
+                "CMakeLists.txt · GCC 工具链 · VS Code 调试任务 · ELF · HEX · BIN",
+                objectName="muted",
+            )
+        )
+        content_layout.addWidget(output_summary)
+        content_layout.addStretch(1)
+        content_scroll.setWidget(content)
+
+        inspector = QFrame(objectName="inspector")
+        inspector_layout = QVBoxLayout(inspector)
+        inspector_layout.setContentsMargins(20, 22, 20, 20)
+        inspector_layout.setSpacing(14)
+        inspector_layout.addWidget(QLabel("工程检查", objectName="eyebrow"))
+        inspector_layout.addWidget(QLabel("转换上下文", objectName="section"))
+        self.inspector_project = self._metric("工程", "未选择", inspector_layout)
+        self.inspector_compiler = self._metric("编译器", "GNU Arm GCC", inspector_layout)
+        self.inspector_target = self._metric("目标", "自动识别", inspector_layout)
+        self.inspector_probe = self._metric("调试探针", "全部", inspector_layout)
+        self.inspector_status = self._metric("构建状态", "等待转换", inspector_layout)
+
+        inspector_layout.addSpacing(4)
+        inspector_layout.addWidget(QLabel("内存估算", objectName="fieldLabel"))
+        flash_row = QHBoxLayout()
+        flash_row.addWidget(QLabel("FLASH", objectName="stageName"))
+        flash_row.addStretch(1)
+        self.flash_usage_label = QLabel("等待构建", objectName="muted")
+        flash_row.addWidget(self.flash_usage_label)
+        inspector_layout.addLayout(flash_row)
+        self.flash_bar = QProgressBar(objectName="memoryBar")
+        self.flash_bar.setRange(0, 100)
+        self.flash_bar.setValue(0)
+        self.flash_bar.setTextVisible(False)
+        inspector_layout.addWidget(self.flash_bar)
+        ram_row = QHBoxLayout()
+        ram_row.addWidget(QLabel("RAM", objectName="stageName"))
+        ram_row.addStretch(1)
+        self.ram_usage_label = QLabel("等待构建", objectName="muted")
+        ram_row.addWidget(self.ram_usage_label)
+        inspector_layout.addLayout(ram_row)
+        self.ram_bar = QProgressBar(objectName="memoryBar")
+        self.ram_bar.setRange(0, 100)
+        self.ram_bar.setValue(0)
+        self.ram_bar.setTextVisible(False)
+        inspector_layout.addWidget(self.ram_bar)
+        inspector_layout.addStretch(1)
+
+        inspector_scroll = QScrollArea(objectName="inspectorScroll")
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inspector_scroll.setMinimumWidth(270)
+        inspector_scroll.setMaximumWidth(420)
+        inspector_scroll.setWidget(inspector)
+
+        self.workspace_splitter.addWidget(content_scroll)
+        self.workspace_splitter.addWidget(inspector_scroll)
+        self.workspace_splitter.setStretchFactor(0, 1)
+        self.workspace_splitter.setStretchFactor(1, 0)
+        self.workspace_splitter.setSizes([950, 300])
+        project_page_layout.addWidget(self.workspace_splitter)
+        self.page_stack.addWidget(project_page)
+
+        config_page = QScrollArea()
+        config_page.setWidgetResizable(True)
+        config_content = QWidget()
+        config_layout = QVBoxLayout(config_content)
+        config_layout.setContentsMargins(30, 26, 30, 30)
+        config_layout.setSpacing(18)
+        config_layout.addWidget(QLabel("构建配置", objectName="section"))
+        config_layout.addWidget(
+            QLabel("设置目标编译器、宿主平台和 CMake 构建方式。", objectName="muted")
+        )
+        profile_grid = QGridLayout()
+        profile_grid.setHorizontalSpacing(16)
+        profile_grid.setVerticalSpacing(14)
+
+        fields = [
+            ("COMPILER", self.compiler_combo),
+            ("HOST", self.host_combo),
+            ("CMAKE GENERATOR", self.generator_combo),
+            ("TARGET NAME", self.target_edit),
+            ("BUILD DIRECTORY", self.build_dir_edit),
+        ]
+        for index, (label, widget) in enumerate(fields):
+            row, column = divmod(index, 2)
+            box = QVBoxLayout()
+            box.setSpacing(4)
+            box.addWidget(QLabel(label, objectName="fieldLabel"))
+            box.addWidget(widget)
+            profile_grid.addLayout(box, row, column)
+        config_layout.addLayout(profile_grid)
+
+        toggles = QHBoxLayout()
+        self.vscode_check = QCheckBox("生成 VS Code 配置与调试任务")
+        self.vscode_check.setChecked(True)
+        self.validate_check = QCheckBox("转换后自动编译验证")
+        self.validate_check.setChecked(True)
+        toggles.addWidget(self.vscode_check)
+        toggles.addSpacing(20)
+        toggles.addWidget(self.validate_check)
+        toggles.addStretch(1)
+        config_layout.addLayout(toggles)
+        config_layout.addStretch(1)
+        config_page.setWidget(config_content)
+        self.page_stack.addWidget(config_page)
+
+        debug_page = QScrollArea()
+        debug_page.setWidgetResizable(True)
+        debug_content = QWidget()
+        debug_layout = QVBoxLayout(debug_content)
+        debug_layout.setContentsMargins(30, 26, 30, 30)
+        debug_layout.setSpacing(18)
+        debug_layout.addWidget(QLabel("调试与烧录", objectName="section"))
+        debug_layout.addWidget(
+            QLabel("生成 VS Code、OpenOCD、J-Link 和探针相关任务。", objectName="muted")
+        )
+        debug_grid = QGridLayout()
+        debug_grid.setHorizontalSpacing(16)
+        debug_grid.setVerticalSpacing(14)
+        for column, (label, widget) in enumerate(
+            (("DEBUG PROBE", self.probe_combo), ("DEBUG BACKEND", self.backend_combo))
+        ):
+            box = QVBoxLayout()
+            box.setSpacing(4)
+            box.addWidget(QLabel(label, objectName="fieldLabel"))
+            box.addWidget(widget)
+            debug_grid.addLayout(box, 0, column)
+        debug_layout.addLayout(debug_grid)
+        debug_assets = QFrame(objectName="pipeline")
+        debug_assets_layout = QVBoxLayout(debug_assets)
+        debug_assets_layout.setContentsMargins(18, 16, 18, 16)
+        debug_assets_layout.setSpacing(7)
+        debug_assets_layout.addWidget(QLabel("生成的调试资产", objectName="section"))
+        debug_assets_layout.addWidget(QLabel(".vscode/launch.json", objectName="muted"))
+        debug_assets_layout.addWidget(QLabel(".vscode/tasks.json", objectName="muted"))
+        debug_assets_layout.addWidget(QLabel("OpenOCD · J-Link · ST-Link 烧录任务", objectName="muted"))
+        debug_layout.addWidget(debug_assets)
+        debug_actions = QHBoxLayout()
+        self.debug_open_output_button = QPushButton("打开输出目录")
+        self.debug_open_vscode_button = QPushButton("打开 .vscode")
+        debug_actions.addWidget(self.debug_open_output_button)
+        debug_actions.addWidget(self.debug_open_vscode_button)
+        debug_actions.addStretch(1)
+        debug_layout.addLayout(debug_actions)
+        debug_layout.addStretch(1)
+        debug_page.setWidget(debug_content)
+        self.page_stack.addWidget(debug_page)
+
+        console = QFrame(objectName="console")
+        console_layout = QVBoxLayout(console)
+        console_layout.setContentsMargins(0, 0, 0, 0)
+        console_layout.setSpacing(0)
+        console_header = QHBoxLayout()
+        console_header.setContentsMargins(18, 8, 12, 6)
+        console_header.addWidget(QLabel("构建控制台", objectName="consoleTitle"))
+        console_header.addSpacing(12)
+        console_header.addWidget(QLabel("输出", objectName="railCaption"))
+        console_header.addStretch(1)
+        self.clear_log_button = QPushButton("清空", objectName="consoleButton")
+        console_header.addWidget(self.clear_log_button)
+        console_layout.addLayout(console_header)
+        self.log_browser = QTextBrowser()
+        self.log_browser.setMinimumHeight(240)
+        console_layout.addWidget(self.log_browser, 1)
+        self.page_stack.addWidget(console)
+        shell_layout.addWidget(self.page_stack, 1)
+
+        status_bar = QFrame(objectName="statusBar")
+        status_layout = QHBoxLayout(status_bar)
+        status_layout.setContentsMargins(18, 5, 18, 5)
+        status_layout.addWidget(QLabel("就绪", objectName="railCaption"))
+        status_layout.addStretch(1)
+        status_layout.addWidget(QLabel("Keil → CMake → GCC", objectName="railCaption"))
+        shell_layout.addWidget(status_bar)
+
+        self.nav_splitter.addWidget(rail)
+        self.nav_splitter.addWidget(shell)
+        self.nav_splitter.setStretchFactor(0, 0)
+        self.nav_splitter.setStretchFactor(1, 1)
+        self.nav_splitter.setSizes([140, 1260])
+        root_layout.addWidget(self.nav_splitter)
+        self.setCentralWidget(root)
+        self._fade_effect = QGraphicsOpacityEffect(root)
+        root.setGraphicsEffect(self._fade_effect)
+        self._fade_effect.setOpacity(0.0)
+
+    @staticmethod
+    def _metric(label, value, layout):
+        frame = QFrame(objectName="metric")
+        frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(12, 9, 12, 9)
+        frame_layout.setSpacing(2)
+        frame_layout.addWidget(QLabel(label.upper(), objectName="fieldLabel"))
+        value_label = QLabel(value, objectName="metricValue")
+        value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        frame_layout.addWidget(value_label)
+        layout.addWidget(frame)
+        return value_label
+
+    def _path_field(self, grid, row, label, placeholder):
+        label_widget = QLabel(label, objectName="fieldLabel")
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        button = QPushButton("浏览")
+        button.setFixedWidth(78)
+        grid.addWidget(label_widget, row * 2, 0, 1, 2)
+        grid.addWidget(edit, row * 2 + 1, 0)
+        grid.addWidget(button, row * 2 + 1, 1)
+        return edit, button
+
+    @staticmethod
+    def _combo(values):
+        combo = QComboBox()
+        for key, label in values.items():
+            combo.addItem(label, key)
+        return combo
+
+    def _connect_signals(self):
+        self.nav_splitter.splitterMoved.connect(self._update_nav_labels)
+        for index, button in enumerate(self.nav_buttons):
+            button.clicked.connect(
+                lambda checked=False, page_index=index: self._show_page(page_index)
+            )
+        self.project_button.clicked.connect(self._browse_project)
+        self.output_button.clicked.connect(self._browse_output)
+        self.uv4_button.clicked.connect(self._browse_uv4)
+        self.convert_button.clicked.connect(self._start_conversion)
+        self.open_output_button.clicked.connect(self._open_output)
+        self.clear_log_button.clicked.connect(self.log_browser.clear)
+        self.debug_open_output_button.clicked.connect(self._open_output)
+        self.debug_open_vscode_button.clicked.connect(self._open_vscode)
+        self.host_combo.currentIndexChanged.connect(self._update_generators)
+        self.probe_combo.currentIndexChanged.connect(self._sync_backends)
+        self.project_edit.textChanged.connect(self._refresh_inspector)
+        self.compiler_combo.currentIndexChanged.connect(self._refresh_inspector)
+        self.target_edit.textChanged.connect(self._refresh_inspector)
+        self.probe_combo.currentIndexChanged.connect(self._refresh_inspector)
+
+    def _update_nav_labels(self, *args):
+        expanded = self.nav_splitter.sizes()[0] >= 130
+        for button, (compact, full, _) in zip(self.nav_buttons, self.nav_labels):
+            button.setText(full if expanded else compact)
+
+    def _show_page(self, index):
+        if not 0 <= index < self.page_stack.count():
+            return
+        self.page_stack.setCurrentIndex(index)
+        for button_index, button in enumerate(self.nav_buttons):
+            button.setObjectName(
+                "navButtonActive" if button_index == index else "navButton"
+            )
+            self._refresh_dynamic_style(button)
+
+    def _browse_project(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Keil 工程",
+            QDir.homePath(),
+            "Keil Projects (*.uvprojx *.uvproj)",
+        )
+        if not file_path:
+            return
+        self.project_edit.setText(QDir.toNativeSeparators(file_path))
+        if not self.output_edit.text().strip():
+            output = Path(file_path).parent / "cmake-generated"
+            self.output_edit.setText(str(output))
+
+    def _browse_output(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择输出目录", self.output_edit.text().strip() or QDir.homePath()
+        )
+        if directory:
+            self.output_edit.setText(QDir.toNativeSeparators(directory))
+
+    def _browse_uv4(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择 Keil MDK 目录", self.uv4_edit.text().strip() or QDir.homePath()
+        )
+        if directory:
+            self.uv4_edit.setText(QDir.toNativeSeparators(directory))
+
+    def _set_combo(self, combo, value):
         index = combo.findData(value)
         if index >= 0:
             combo.setCurrentIndex(index)
 
-    def _sync_debug_backend_options(self):
-        probe = self.comboDebugProbe.currentData() or "default"
-        current_backend = self.comboDebugger.currentData() or "default"
-        if probe not in {"default", "all", "jlink"} and current_backend == "jlink":
-            current_backend = "default"
+    def _update_generators(self, preferred=""):
+        if not isinstance(preferred, str):
+            preferred = ""
+        preferred = preferred or self.generator_combo.currentText().strip()
+        host = self.host_combo.currentData() or "windows"
+        values = get_supported_generators(host)
+        self.generator_combo.blockSignals(True)
+        self.generator_combo.clear()
+        self.generator_combo.addItems(values)
+        target = preferred or DEFAULT_GENERATOR_BY_HOST.get(host, "Ninja")
+        index = self.generator_combo.findText(target)
+        if index >= 0:
+            self.generator_combo.setCurrentIndex(index)
+        else:
+            self.generator_combo.setEditText(target)
+        self.generator_combo.blockSignals(False)
 
-        self.comboDebugger.blockSignals(True)
-        self.comboDebugger.clear()
+    def _sync_backends(self):
+        probe = self.probe_combo.currentData() or "default"
+        current = self.backend_combo.currentData() or "default"
+        self.backend_combo.blockSignals(True)
+        self.backend_combo.clear()
         for key, label in SUPPORTED_DEBUG_BACKENDS.items():
             if probe not in {"default", "all", "jlink"} and key == "jlink":
                 continue
-            self.comboDebugger.addItem(label, key)
+            self.backend_combo.addItem(label, key)
+        self._set_combo(self.backend_combo, current)
+        self.backend_combo.blockSignals(False)
 
-        self._set_combo_data(self.comboDebugger, current_backend)
-        if self.comboDebugger.currentIndex() < 0:
-            self._set_combo_data(self.comboDebugger, "default")
-        self.comboDebugger.blockSignals(False)
+    def _refresh_inspector(self):
+        project_path = self.project_edit.text().strip()
+        self.inspector_project.setText(Path(project_path).name if project_path else "未选择")
+        self.inspector_project.setToolTip(project_path)
+        self.inspector_compiler.setText(self.compiler_combo.currentText() or "未选择")
+        self.inspector_target.setText(self.target_edit.text().strip() or "自动识别")
+        self.inspector_probe.setText(self.probe_combo.currentText() or "未选择")
 
-    def _update_generator_options(self, preferred: str = ""):
-        preferred = preferred or self.comboGenerator.currentText().strip()
-        host_os = self.comboHostOs.currentData() or "windows"
-        generators = get_supported_generators(host_os)
+    @staticmethod
+    def _format_memory_size(value):
+        if value >= 1024 * 1024:
+            return f"{value / (1024 * 1024):.2f} MiB"
+        if value >= 1024:
+            return f"{value / 1024:.1f} KiB"
+        return f"{value} B"
 
-        self.comboGenerator.blockSignals(True)
-        self.comboGenerator.clear()
-        for generator in generators:
-            self.comboGenerator.addItem(generator, generator)
+    @Slot(int, int, int, int)
+    def _update_memory_usage(self, flash_used, flash_total, ram_used, ram_total):
+        def update(label, bar, used, total):
+            percent = round(used * 100 / total, 1) if total else 0.0
+            label.setText(
+                f"{self._format_memory_size(used)} / "
+                f"{self._format_memory_size(total)} · {percent:.1f}%"
+            )
+            bar.setValue(max(0, min(100, round(percent))))
 
-        if preferred and preferred not in generators:
-            self.comboGenerator.addItem(preferred, preferred)
+        update(self.flash_usage_label, self.flash_bar, flash_used, flash_total)
+        update(self.ram_usage_label, self.ram_bar, ram_used, ram_total)
 
-        target = preferred or DEFAULT_GENERATOR_BY_HOST.get(host_os, "Ninja")
-        index = self.comboGenerator.findText(target)
-        if index >= 0:
-            self.comboGenerator.setCurrentIndex(index)
-        else:
-            self.comboGenerator.setEditText(target)
-        self.comboGenerator.blockSignals(False)
+    @staticmethod
+    def _refresh_dynamic_style(widget):
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
 
-    def _suggest_output_directory(self) -> str:
-        uvproj_path = self.lineeditUvProjFilepath.text().strip()
-        if not uvproj_path:
-            return ""
+    def _set_status(self, text, state):
+        self.status_pill.setText(text)
+        self.status_pill.setProperty("state", state)
+        self._refresh_dynamic_style(self.status_pill)
 
-        project_dir = os.path.dirname(uvproj_path)
-        compiler = self.comboCompiler.currentData() or "armclang"
-        if compiler == "gcc" and os.path.basename(project_dir).lower() in {
-            "mdk_v5",
-            "mdk",
-            "uvprojx",
-        }:
-            return os.path.dirname(project_dir)
-        return project_dir
+    def _set_stage_state(self, stage_index, state):
+        if not 0 <= stage_index < len(self.stage_badges):
+            return
+        for widget in (self.stage_badges[stage_index], self.stage_names[stage_index]):
+            widget.setProperty("state", state)
+            self._refresh_dynamic_style(widget)
 
-    def _current_options(self) -> GenerationOptions:
+    def _reset_stages(self):
+        self.current_stage = 0
+        for index in range(len(self.stage_badges)):
+            self._set_stage_state(index, "running" if index == 0 else "pending")
+
+    def _advance_stage(self, stage_index):
+        stage_index = max(0, min(stage_index, len(self.stage_badges) - 1))
+        for index in range(stage_index):
+            self._set_stage_state(index, "complete")
+        self._set_stage_state(stage_index, "running")
+        for index in range(stage_index + 1, len(self.stage_badges)):
+            self._set_stage_state(index, "pending")
+        self.current_stage = stage_index
+
+    def _handle_worker_log(self, message):
+        if "解析 Keil 工程" in message:
+            self._advance_stage(0)
+        elif "目标:" in message:
+            self._advance_stage(1)
+        elif "生成 CMake" in message:
+            self._advance_stage(2)
+        elif "编译验证" in message or "构建验证" in message:
+            self._advance_stage(3)
+        self._log(message)
+
+    def _options(self):
         return GenerationOptions(
-            compiler=self.comboCompiler.currentData() or "armclang",
-            generator=self.comboGenerator.currentText().strip()
-            or DEFAULT_GENERATOR_BY_HOST.get(self.comboHostOs.currentData(), "Ninja"),
-            host_os=self.comboHostOs.currentData() or "windows",
-            debugger=self.comboDebugger.currentData() or "default",
-            debug_probe=self.comboDebugProbe.currentData() or "default",
-            debug_backend=self.comboDebugger.currentData() or "default",
-            build_dir=self.lineeditBuildDir.text().strip() or None,
-            export_vsc_settings=self.checkboxExportVSCode.isChecked(),
+            compiler=self.compiler_combo.currentData() or "gcc",
+            generator=self.generator_combo.currentText().strip() or "Ninja",
+            host_os=self.host_combo.currentData() or "windows",
+            debugger=self.backend_combo.currentData() or "all",
+            debug_probe=self.probe_combo.currentData() or "all",
+            debug_backend=self.backend_combo.currentData() or "all",
+            build_dir=self.build_dir_edit.text().strip() or None,
+            export_vsc_settings=self.vscode_check.isChecked(),
         ).normalized()
 
-    def load_config(self):
-        settings = QSettings("config.ini", QSettings.Format.IniFormat)
-        detected_uv4_path = find_keil_mdk_root() or ""
-
-        self.uvproj_filepath = str(settings.value("uvproj_filepath", ""))
-        self.output_directory = str(settings.value("output_directory", ""))
-        self.uv4_path = str(settings.value("uv4_path", detected_uv4_path))
-
-        compiler = str(settings.value("compiler", "armclang"))
-        host_os = str(settings.value("host_os", "windows"))
-        generator = str(
-            settings.value("generator", DEFAULT_GENERATOR_BY_HOST.get(host_os, "Ninja"))
-        )
-        debugger = str(settings.value("debugger", "default"))
-        debug_probe = str(settings.value("debug_probe", "default"))
-        debug_backend = str(settings.value("debug_backend", ""))
-        if not debug_backend:
-            debug_backend = debugger or "default"
-        build_dir = str(settings.value("build_dir", ""))
-        export_vsc = str(settings.value("export_vsc_settings", "true")).lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-
-        self.lineeditUvProjFilepath.setText(self.uvproj_filepath)
-        self.lineeditUv4Path.setText(self.uv4_path)
-        self.lineeditOutputDirectory.setText(self.output_directory)
-        self.lineeditBuildDir.setText(build_dir)
-        self.checkboxExportVSCode.setChecked(export_vsc)
-
-        self._set_combo_data(self.comboCompiler, compiler)
-        self._set_combo_data(self.comboHostOs, host_os)
-        self._update_generator_options(generator)
-        self._set_combo_data(self.comboDebugProbe, debug_probe)
-        self._sync_debug_backend_options()
-        self._set_combo_data(self.comboDebugger, debug_backend)
-        self.refresh_original_info()
-
-    def save_config(self):
-        settings = QSettings("config.ini", QSettings.Format.IniFormat)
-        settings.setValue("uvproj_filepath", self.lineeditUvProjFilepath.text().strip())
-        settings.setValue(
-            "output_directory", self.lineeditOutputDirectory.text().strip()
-        )
-        settings.setValue("uv4_path", self.lineeditUv4Path.text().strip())
-        settings.setValue("compiler", self.comboCompiler.currentData())
-        settings.setValue("host_os", self.comboHostOs.currentData())
-        settings.setValue("generator", self.comboGenerator.currentText().strip())
-        settings.setValue("debugger", self.comboDebugger.currentData())
-        settings.setValue("debug_probe", self.comboDebugProbe.currentData())
-        settings.setValue("debug_backend", self.comboDebugger.currentData())
-        settings.setValue("build_dir", self.lineeditBuildDir.text().strip())
-        settings.setValue(
-            "export_vsc_settings", "true" if self.checkboxExportVSCode.isChecked() else "false"
-        )
-        settings.sync()
-
-    def refresh_original_info(self):
-        self.listWidgetOriginalInfo.clear()
-        info_items = [
-            ("uvprojx", self.lineeditUvProjFilepath.text().strip()),
-            ("Keil MDK", self.lineeditUv4Path.text().strip()),
-            ("输出目录", self.lineeditOutputDirectory.text().strip()),
-            ("编译器", self.comboCompiler.currentText()),
-            ("Generator", self.comboGenerator.currentText().strip()),
-            ("宿主系统", self.comboHostOs.currentText()),
-            ("硬件探针", self.comboDebugProbe.currentText()),
-            ("调试后端", self.comboDebugger.currentText()),
-            ("构建目录", self.lineeditBuildDir.text().strip() or "(默认)"),
-            ("VS Code", "启用" if self.checkboxExportVSCode.isChecked() else "关闭"),
-        ]
-        for label, value in info_items:
-            if value:
-                self.listWidgetOriginalInfo.addItem(f"{label}: {value}")
-
-    def show_message(self, message: str):
-        self.textBrowserLog.append(message)
-
-    def on_host_os_changed(self):
-        self._update_generator_options()
-        self.refresh_original_info()
-
-    def on_debug_probe_changed(self):
-        self._sync_debug_backend_options()
-        self.refresh_original_info()
-
-    def on_compiler_changed(self):
-        uvproj_path = self.lineeditUvProjFilepath.text().strip()
-        current_output = self.lineeditOutputDirectory.text().strip()
-        if uvproj_path:
-            project_dir = os.path.dirname(uvproj_path)
-            parent_dir = os.path.dirname(project_dir)
-            suggested = self._suggest_output_directory()
-            if suggested and (
-                not current_output
-                or current_output == project_dir
-                or current_output == parent_dir
-            ):
-                self.lineeditOutputDirectory.setText(suggested)
-        self.refresh_original_info()
-
-    def on_pushbuttonBrowseUvProj_clicked(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择 UVPROJX 文件", QDir.homePath(), "UVPROJX Files (*.uvprojx)"
-        )
-        if not file_path:
+    def _start_conversion(self):
+        project_file = self.project_edit.text().strip()
+        output_dir = self.output_edit.text().strip()
+        if not project_file or not Path(project_file).is_file():
+            QMessageBox.critical(self, "工程无效", "请选择有效的 Keil 工程文件。")
             return
-
-        _, ext = os.path.splitext(file_path)
-        if ext.lower() != ".uvprojx":
-            QMessageBox.critical(self, "错误", "请选择有效的 UVPROJX 文件。")
+        if not output_dir:
+            QMessageBox.critical(self, "输出目录无效", "请选择输出目录。")
             return
-
-        self.uvproj_filepath = file_path.replace("/", os.sep)
-        self.lineeditUvProjFilepath.setText(self.uvproj_filepath)
-        suggested_output = self._suggest_output_directory() or os.path.dirname(
-            self.uvproj_filepath
-        )
-        self.lineeditOutputDirectory.setText(suggested_output)
-        self.refresh_original_info()
-
-        self.show_message(f"已选择 UVPROJX 文件: {self.uvproj_filepath}")
-        self.show_message(f"建议输出目录: {suggested_output}")
-
-    def on_pushbuttonBrowseUv4_clicked(self):
-        dir_path = QFileDialog.getExistingDirectory(
-            self,
-            "选择 Keil MDK 目录",
-            self.lineeditUv4Path.text().strip() or QDir.homePath(),
-        )
-        if not dir_path:
-            return
-
-        self.uv4_path = dir_path.replace("/", os.sep)
-        self.lineeditUv4Path.setText(self.uv4_path)
-        self.refresh_original_info()
-        self.show_message(f"已选择 Keil MDK 目录: {self.uv4_path}")
-
-    def on_pushbuttonBrowseOutput_clicked(self):
-        dir_path = QFileDialog.getExistingDirectory(
-            self,
-            "选择输出目录",
-            self.lineeditOutputDirectory.text().strip()
-            or os.path.dirname(self.lineeditUvProjFilepath.text().strip())
-            or QDir.homePath(),
-        )
-        if not dir_path:
-            return
-
-        self.output_directory = dir_path.replace("/", os.sep)
-        self.lineeditOutputDirectory.setText(self.output_directory)
-        self.refresh_original_info()
-        self.show_message(f"已选择输出目录: {self.output_directory}")
-
-    def on_pushbuttonConvert_clicked(self):
-        self.uvproj_filepath = self.lineeditUvProjFilepath.text().strip()
-        self.output_directory = self.lineeditOutputDirectory.text().strip()
-        self.uv4_path = self.lineeditUv4Path.text().strip()
-
-        if not self.uvproj_filepath:
-            QMessageBox.critical(self, "错误", "请先选择 UVPROJX 文件。")
-            return
-
-        if not self.output_directory:
-            self.output_directory = self._suggest_output_directory()
-            self.lineeditOutputDirectory.setText(self.output_directory)
 
         try:
-            options = self._current_options()
-        except Exception as e:
-            reason = f"配置错误: {e}"
-            self.show_message(reason)
-            QMessageBox.critical(self, "配置错误", reason)
-            return
-        parser = KeilProjectToCMake(self.uvproj_filepath, self.uv4_path or None)
-
-        if not parser.parse():
-            reason = parser.last_error or "解析失败，请检查工程路径和 Keil MDK 路径。"
-            self.show_message(reason)
-            QMessageBox.critical(self, "解析失败", reason)
+            options = self._options()
+        except Exception as exc:
+            QMessageBox.critical(self, "配置错误", str(exc))
             return
 
-        self.uv4_path = parser.uv4_path
-        self.lineeditUv4Path.setText(self.uv4_path)
-        self.refresh_original_info()
+        self._save_config()
+        self.convert_button.setEnabled(False)
+        self.open_output_button.setEnabled(False)
+        self._set_status("转换中", "running")
+        self.inspector_status.setText("正在转换")
+        memory_state = "正在构建" if self.validate_check.isChecked() else "未执行验证"
+        self.flash_usage_label.setText(memory_state)
+        self.ram_usage_label.setText(memory_state)
+        self.flash_bar.setValue(0)
+        self.ram_bar.setValue(0)
+        self._reset_stages()
+        self.progress.setRange(0, 0)
+        self.log_browser.clear()
+        self._log(f"输入: {project_file}")
+        self._log(f"输出: {output_dir}")
+        self._log(
+            f"编译器: {self.compiler_combo.currentText()} ({options.compiler})"
+        )
+        self._log(f"CMake 生成器: {options.generator}")
 
-        if not parser.generate_cmake(
-            self.output_directory,
-            options.export_vsc_settings,
+        self.worker_thread = QThread(self)
+        self.worker = ConversionWorker(
+            project_file,
+            output_dir,
+            self.uv4_edit.text().strip(),
+            self.target_edit.text().strip(),
             options,
-        ):
-            reason = parser.last_error or "生成 CMake 失败。"
-            self.show_message(reason)
-            QMessageBox.critical(self, "生成失败", reason)
-            return
+            self.validate_check.isChecked(),
+        )
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.log.connect(self._handle_worker_log)
+        self.worker.memory_usage.connect(self._update_memory_usage)
+        self.worker.finished.connect(self._conversion_finished)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.start()
 
-        self.show_message(
-            "转换完成: "
-            f"compiler={options.compiler}, "
-            f"generator={options.generator}, "
-            f"host={options.host_os}, "
-            f"probe={options.debug_probe}, "
-            f"backend={options.debug_backend}"
+    @Slot(bool, str, str)
+    def _conversion_finished(self, success, message, output_dir):
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1 if success else 0)
+        self.convert_button.setEnabled(True)
+        self.open_output_button.setEnabled(bool(output_dir))
+        self._set_status(
+            "成功" if success else "失败",
+            "success" if success else "failed",
+        )
+        self.inspector_status.setText("构建通过" if success else "转换失败")
+        if success:
+            for index in range(len(self.stage_badges)):
+                self._set_stage_state(index, "complete")
+        else:
+            self._set_stage_state(self.current_stage, "failed")
+            if self.flash_usage_label.text() == "正在构建":
+                self.flash_usage_label.setText("构建失败")
+                self.ram_usage_label.setText("构建失败")
+        self._log(message)
+        if success:
+            QMessageBox.information(self, "转换完成", "CMake 工程生成完成。")
+        else:
+            self._show_page(3)
+            QMessageBox.critical(self, "转换失败", message)
+
+    def _open_output(self):
+        output = self.output_edit.text().strip()
+        if output:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(output))
+
+    def _open_vscode(self):
+        output = Path(self.output_edit.text().strip())
+        vscode_dir = output / ".vscode"
+        if vscode_dir.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(vscode_dir)))
+            return
+        QMessageBox.information(
+            self,
+            "调试配置尚未生成",
+            "完成转换后可打开输出目录中的 .vscode 配置。",
         )
 
-        if (
-            QMessageBox.question(
-                self,
-                "提示",
-                "转换完成，是否打开输出目录？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            == QMessageBox.StandardButton.Yes
-        ):
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_directory))
+    def _log(self, message):
+        self.log_browser.append(message)
+
+    def _load_config(self):
+        settings = QSettings(str(_config_file_path()), QSettings.Format.IniFormat)
+        self.project_edit.setText(str(settings.value("uvproj_filepath", "")))
+        self.output_edit.setText(str(settings.value("output_directory", "")))
+        self.uv4_edit.setText(
+            str(settings.value("uv4_path", find_keil_mdk_root() or ""))
+        )
+        self.target_edit.setText(str(settings.value("target_name", "")))
+        self.build_dir_edit.setText(str(settings.value("build_dir", "")))
+        self._set_combo(self.compiler_combo, str(settings.value("compiler", "gcc")))
+        self._set_combo(self.host_combo, str(settings.value("host_os", "windows")))
+        self._update_generators(str(settings.value("generator", "Ninja")))
+        self._set_combo(self.probe_combo, str(settings.value("debug_probe", "all")))
+        self._sync_backends()
+        self._set_combo(self.backend_combo, str(settings.value("debug_backend", "all")))
+        self.vscode_check.setChecked(
+            str(settings.value("export_vsc_settings", "true")).lower()
+            in {"1", "true", "yes"}
+        )
+        self.validate_check.setChecked(
+            str(settings.value("validate_build", "true")).lower()
+            in {"1", "true", "yes"}
+        )
+        nav_width = int(settings.value("nav_width", 140))
+        inspector_width = int(settings.value("inspector_width", 300))
+        self.nav_splitter.setSizes([nav_width, max(1, self.width() - nav_width)])
+        self.workspace_splitter.setSizes(
+            [max(1, self.width() - nav_width - inspector_width), inspector_width]
+        )
+        self._update_nav_labels()
+        self._refresh_inspector()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._entrance_animation is not None:
+            return
+        self._entrance_animation = QPropertyAnimation(
+            self._fade_effect, b"opacity", self
+        )
+        self._entrance_animation.setDuration(320)
+        self._entrance_animation.setStartValue(0.0)
+        self._entrance_animation.setEndValue(1.0)
+        self._entrance_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._entrance_animation.start()
+
+    def _save_config(self):
+        settings = QSettings(str(_config_file_path()), QSettings.Format.IniFormat)
+        values = {
+            "uvproj_filepath": self.project_edit.text().strip(),
+            "output_directory": self.output_edit.text().strip(),
+            "uv4_path": self.uv4_edit.text().strip(),
+            "target_name": self.target_edit.text().strip(),
+            "build_dir": self.build_dir_edit.text().strip(),
+            "compiler": self.compiler_combo.currentData(),
+            "host_os": self.host_combo.currentData(),
+            "generator": self.generator_combo.currentText().strip(),
+            "debug_probe": self.probe_combo.currentData(),
+            "debug_backend": self.backend_combo.currentData(),
+            "export_vsc_settings": "true" if self.vscode_check.isChecked() else "false",
+            "validate_build": "true" if self.validate_check.isChecked() else "false",
+            "nav_width": self.nav_splitter.sizes()[0],
+            "inspector_width": self.workspace_splitter.sizes()[1],
+        }
+        for key, value in values.items():
+            settings.setValue(key, value)
+        settings.sync()
+
+    def closeEvent(self, event):
+        self._save_config()
+        if self.worker_thread and self.worker_thread.isRunning():
+            QMessageBox.information(self, "任务运行中", "转换完成后再关闭窗口。")
+            event.ignore()
+            return
+        event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    widget = Widget()
-    widget.show()
+    app.setWindowIcon(QIcon(str(_resource_path("assets/keilforge-app-icon.svg"))))
+    app.setStyle("Fusion")
+    app.setFont(QFont("Segoe UI Variable", 10))
+    app.setStyleSheet(APP_STYLE)
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec())

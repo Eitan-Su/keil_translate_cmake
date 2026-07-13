@@ -8,10 +8,12 @@
 
 1. 解析 `uvprojx` 中的目标名称、输出文件名、设备型号、厂商信息与 CPU 描述。
 2. 收集工程中的源文件、头文件目录、显式包含目录与预处理宏。
-3. 读取 Keil RTE 信息，并从 PDSC 文件中补入相关源文件与目录。
-4. 生成 `CMakeLists.txt`、工具链文件、构建脚本与 `.vscode` 配置。
-5. 为 GCC 场景补充启动文件转换、链接脚本推断、产物导出与调试器配置。
-6. 支持 OpenOCD、J-Link、PyOCD、Keil MDK 等调试后端枚举。
+3. 识别 Keil 文件级 `IncludeInBuild=0` 配置，过滤被工程排除的源文件。
+4. 读取 Keil RTE 信息，并从 PDSC 文件中补入相关源文件与目录；缺少 Keil MDK 时仍可转换非 RTE 工程。
+5. 生成 `CMakeLists.txt`、工具链文件、构建脚本与 `.vscode` 配置。
+6. 为 GCC 场景补充启动文件转换、链接脚本推断、产物导出与调试器配置。
+7. 在 GCC 模式下将外部源文件暂存到输出目录的短 ASCII 路径，降低中文路径和长路径对 Ninja/GCC 构建的影响。
+8. 支持 OpenOCD、J-Link、PyOCD、Keil MDK 等调试后端枚举。
 
 ## 当前支持情况
 
@@ -20,6 +22,7 @@
 | 目标系列 | 当前状态 | 说明 |
 | --- | --- | --- |
 | `STM32F103` | 支持较完整 | 包含 F1 宏推断、ARMASM 启动文件转 GNU 汇编、`core_cm3.c` 修补、回退链接脚本生成、OpenOCD 默认目标脚本 |
+| `STM32F407` | 已通过样本构建验证 | 支持文件级排除过滤、ARMASM 启动文件转 GNU 汇编、回退链接脚本生成、中文长路径源文件暂存 |
 | `AT32F415` | 支持较完整 | 包含 MDK 启动文件切换到 GCC 版本、`.ld` 文件推断、ArteryTek OpenOCD 默认目标脚本、J-Link 与 ST-Link 配置生成 |
 
 其他系列通常可以完成基础转换，但编译参数、启动文件、链接脚本、器件宏、OpenOCD 配置与 J-Link 设备名常需补充规则。
@@ -39,9 +42,10 @@
 
 ### 图形界面
 
-执行：
+安装界面依赖并执行：
 
 ```powershell
+python -m pip install -r requirements.txt
 python main.py
 ```
 
@@ -57,7 +61,7 @@ python main.py
 8. 调试后端
 9. 构建目录
 
-勾选“生成 VS Code 配置”后，输出目录中会新增 `.vscode` 相关文件。
+界面默认启用 VS Code 配置与自动编译验证。硬件探针和调试后端选择 `All` 时，会同时生成 J-Link、ST-Link、OpenOCD 与 J-Link GDB Server 任务。
 
 ### 命令行
 
@@ -68,9 +72,11 @@ python keil_to_cmake.py project.uvprojx `
   --compiler gcc `
   --host-os windows `
   --generator Ninja `
-  --debug-probe stlink `
-  --debug-backend openocd `
+  --debug-probe all `
+  --debug-backend all `
   --build-dir build-gcc `
+  --target-name Target_1 `
+  --validate-build `
   --export-vsc-settings `
   --destination D:\output\demo
 ```
@@ -85,6 +91,9 @@ python keil_to_cmake.py project.uvprojx `
 | `--debug-probe` | 指定探针类型 |
 | `--debug-backend` | 指定调试后端 |
 | `--build-dir` | 指定构建目录名称 |
+| `--target-name` | 多目标 `uvprojx` 中选择指定 `TargetName` |
+| `--validate-build` | 生成后执行 CMake 配置与编译验证 |
+| `--validation-timeout` | 设置单个验证命令的超时秒数 |
 | `--export-vsc-settings` | 输出 `.vscode` 配置 |
 | `--destination` | 指定输出目录 |
 | `--uv4-path` | 指定 Keil MDK 安装目录 |
@@ -96,13 +105,17 @@ python keil_to_cmake.py project.uvprojx `
 ```text
 output/
 ├─ CMakeLists.txt
+├─ conversion-report.json
+├─ build-validation.json
 ├─ do_build.bat 或 do_build.sh
 ├─ cmake/
 │  ├─ armclang.cmake
 │  ├─ arm-none-eabi-toolchain.cmake
 │  ├─ generated_linker.ld
 │  ├─ startup_xxx_gcc.S
-│  └─ core_cm3_gcc.c
+│  ├─ core_cm3_gcc.c
+│  └─ sources/
+│     └─ xxx_hash.c
 └─ .vscode/
    ├─ settings.json
    ├─ tasks.json
@@ -112,6 +125,8 @@ output/
    ├─ jlink_flash_hex.jlink
    └─ jlink_flash_bin.jlink
 ```
+
+`conversion-report.json` 始终生成，记录目标信息、警告以及 startup、链接脚本等资产的来源和支持等级。`build-validation.json` 仅在使用 `--validate-build` 时生成，包含 CMake 配置、编译命令、原始输出和分类诊断。
 
 GCC 模式下，任务配置中通常会包含以下项目：
 

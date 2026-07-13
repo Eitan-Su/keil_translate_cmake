@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Keil Forge application icon">
+  <defs>
+    <linearGradient id="shell" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#163A66"/>
+      <stop offset="1" stop-color="#071B32"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="67" y1="63" x2="193" y2="194" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#43D6FF"/>
+      <stop offset="0.55" stop-color="#168BFF"/>
+      <stop offset="1" stop-color="#0B5FE6"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="58" fill="url(#shell)"/>
+  <rect x="20" y="20" width="216" height="216" rx="50" fill="none" stroke="#2B5B88" stroke-width="4"/>
+  <path d="M72 58v140h31v-54l49 54h42l-66-73 61-67h-41l-45 53V58z" fill="url(#signal)"/>
+  <path d="M103 112l45-54h41l-61 67 66 73h-42l-49-54z" fill="#EAF8FF" fill-opacity="0.96"/>
+  <circle cx="72" cy="58" r="11" fill="#77E8FF"/>
+  <circle cx="72" cy="198" r="11" fill="#168BFF"/>
+  <circle cx="189" cy="58" r="9" fill="#43D6FF"/>
+  <path d="M72 58h31M72 198h31M189 58h-18" stroke="#B8F3FF" stroke-width="7" stroke-linecap="round"/>
+</svg>
