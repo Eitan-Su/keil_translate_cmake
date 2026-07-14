@@ -664,6 +664,57 @@ class KeilToCMakeTests(unittest.TestCase):
 
             self.assertIsNone(runtime)
 
+    def test_runtime_compat_generates_sbrk_from_linker_bounds(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            source = root / "heap.c"
+            linker = root / "device.ld"
+            source.write_text(
+                "void *allocate(unsigned size) { return malloc(size); }\n",
+                encoding="utf-8",
+            )
+            linker.write_text(
+                "_estack = ORIGIN(RAM) + LENGTH(RAM);\n"
+                "_Min_Stack_Size = 0x400;\n"
+                "SECTIONS { .bss : { end = .; } > RAM }\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+
+            runtime = parser._generate_gcc_runtime_compat_source(
+                str(root / "out"), str(linker)
+            )
+
+            self.assertIsNotNone(runtime)
+            runtime_text = Path(runtime).read_text(encoding="utf-8")
+            self.assertIn("void *_sbrk(ptrdiff_t increment)", runtime_text)
+            self.assertIn("(uintptr_t)&_estack - (uintptr_t)&_Min_Stack_Size", runtime_text)
+            self.assertTrue(any("newlib heap" in item for item in parser.warnings))
+
+    def test_runtime_compat_preserves_existing_sbrk(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            source = root / "syscalls.c"
+            source.write_text(
+                "void *malloc(unsigned);\n"
+                "void *_sbrk(int size) { return 0; }\n"
+                "void *allocate(unsigned size) { return malloc(size); }\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+
+            runtime = parser._generate_gcc_runtime_compat_source(
+                str(root / "out"), str(root / "missing.ld")
+            )
+
+            self.assertIsNone(runtime)
+
     def test_gcc_reorders_explicit_lvgl_init_before_hal_init(self):
         with TemporaryDirectory() as temp_dir, patch(
             "keil_to_cmake.find_keil_mdk_root", return_value=None
@@ -732,6 +783,101 @@ class KeilToCMakeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertFalse(parser._gcc_uses_printf_float())
+
+    def test_gcc_distinguishes_printf_and_scanf_float_support(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            source = root / "console.c"
+            source.write_text(
+                'void read_value(const char *text, float *value) {'
+                ' sscanf(text, "%f", value); }\n',
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+
+            self.assertFalse(parser._gcc_uses_printf_float())
+            self.assertTrue(parser._gcc_uses_scanf_float())
+
+            source.write_text(
+                'void print_value(char *text, float value) {'
+                ' snprintf(text, 16, "%.2f", value); }\n',
+                encoding="utf-8",
+            )
+            self.assertTrue(parser._gcc_uses_printf_float())
+            self.assertFalse(parser._gcc_uses_scanf_float())
+
+    def test_generated_cmake_enables_only_required_float_io_helpers(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            source = root / "Src" / "main.c"
+            source.write_text(
+                '#include <stdio.h>\nint main(void) {'
+                ' float value; return sscanf("1.0", "%f", &value); }\n',
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            output_dir = root / "out"
+
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(output_dir),
+                    False,
+                    GenerationOptions(compiler="gcc", generator="Ninja"),
+                )
+            )
+
+            cmake_text = (output_dir / "CMakeLists.txt").read_text(encoding="utf-8")
+            self.assertIn("    -u _scanf_float\n", cmake_text)
+            self.assertNotIn("    -u _printf_float\n", cmake_text)
+
+    def test_gcc_migration_analyzer_reports_runtime_and_linker_gaps(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            startup = root / "startup_device.s"
+            source = root / "app.cpp"
+            linker = root / "device.ld"
+            startup.write_text(
+                "Reset_Handler:\n    bl SystemInit\n    bl main\n",
+                encoding="utf-8",
+            )
+            source.write_text(
+                "void $Sub$$driver(void);\n"
+                "void *allocate(unsigned size) { return malloc(size); }\n"
+                "__asm void legacy(void) { bx lr }\n"
+                "void boot(void) { __rt_lib_init(); }\n",
+                encoding="utf-8",
+            )
+            linker.write_text(
+                "SECTIONS { .text : { *(.text*) } }\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source), str(startup)]
+
+            parser._analyze_gcc_migration_issues(
+                [str(source), str(startup)], str(linker)
+            )
+
+            warnings = "\n".join(parser.warnings)
+            for expected in (
+                "__libc_init_array",
+                ".init_array",
+                ".ARM.exidx",
+                "$Sub$$/$Super$$",
+                "Arm C Library",
+                "ARMASM",
+                "_sbrk",
+            ):
+                self.assertIn(expected, warnings)
 
     def test_gcc_lto_keeps_inline_assembly_call_targets(self):
         with TemporaryDirectory() as temp_dir, patch(

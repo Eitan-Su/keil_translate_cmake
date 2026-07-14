@@ -1,6 +1,6 @@
 # Keil 工程转换验证清单
 
-本文档记录经过实际转换和 GCC 构建验证的 Keil 工程。统计日期为 2026 年 7 月 13 日。
+本文档记录经过实际转换和 GCC 构建验证的 Keil 工程。统计日期为 2026 年 7 月 14 日。
 
 ## 验证标准
 
@@ -20,16 +20,17 @@
 
 | 项目 | 数量 |
 | --- | ---: |
-| 通过验证的独立 Keil 工程 | 141 |
-| 通过验证的器件规格 | 20 |
+| 通过验证的独立 Keil 工程 | 142 |
+| 通过验证的器件规格 | 21 |
 | AT32F415 官方 examples | 118 |
-| 其他代表工程和 utility 工程 | 23 |
+| 其他代表工程和 utility 工程 | 24 |
 
 ## 器件规格
 
 | 厂商 | 器件规格 | 通过工程数 | 验证范围 |
 | --- | --- | ---: | --- |
 | ArteryTek | `AT32F415RCT7` | 119 | 官方 examples 全量验证 118 项，加 USB IAP utility 1 项 |
+| ArteryTek | `AT32F415CBT7` | 1 | EEPROM/FOC ESC 代表工程 |
 | ArteryTek | `AT32F421K8T7` | 1 | FOC 代表工程 |
 | ArteryTek | `AT32F435RGT7` | 1 | SDIO 代表工程 |
 | Texas Instruments | `MSP432P401R` | 1 | GPIO LED 代表工程 |
@@ -88,6 +89,7 @@ utilities/at32f415_usb_iap_demo/source_code/app_led4_toggle/mdk_v5/app_led4_togg
 | 器件 | 工程路径 |
 | --- | --- |
 | `AT32F421K8T7` | `AT32/at32_foc/project/MDK_V5/project_file.uvprojx` |
+| `AT32F415CBT7` | `AT32_ESC/mdk_v5/eeprom.uvprojx` |
 | `AT32F435RGT7` | `AT32F435RGT7_SDIO/MDK-ARM_F435/proj.uvprojx` |
 | `MSP432P401R` | `MSP432_Quick_entry-master/02_RNA_LED/keil/empty.uvprojx` |
 | `N32WB031` | `N32WB_HID/MDK-ARM/touch_screen.uvprojx` |

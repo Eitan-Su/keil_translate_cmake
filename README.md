@@ -142,11 +142,24 @@ GCC 模式下，任务配置中通常会包含以下项目：
 8. `Start ST-Link OpenOCD GDB Server`
 9. `Flash J-Link OpenOCD BIN`
 10. `Flash J-Link BIN`
+11. `Start J-Link GDB Server`
 
 `Build GCC Debug` 和直接执行 `do_build.bat` 使用增量构建。`Rebuild GCC Debug`
 和 `do_build.bat rebuild` 会先清理构建目标，再进行全量编译。普通 ASCII 源文件由
 CMake 直接引用；非 ASCII 目录中的安全副本通过源文件依赖规则自动同步，因此保存源码后
 再次构建会更新 ELF、HEX 和 BIN 固件。
+
+## GCC 迁移检查
+
+GCC 模式会针对常见的 AC5/armclang 迁移差异执行检查和安全适配：
+
+1. 按源码使用情况分别启用 newlib-nano 的 `_printf_float` 和 `_scanf_float`。
+2. 工程使用动态内存且没有 `_sbrk` 时，链接脚本边界明确的项目自动生成 `_sbrk`。
+3. C++ 工程检查启动文件是否调用 `__libc_init_array`，并检查链接脚本中的构造、析构和 unwind section。
+4. 检查 `$Sub$$`、`$Super$$`、Arm C Library 私有入口、残留 ARMASM 函数语法和绝对地址放置属性。
+5. 无法安全自动处理的项目写入 `conversion-report.json` 的 `warnings`，保留原始源码供人工处理。
+
+自动生成 `_sbrk` 仅适用于链接脚本具有明确 heap 起点和终点，或者具有 RAM 顶部与保留栈大小符号的项目。边界信息不足时只生成诊断，避免推测内存布局。
 
 ## 详细文档
 

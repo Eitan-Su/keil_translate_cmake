@@ -2664,7 +2664,70 @@ class KeilProjectToCMake:
             )
         return fragments
 
-    def _generate_gcc_runtime_compat_source(self, dest: str) -> Optional[str]:
+    def _gcc_newlib_heap_usage(self) -> tuple[bool, bool]:
+        uses_heap = False
+        defines_sbrk = False
+        definition_pattern = re.compile(
+            r"\b_?sbrk\s*\([^;{}]*\)\s*\{", re.MULTILINE
+        )
+        for source in self._gcc_source_files():
+            source_path = Path(source)
+            if source_path.suffix.lower() not in {".c", ".cpp", ".cc", ".cxx"}:
+                continue
+            try:
+                content = source_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            uses_heap = uses_heap or bool(
+                re.search(r"\b(?:malloc|calloc|realloc)\s*\(", content)
+            )
+            defines_sbrk = defines_sbrk or bool(definition_pattern.search(content))
+            if uses_heap and defines_sbrk:
+                break
+        return uses_heap, defines_sbrk
+
+    @staticmethod
+    def _gcc_sbrk_linker_bounds(
+        linker_script: Optional[str],
+    ) -> Optional[tuple[str, str, Optional[str]]]:
+        if not linker_script:
+            return None
+        try:
+            content = Path(linker_script).read_text(
+                encoding="utf-8", errors="ignore"
+            )
+        except OSError:
+            return None
+
+        for start, limit in (
+            ("__HeapBase", "__HeapLimit"),
+            ("__heap_start__", "__heap_end__"),
+            ("_heap_start", "_heap_end"),
+        ):
+            if re.search(rf"\b{re.escape(start)}\b", content) and re.search(
+                rf"\b{re.escape(limit)}\b", content
+            ):
+                return start, limit, None
+
+        start = next(
+            (
+                symbol
+                for symbol in ("end", "_end", "__end__")
+                if re.search(rf"\b{re.escape(symbol)}\b", content)
+            ),
+            None,
+        )
+        if (
+            start
+            and re.search(r"\b_estack\b", content)
+            and re.search(r"\b_Min_Stack_Size\b", content)
+        ):
+            return start, "_estack", "_Min_Stack_Size"
+        return None
+
+    def _generate_gcc_runtime_compat_source(
+        self, dest: str, linker_script: Optional[str] = None
+    ) -> Optional[str]:
         needs_irq_functions = False
         for source in self._gcc_source_files():
             source_path = Path(source)
@@ -2678,7 +2741,13 @@ class KeilProjectToCMake:
                 continue
             if "__disable_irq()" in content or "__enable_irq()" in content:
                 needs_irq_functions = True
-        if not needs_irq_functions:
+        uses_heap, defines_sbrk = self._gcc_newlib_heap_usage()
+        sbrk_bounds = (
+            self._gcc_sbrk_linker_bounds(linker_script)
+            if uses_heap and not defines_sbrk
+            else None
+        )
+        if not needs_irq_functions and sbrk_bounds is None:
             return None
 
         runtime_path = Path(dest) / "cmake" / "gcc_runtime_compat.c"
@@ -2703,6 +2772,54 @@ class KeilProjectToCMake:
             '    "bx lr\\n"\n'
             '    ".size __enable_irq, .-__enable_irq\\n"\n'
                 ");\n"
+            )
+        if sbrk_bounds is not None:
+            heap_start, heap_limit, stack_size = sbrk_bounds
+            limit_expression = f"(uintptr_t)&{heap_limit}"
+            declarations = [
+                f"extern char {heap_start};",
+                f"extern char {heap_limit};",
+            ]
+            if stack_size is not None:
+                declarations.append(f"extern char {stack_size};")
+                limit_expression += f" - (uintptr_t)&{stack_size}"
+            fragments.append(
+                "#include <errno.h>\n"
+                "#include <stddef.h>\n"
+                "#include <stdint.h>\n\n"
+                + "\n".join(declarations)
+                + "\n\nvoid *_sbrk(ptrdiff_t increment)\n"
+                "{\n"
+                f"    static uintptr_t current = (uintptr_t)&{heap_start};\n"
+                f"    const uintptr_t base = (uintptr_t)&{heap_start};\n"
+                f"    const uintptr_t limit = {limit_expression};\n"
+                "    uintptr_t next;\n\n"
+                "    if (increment >= 0)\n"
+                "    {\n"
+                "        if (current > limit || (uintptr_t)increment > limit - current)\n"
+                "        {\n"
+                "            errno = ENOMEM;\n"
+                "            return (void *)-1;\n"
+                "        }\n"
+                "        next = current + (uintptr_t)increment;\n"
+                "    }\n"
+                "    else\n"
+                "    {\n"
+                "        uintptr_t decrease = (uintptr_t)(-(increment + 1)) + 1U;\n"
+                "        if (current < base || decrease > current - base)\n"
+                "        {\n"
+                "            errno = ENOMEM;\n"
+                "            return (void *)-1;\n"
+                "        }\n"
+                "        next = current - decrease;\n"
+                "    }\n\n"
+                "    void *previous = (void *)current;\n"
+                "    current = next;\n"
+                "    return previous;\n"
+                "}\n"
+            )
+            self._append_warning_once(
+                "GCC newlib heap 兼容: 根据链接脚本边界生成 _sbrk"
             )
         self._write_text_file(runtime_path, "\n".join(fragments))
         return str(runtime_path.resolve(strict=False))
@@ -3737,10 +3854,30 @@ SECTIONS
         return sorted(self._dedupe_keep_order(symbols))
 
     def _gcc_uses_printf_float(self) -> bool:
+        printf_float, _ = self._gcc_formatted_io_float_requirements()
+        return printf_float
+
+    def _gcc_uses_scanf_float(self) -> bool:
+        _, scanf_float = self._gcc_formatted_io_float_requirements()
+        return scanf_float
+
+    def _gcc_formatted_io_float_requirements(self) -> tuple[bool, bool]:
         float_format = re.compile(
             r"%(?:[-+ #0']*)(?:\d+|\*)?(?:\.(?:\d+|\*))?"
             r"(?:hh|h|ll|l|j|z|t|L)?[aAeEfFgG]"
         )
+        printf_call = re.compile(
+            r"\b(?:printf|fprintf|sprintf|snprintf|vprintf|vfprintf|vsprintf|vsnprintf)"
+            r"\s*\((?P<args>.{0,2048}?)\)\s*;",
+            re.DOTALL,
+        )
+        scanf_call = re.compile(
+            r"\b(?:scanf|fscanf|sscanf|vscanf|vfscanf|vsscanf)"
+            r"\s*\((?P<args>.{0,2048}?)\)\s*;",
+            re.DOTALL,
+        )
+        uses_printf_float = False
+        uses_scanf_float = False
         for source in self._gcc_source_files():
             source_path = Path(source)
             if source_path.suffix.lower() not in {".c", ".cpp", ".cc", ".cxx"}:
@@ -3749,15 +3886,130 @@ SECTIONS
                 content = source_path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            if float_format.search(content):
-                return True
-        return False
+            if not uses_printf_float:
+                uses_printf_float = any(
+                    float_format.search(match.group("args"))
+                    for match in printf_call.finditer(content)
+                )
+            if not uses_scanf_float:
+                uses_scanf_float = any(
+                    float_format.search(match.group("args"))
+                    for match in scanf_call.finditer(content)
+                )
+            if uses_printf_float and uses_scanf_float:
+                break
+        return uses_printf_float, uses_scanf_float
 
     def _gcc_include_reference(self, include_path: str, dest: str) -> str:
         absolute = Path(include_path).resolve(strict=False).as_posix()
         relative = self._normalize_path(include_path, dest)
         cmake_relative = f"${{CMAKE_CURRENT_LIST_DIR}}/{relative}"
         return absolute if len(absolute) < len(cmake_relative) else cmake_relative
+
+    def _append_warning_once(self, message: str) -> None:
+        if message not in self.warnings:
+            self.warnings.append(message)
+
+    def _analyze_gcc_migration_issues(
+        self, prepared_sources: List[str], linker_script: str
+    ) -> None:
+        source_texts: List[tuple[Path, str]] = []
+        for source in prepared_sources:
+            path = Path(source)
+            if path.suffix.lower() not in {
+                ".c",
+                ".cpp",
+                ".cc",
+                ".cxx",
+                ".s",
+                ".asm",
+            }:
+                continue
+            try:
+                source_texts.append(
+                    (path, path.read_text(encoding="utf-8", errors="ignore"))
+                )
+            except OSError:
+                continue
+
+        combined = "\n".join(content for _, content in source_texts)
+        cxx_project = "CXX" in self._project_languages()
+        startup_text = "\n".join(
+            content
+            for path, content in source_texts
+            if path.name.lower().startswith("startup_")
+        )
+        if cxx_project and startup_text and "__libc_init_array" not in startup_text:
+            self._append_warning_once(
+                "迁移检查: C++ 工程启动文件未引用 __libc_init_array，"
+                "全局对象构造函数可能不会执行"
+            )
+
+        try:
+            linker_text = Path(linker_script).read_text(
+                encoding="utf-8", errors="ignore"
+            )
+        except OSError:
+            linker_text = ""
+        if cxx_project and linker_text:
+            missing_arrays = [
+                section
+                for section in (".preinit_array", ".init_array", ".fini_array")
+                if section not in linker_text
+            ]
+            if missing_arrays:
+                self._append_warning_once(
+                    "迁移检查: C++ 链接脚本缺少构造析构表: "
+                    + ", ".join(missing_arrays)
+                )
+            if ".ARM.exidx" not in linker_text:
+                self._append_warning_once(
+                    "迁移检查: 链接脚本缺少 .ARM.exidx，"
+                    "异常展开或回溯功能可能不完整"
+                )
+
+        checks = [
+            (
+                re.compile(r"\$(?:Sub|Super)\$\$[A-Za-z_]\w*"),
+                "迁移检查: 检测到 Arm linker $Sub$$/$Super$$ 符号包装，"
+                "GNU ld 需要 --wrap 或源码适配",
+            ),
+            (
+                re.compile(
+                    r"\b(?:__rt_entry|__rt_lib_init|__user_initial_stackheap)\b"
+                ),
+                "迁移检查: 检测到 Arm C Library 私有入口，"
+                "newlib 不提供等价符号",
+            ),
+            (
+                re.compile(
+                    r"\b__asm\s+(?:void|int|unsigned|long|short|char)\s+"
+                    r"[A-Za-z_]\w*\s*\("
+                ),
+                "迁移检查: 转换后仍存在 ARMASM 函数语法，"
+                "需要人工转换为 GNU 扩展汇编",
+            ),
+            (
+                re.compile(r"__attribute__\s*\(\(\s*at\s*\("),
+                "迁移检查: 检测到绝对地址放置属性 at(...)，"
+                "需要在 GNU 链接脚本中定义专用 section",
+            ),
+        ]
+        for pattern, warning in checks:
+            if pattern.search(combined):
+                self._append_warning_once(warning)
+
+        uses_heap = re.search(r"\b(?:malloc|calloc|realloc)\s*\(", combined)
+        defines_sbrk = re.search(
+            r"\b_?sbrk\s*\([^;{}]*\)\s*(?:\{|$)",
+            combined,
+            re.MULTILINE,
+        )
+        if uses_heap and not defines_sbrk:
+            self._append_warning_once(
+                "迁移检查: 工程调用 newlib 动态内存函数但未发现 _sbrk 实现，"
+                "分配操作可能始终失败"
+            )
 
     def _effective_defines(self, compiler: str) -> List[str]:
         defines: List[str] = []
@@ -4925,9 +5177,12 @@ SECTIONS
         artifact_name = self._artifact_name()
         source_files = self._prepared_gcc_source_files(dest)
         self._emit_generation_progress(62, "生成运行时兼容文件")
-        runtime_compat_source = self._generate_gcc_runtime_compat_source(dest)
+        runtime_compat_source = self._generate_gcc_runtime_compat_source(
+            dest, linker_script
+        )
         if runtime_compat_source:
             source_files.append(runtime_compat_source)
+        self._analyze_gcc_migration_issues(source_files, linker_script)
         gcc_libraries = self._prepared_gcc_libraries(dest)
         symbol_fragments = self._generate_gcc_symbol_fragments(dest)
         self._emit_generation_progress(70, "检查头文件兼容性")
@@ -4943,6 +5198,7 @@ SECTIONS
         lto_default = "ON" if self._gcc_lto_enabled() else "OFF"
         inline_assembly_symbols = self._gcc_inline_assembly_symbols()
         uses_printf_float = self._gcc_uses_printf_float()
+        uses_scanf_float = self._gcc_uses_scanf_float()
         cxx_multilib_includes = self._gcc_cxx_multilib_include_fallbacks(
             cpu_options
         )
@@ -5140,6 +5396,8 @@ SECTIONS
         f.write("    -specs=nosys.specs\n")
         if uses_printf_float:
             f.write("    -u _printf_float\n")
+        if uses_scanf_float:
+            f.write("    -u _scanf_float\n")
         f.write(")\n\n")
 
         libraries = self._dedupe_keep_order(gcc_libraries + ["m"])
