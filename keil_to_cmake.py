@@ -13,12 +13,14 @@ import re
 import argparse
 import json
 import hashlib
+import queue
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from get_keil_mdk_info import find_keil_mdk_root, get_keil_mdk_info
 
 
@@ -219,10 +221,154 @@ class BuildValidator:
         ("compile_error", re.compile(r"\berror:", re.I)),
     ]
 
-    def __init__(self, timeout_seconds: int = 300):
+    def __init__(
+        self,
+        timeout_seconds: int = 300,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ):
         self.timeout_seconds = timeout_seconds
+        self.progress_callback = progress_callback
+        self._last_progress = -1
 
-    def _run(self, command: List[str], cwd: Path) -> CommandResult:
+    def _emit_progress(self, value: int, message: str) -> None:
+        value = max(0, min(100, int(value)))
+        if value < self._last_progress:
+            return
+        self._last_progress = value
+        if self.progress_callback is not None:
+            self.progress_callback(value, message)
+
+    @staticmethod
+    def _build_progress_from_line(line: str) -> Optional[tuple[int, int]]:
+        ninja = re.search(r"\[\s*(\d+)\s*/\s*(\d+)\s*\]", line)
+        if ninja:
+            current = int(ninja.group(1))
+            total = int(ninja.group(2))
+            if total > 0:
+                return current, total
+
+        make = re.search(r"\[\s*(\d{1,3})%\s*\]", line)
+        if make:
+            percent = max(0, min(100, int(make.group(1))))
+            return percent, 100
+        return None
+
+    def _handle_stream_line(self, phase: str, line: str) -> None:
+        if phase == "configure":
+            if "Configuring done" in line:
+                self._emit_progress(6, "CMake 配置完成")
+            elif "Generating done" in line:
+                self._emit_progress(9, "CMake 生成完成")
+            return
+
+        progress = self._build_progress_from_line(line)
+        if progress is None:
+            return
+        current, total = progress
+        percent = 10 + round(88 * current / total)
+        self._emit_progress(percent, f"编译 {current}/{total}")
+
+    def _run_streaming(
+        self, command: List[str], cwd: Path, phase: str
+    ) -> CommandResult:
+        started = time.monotonic()
+        stdout_parts: List[str] = []
+        stderr_parts: List[str] = []
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError as exc:
+            return CommandResult(
+                command=command,
+                return_code=None,
+                stdout="",
+                stderr="",
+                duration_seconds=round(time.monotonic() - started, 3),
+                error=str(exc),
+            )
+
+        output_queue: queue.Queue[tuple[str, Optional[str]]] = queue.Queue()
+
+        def read_stream(name: str, stream: Any) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    output_queue.put((name, line))
+            finally:
+                stream.close()
+                output_queue.put((name, None))
+
+        readers = [
+            threading.Thread(
+                target=read_stream,
+                args=("stdout", process.stdout),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_stream,
+                args=("stderr", process.stderr),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
+        completed_streams = 0
+        error = ""
+        while completed_streams < len(readers):
+            if time.monotonic() - started >= self.timeout_seconds:
+                process.kill()
+                error = f"Command timed out after {self.timeout_seconds} seconds"
+                break
+            try:
+                stream_name, line = output_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:
+                completed_streams += 1
+                continue
+            if stream_name == "stdout":
+                stdout_parts.append(line)
+            else:
+                stderr_parts.append(line)
+            self._handle_stream_line(phase, line.rstrip())
+
+        for reader in readers:
+            reader.join(timeout=1)
+        while True:
+            try:
+                stream_name, line = output_queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                continue
+            if stream_name == "stdout":
+                stdout_parts.append(line)
+            else:
+                stderr_parts.append(line)
+
+        return_code = process.wait()
+        return CommandResult(
+            command=command,
+            return_code=return_code,
+            stdout="".join(stdout_parts),
+            stderr="".join(stderr_parts),
+            duration_seconds=round(time.monotonic() - started, 3),
+            error=error,
+        )
+
+    def _run(
+        self, command: List[str], cwd: Path, phase: str = ""
+    ) -> CommandResult:
+        if self.progress_callback is not None:
+            return self._run_streaming(command, cwd, phase)
         started = time.monotonic()
         try:
             completed = subprocess.run(
@@ -276,6 +422,8 @@ class BuildValidator:
     def validate(
         self, source_dir: Path, options: GenerationOptions
     ) -> BuildValidationReport:
+        self._last_progress = -1
+        self._emit_progress(0, "准备 CMake 配置")
         build_dir = source_dir / str(options.build_dir)
         configure_command = [
             "cmake",
@@ -286,14 +434,19 @@ class BuildValidator:
             "-G",
             options.generator,
         ]
-        configure = self._run(configure_command, source_dir)
+        configure = self._run(configure_command, source_dir, "configure")
         diagnostics = self._classify("configure", configure)
         if not configure.succeeded:
             return BuildValidationReport("configure_failed", configure, None, diagnostics)
 
-        build = self._run(["cmake", "--build", str(build_dir)], source_dir)
+        self._emit_progress(10, "开始编译")
+        build = self._run(
+            ["cmake", "--build", str(build_dir)], source_dir, "build"
+        )
         diagnostics.extend(self._classify("build", build))
         status = "success" if build.succeeded else "build_failed"
+        if build.succeeded:
+            self._emit_progress(100, "构建验证完成")
         return BuildValidationReport(status, configure, build, diagnostics)
 
 
@@ -377,6 +530,11 @@ class KeilProjectToCMake:
         self.asset_records: List[AssetRecord] = []
         self._missing_source_cache: Dict[str, Optional[Path]] = {}
         self._project_rte_instance_names: Set[str] = set()
+        self._copy_staged_source_mappings: List[tuple[Path, Path]] = []
+        self._lvgl_lazy_new_allocator_cache: Optional[bool] = None
+        self._generation_progress_callback: Optional[
+            Callable[[int, str], None]
+        ] = None
         self.requested_target_name = (target_name or "").strip()
 
         # 项目信息
@@ -415,6 +573,12 @@ class KeilProjectToCMake:
         # 库文件
         self.libraries: List[str] = []
         self.library_paths: Set[str] = set()
+
+    def _emit_generation_progress(self, value: int, message: str) -> None:
+        if self._generation_progress_callback is not None:
+            self._generation_progress_callback(
+                max(0, min(100, int(value))), message
+            )
 
     def parse(self) -> bool:
         """解析uVision项目文件"""
@@ -500,6 +664,12 @@ class KeilProjectToCMake:
             if target_names and target_name not in target_names:
                 continue
             for instance in file_node.findall("./instance"):
+                if (instance.get("removed") or "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }:
+                    continue
                 instance_text = (instance.text or "").strip().replace("\\", "/")
                 if not instance_text:
                     continue
@@ -1635,10 +1805,108 @@ class KeilProjectToCMake:
 
         return entries
 
+    @staticmethod
+    def _parse_armasm_integer(value: str) -> Optional[int]:
+        normalized = value.strip().strip("()")
+        try:
+            if normalized.lower().startswith("0x"):
+                return int(normalized, 16)
+            if normalized.lower().endswith("h"):
+                return int(normalized[:-1], 16)
+            return int(normalized, 10)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _parse_armasm_stack_heap_sizes(
+        cls, path: Path
+    ) -> Tuple[Optional[int], Optional[int]]:
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None, None
+
+        def reservation(symbol: str) -> Optional[int]:
+            match = re.search(
+                rf"(?mi)^\s*{re.escape(symbol)}\s+EQU\s+([^\s;]+)",
+                content,
+            )
+            return cls._parse_armasm_integer(match.group(1)) if match else None
+
+        return reservation("Stack_Size"), reservation("Heap_Size")
+
+    def _gcc_stack_heap_sizes(self) -> Tuple[int, int]:
+        default_stack_size = 0x400
+        default_heap_size = 0x400
+        for source in self.source_files:
+            path = Path(source)
+            if path.suffix.lower() not in {".s", ".asm"} or not path.is_file():
+                continue
+            if "startup" not in path.stem.lower() and not self._is_armasm_startup_source(path):
+                continue
+            stack_size, heap_size = self._parse_armasm_stack_heap_sizes(path)
+            if stack_size is None and heap_size is None:
+                continue
+            return (
+                stack_size if stack_size is not None else default_stack_size,
+                heap_size if heap_size is not None else default_heap_size,
+            )
+        return default_stack_size, default_heap_size
+
+    def _parse_armasm_pre_system_init_calls(self, path: Path) -> List[str]:
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return []
+
+        reset_match = re.search(
+            r"(?mis)^\s*Reset_Handler\s+PROC\b(?P<body>.*?)^\s*ENDP\b",
+            content,
+        )
+        if reset_match is None:
+            return []
+
+        register_targets: Dict[str, str] = {}
+        calls: List[str] = []
+        for raw_line in reset_match.group("body").splitlines():
+            line = raw_line.split(";", 1)[0].strip()
+            if not line:
+                continue
+
+            load_match = re.match(
+                r"LDR\s+(R\d+)\s*,\s*=([A-Za-z_]\w*)\b",
+                line,
+                re.IGNORECASE,
+            )
+            if load_match:
+                register = load_match.group(1).upper()
+                target = load_match.group(2)
+                if target == "SystemInit":
+                    break
+                register_targets[register] = target
+                continue
+
+            call_match = re.match(
+                r"BLX?\s+([A-Za-z_]\w*)\b",
+                line,
+                re.IGNORECASE,
+            )
+            if call_match:
+                operand = call_match.group(1)
+                target = register_targets.get(operand.upper(), operand)
+                if target == "SystemInit":
+                    break
+                if target not in {"__main", "Reset_Handler"}:
+                    calls.append(target)
+
+        return self._dedupe_keep_order(calls)
+
     def _generate_gnu_startup_from_armasm(self, source_path: Path, dest: str) -> Optional[str]:
         vector_entries = self._parse_armasm_vector_entries(source_path)
         if len(vector_entries) < 2:
             return None
+
+        pre_system_init_calls = self._parse_armasm_pre_system_init_calls(source_path)
 
         cpu_name = self._normalize_gcc_cpu_name(self.cpu or "cortex-m3")
         generated_path = Path(dest) / "cmake" / f"{source_path.stem}_gcc.S"
@@ -1674,6 +1942,7 @@ class KeilProjectToCMake:
                 ".extern SystemInit",
                 ".extern __libc_init_array",
                 ".extern main",
+                *[f".extern {symbol}" for symbol in pre_system_init_calls],
                 "",
                 '.section .isr_vector,"a",%progbits',
                 ".type __Vectors, %object",
@@ -1688,6 +1957,7 @@ class KeilProjectToCMake:
                 "Reset_Handler:",
                 "    ldr r0, =_estack",
                 "    mov sp, r0",
+                *[f"    bl {symbol}" for symbol in pre_system_init_calls],
                 "    bl SystemInit",
                 "    ldr r0, =_sidata",
                 "    ldr r1, =_sdata",
@@ -1913,8 +2183,10 @@ class KeilProjectToCMake:
         if not source_path.is_file():
             return str(source_path)
 
+        resolved_source = source_path.resolve(strict=False)
+        copy_only_staging = self._path_contains_non_ascii(resolved_source)
         digest = hashlib.sha1(
-            str(source_path.resolve(strict=False)).encode("utf-8")
+            str(resolved_source).encode("utf-8")
         ).hexdigest()[:12]
         safe_stem = self._safe_ascii_file_stem(source_path.stem)
         staged_dir = Path(dest) / "cmake" / "sources"
@@ -1924,9 +2196,13 @@ class KeilProjectToCMake:
             staged_path.chmod(staged_path.stat().st_mode | 0o200)
         shutil.copy2(source_path, staged_path)
         staged_path.chmod(staged_path.stat().st_mode | 0o200)
+        content_changed = False
         if source_path.suffix.lower() == ".c":
             try:
-                content = staged_path.read_text(encoding="utf-8", errors="ignore")
+                original_content = staged_path.read_text(
+                    encoding="utf-8", errors="ignore"
+                )
+                content = original_content
                 normalized_source = source_path.as_posix().lower()
                 if (
                     source_path.name.lower() == "port.c"
@@ -1946,10 +2222,9 @@ class KeilProjectToCMake:
                 patched, uart_alias_count = self._patch_missing_uart_handle_alias(
                     patched
                 )
-                if patched != staged_path.read_text(
-                    encoding="utf-8", errors="ignore"
-                ):
+                if patched != original_content:
                     self._write_text_file(staged_path, patched)
+                    content_changed = True
                 if patched_functions:
                     self.warnings.append(
                         "GCC ARMCC 内嵌汇编转换: "
@@ -1968,6 +2243,24 @@ class KeilProjectToCMake:
                     'extern "C" uint32_t system_core_clock;',
                     'extern "C" unsigned int system_core_clock;',
                 )
+                if self._has_lvgl_lazy_new_allocator():
+                    init_pattern = re.compile(
+                        r"(?P<indent>^[ \t]*)HAL::HAL_Init\(\);\s*\n"
+                        r"(?P=indent)lv_init\(\);",
+                        re.MULTILINE,
+                    )
+                    patched, init_order_count = init_pattern.subn(
+                        lambda match: (
+                            f"{match.group('indent')}lv_init();\n"
+                            f"{match.group('indent')}HAL::HAL_Init();"
+                        ),
+                        patched,
+                        count=1,
+                    )
+                    if init_order_count:
+                        self.warnings.append(
+                            "GCC LVGL 初始化顺序修正: lv_init() 先于 HAL::HAL_Init()"
+                        )
                 hardfault_pattern = re.compile(
                     r"\s*__asm\s+void\s+HardFault_Handler\s*\(\s*\)\s*\{.*?fault_loop\s*\n\s*b\s+fault_loop\s*\n\s*\}",
                     re.DOTALL,
@@ -2001,21 +2294,55 @@ class KeilProjectToCMake:
                 )
                 if patched != content:
                     self._write_text_file(staged_path, patched)
+                    content_changed = True
                     self.warnings.append(
                         f"GCC 类型兼容修正: {source_path.name}: system_core_clock"
                     )
             except OSError:
                 pass
 
+        if not content_changed and not copy_only_staging:
+            staged_path.unlink(missing_ok=True)
+            return str(resolved_source)
+
+        # A staged source loses GCC's implicit search of its original directory.
+        # Add that directory only for staged files instead of every source file.
         source_dir = str(source_path.parent.resolve(strict=False))
         if source_dir:
             self._add_include_path(source_dir)
-            if source_path.parent.name.lower() == "src":
-                sibling_include = source_path.parent.parent / "inc"
-                if sibling_include.is_dir():
-                    self._add_include_path(str(sibling_include.resolve(strict=False)))
+        if source_path.parent.name.lower() == "src":
+            sibling_include = source_path.parent.parent / "inc"
+            if sibling_include.is_dir():
+                self._add_include_path(str(sibling_include.resolve(strict=False)))
 
+        if not content_changed:
+            self._copy_staged_source_mappings.append(
+                (resolved_source, staged_path.resolve(strict=False))
+            )
         return str(staged_path.resolve(strict=False))
+
+    def _has_lvgl_lazy_new_allocator(self) -> bool:
+        if self._lvgl_lazy_new_allocator_cache is not None:
+            return self._lvgl_lazy_new_allocator_cache
+
+        for source in self._gcc_source_files():
+            source_path = Path(source)
+            if source_path.suffix.lower() not in {".cpp", ".cc", ".cxx"}:
+                continue
+            try:
+                content = source_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if (
+                re.search(r"\boperator\s+new(?:\s*\[\s*\])?\s*\(", content)
+                and re.search(r"\blv_is_initialized\s*\(", content)
+                and re.search(r"\blv_init\s*\(", content)
+                and re.search(r"\blv_mem_alloc\s*\(", content)
+            ):
+                self._lvgl_lazy_new_allocator_cache = True
+                return True
+        self._lvgl_lazy_new_allocator_cache = False
+        return False
 
     def _resolve_missing_source(self, source_path: Path) -> Path:
         if source_path.is_file():
@@ -2059,7 +2386,13 @@ class KeilProjectToCMake:
 
     def _prepared_gcc_source_files(self, dest: str) -> List[str]:
         prepared: List[str] = []
-        for source in self._gcc_source_files():
+        sources = self._gcc_source_files()
+        total = len(sources)
+        for index, source in enumerate(sources, start=1):
+            self._emit_generation_progress(
+                5 + round(55 * index / max(total, 1)),
+                f"处理源文件 {index}/{total}",
+            )
             source_path = self._resolve_missing_source(Path(source))
             if source_path.name.lower().endswith("_keil.c"):
                 gcc_name = source_path.name[:-7] + "_gcc.c"
@@ -2345,22 +2678,33 @@ class KeilProjectToCMake:
                 continue
             if "__disable_irq()" in content or "__enable_irq()" in content:
                 needs_irq_functions = True
-                break
         if not needs_irq_functions:
             return None
 
         runtime_path = Path(dest) / "cmake" / "gcc_runtime_compat.c"
-        content = (
-            "void __disable_irq(void)\n"
-            "{\n"
-            "    __asm volatile (\"cpsid i\" ::: \"memory\");\n"
-            "}\n\n"
-            "void __enable_irq(void)\n"
-            "{\n"
-            "    __asm volatile (\"cpsie i\" ::: \"memory\");\n"
-            "}\n"
-        )
-        self._write_text_file(runtime_path, content)
+        fragments: List[str] = []
+        if needs_irq_functions:
+            fragments.append(
+            "__asm__(\n"
+            '    ".syntax unified\\n"\n'
+            '    ".thumb\\n"\n'
+            '    ".weak __disable_irq\\n"\n'
+            '    ".type __disable_irq, %function\\n"\n'
+            '    ".thumb_func\\n"\n'
+            '    "__disable_irq:\\n"\n'
+            '    "cpsid i\\n"\n'
+            '    "bx lr\\n"\n'
+            '    ".size __disable_irq, .-__disable_irq\\n"\n'
+            '    ".weak __enable_irq\\n"\n'
+            '    ".type __enable_irq, %function\\n"\n'
+            '    ".thumb_func\\n"\n'
+            '    "__enable_irq:\\n"\n'
+            '    "cpsie i\\n"\n'
+            '    "bx lr\\n"\n'
+            '    ".size __enable_irq, .-__enable_irq\\n"\n'
+                ");\n"
+            )
+        self._write_text_file(runtime_path, "\n".join(fragments))
         return str(runtime_path.resolve(strict=False))
 
     @staticmethod
@@ -2417,14 +2761,17 @@ class KeilProjectToCMake:
     def _patch_legacy_uint32_prototypes(
         content: str, function_names: Set[str]
     ) -> tuple[str, int]:
-        replacement_count = 0
-        for function_name in sorted(function_names):
-            pattern = re.compile(
-                rf"(?P<prefix>\b{re.escape(function_name)}\s*\(\s*"
-                rf"(?:__IO\s+)?)unsigned\s+int\b"
-            )
-            content, count = pattern.subn(r"\g<prefix>uint32_t", content)
-            replacement_count += count
+        identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", content))
+        present_names = function_names.intersection(identifiers)
+        if not present_names:
+            return content, 0
+
+        names = "|".join(re.escape(name) for name in sorted(present_names))
+        pattern = re.compile(
+            rf"(?P<prefix>\b(?:{names})\s*\(\s*(?:__IO\s+)?)"
+            rf"unsigned\s+int\b"
+        )
+        content, replacement_count = pattern.subn(r"\g<prefix>uint32_t", content)
         if replacement_count and not re.search(
             r"^\s*#\s*include\s*[<\"]stdint\.h[>\"]", content, re.MULTILINE
         ):
@@ -2435,16 +2782,107 @@ class KeilProjectToCMake:
     def _remove_conflicting_static_prototypes(
         content: str, function_names: Set[str]
     ) -> tuple[str, int]:
+        if not function_names:
+            return content, 0
+
+        identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", content))
+        present_names = function_names.intersection(identifiers)
+        if not present_names:
+            return content, 0
+
+        type_ranges = KeilProjectToCMake._cxx_type_body_ranges(content)
+        names = "|".join(re.escape(name) for name in sorted(present_names))
+        pattern = re.compile(
+            rf"(?m)^\s*(?:extern\s+)?[A-Za-z_]\w*"
+            rf"(?:\s+[A-Za-z_]\w*)*\s+(?P<name>{names})"
+            rf"\s*\([^;{{}}]*\)\s*;\s*$\n?"
+        )
+
         replacement_count = 0
-        for function_name in sorted(function_names):
-            pattern = re.compile(
-                rf"(?m)^\s*(?:extern\s+)?[A-Za-z_]\w*"
-                rf"(?:\s+[A-Za-z_]\w*)*\s+{re.escape(function_name)}"
-                rf"\s*\([^;{{}}]*\)\s*;\s*$\n?"
-            )
-            content, count = pattern.subn("", content)
-            replacement_count += count
-        return content, replacement_count
+
+        def remove_global_prototype(match: re.Match[str]) -> str:
+            nonlocal replacement_count
+            if any(start <= match.start() < end for start, end in type_ranges):
+                return match.group(0)
+            replacement_count += 1
+            return ""
+
+        return pattern.sub(remove_global_prototype, content), replacement_count
+
+    @staticmethod
+    def _cxx_type_body_ranges(content: str) -> List[tuple[int, int]]:
+        masked = list(content)
+        index = 0
+        state = "code"
+        quote = ""
+        while index < len(masked):
+            char = content[index]
+            next_char = content[index + 1] if index + 1 < len(content) else ""
+            if state == "code":
+                if char == "/" and next_char == "/":
+                    masked[index] = masked[index + 1] = " "
+                    index += 2
+                    state = "line_comment"
+                    continue
+                if char == "/" and next_char == "*":
+                    masked[index] = masked[index + 1] = " "
+                    index += 2
+                    state = "block_comment"
+                    continue
+                if char in {'"', "'"}:
+                    quote = char
+                    masked[index] = " "
+                    index += 1
+                    state = "string"
+                    continue
+            elif state == "line_comment":
+                if char in "\r\n":
+                    state = "code"
+                else:
+                    masked[index] = " "
+                index += 1
+                continue
+            elif state == "block_comment":
+                if char == "*" and next_char == "/":
+                    masked[index] = masked[index + 1] = " "
+                    index += 2
+                    state = "code"
+                    continue
+                if char not in "\r\n":
+                    masked[index] = " "
+                index += 1
+                continue
+            else:
+                if char == "\\" and next_char:
+                    masked[index] = " "
+                    if next_char not in "\r\n":
+                        masked[index + 1] = " "
+                    index += 2
+                    continue
+                if char == quote:
+                    state = "code"
+                if char not in "\r\n":
+                    masked[index] = " "
+                index += 1
+                continue
+            index += 1
+
+        sanitized = "".join(masked)
+        type_pattern = re.compile(r"\b(?:class|struct|union)\b[^;{}]*\{")
+        ranges: List[tuple[int, int]] = []
+        for match in type_pattern.finditer(sanitized):
+            opening = sanitized.find("{", match.start(), match.end())
+            depth = 1
+            cursor = opening + 1
+            while cursor < len(sanitized) and depth:
+                if sanitized[cursor] == "{":
+                    depth += 1
+                elif sanitized[cursor] == "}":
+                    depth -= 1
+                cursor += 1
+            if depth == 0:
+                ranges.append((opening + 1, cursor - 1))
+        return ranges
 
     @staticmethod
     def _find_static_function_names(content: str) -> Set[str]:
@@ -2942,6 +3380,12 @@ SECTIONS
                 origin = int(origin_text, 16)
                 length = int(length_text, 16)
                 if origin == ram_origin:
+                    if ram_length != length:
+                        ram_length = length
+                        self.warnings.append(
+                            f"使用 SCT 主 RAM 区域 {region_name}: "
+                            f"0x{origin:08X}+0x{length:X}"
+                        )
                     continue
                 section_names = re.findall(r"\*\(\.([A-Za-z0-9_.$-]+)\)", body)
                 if not section_names:
@@ -2969,14 +3413,15 @@ SECTIONS
 
         extra_memory = "\n".join(extra_memory_lines)
         extra_sections = "\n".join(extra_section_lines)
+        stack_size, heap_size = self._gcc_stack_heap_sizes()
 
         content = f"""/* Auto-generated fallback linker script from uvprojx memory info */
 ENTRY(Reset_Handler)
 
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 _sstack = ORIGIN(RAM);
-_Min_Heap_Size = 0x400;
-_Min_Stack_Size = 0x400;
+_Min_Heap_Size = 0x{heap_size:X};
+_Min_Stack_Size = 0x{stack_size:X};
 
 MEMORY
 {{
@@ -3243,11 +3688,10 @@ SECTIONS
         level = (self.keil_optimization or "0").strip()
         optimize_for_time = (self.keil_optimize_for_time or "").strip()
 
-        # In uVision, oTime=0 selects space optimization. GCC has no separate
-        # space policy switch, so -Os is the closest equivalent for optimized
-        # builds. Level 0 remains unoptimized to preserve debug semantics.
+        # In uVision, oTime=0 selects space optimization. GCC 12 and newer
+        # provide -Oz; generated CMake falls back to -Os for older releases.
         if optimize_for_time == "0" and level not in {"0", "1"}:
-            return "-Os"
+            return "-Oz"
 
         return {
             "0": "-O0",
@@ -3261,6 +3705,53 @@ SECTIONS
             "7": "-Os",
             "8": "-O3",
         }.get(level, "-O0")
+
+    def _gcc_compatible_compile_options(self) -> List[str]:
+        supported = {
+            "-fsigned-char",
+            "-funsigned-char",
+            "-fshort-enums",
+        }
+        return self._dedupe_keep_order(
+            flag for flag in self.c_cpp_flags if flag in supported
+        )
+
+    def _gcc_lto_enabled(self) -> bool:
+        return "-flto" in self.c_cpp_flags
+
+    def _gcc_size_optimized(self) -> bool:
+        return self._gcc_optimization_flag() in {"-Os", "-Oz"}
+
+    def _gcc_inline_assembly_symbols(self) -> List[str]:
+        symbols: List[str] = []
+        pattern = re.compile(r"(?i)\bblx?\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+        for source in self._gcc_source_files():
+            source_path = Path(source)
+            if source_path.suffix.lower() not in {".c", ".cpp", ".cc", ".cxx"}:
+                continue
+            try:
+                content = source_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            symbols.extend(match.group(1) for match in pattern.finditer(content))
+        return sorted(self._dedupe_keep_order(symbols))
+
+    def _gcc_uses_printf_float(self) -> bool:
+        float_format = re.compile(
+            r"%(?:[-+ #0']*)(?:\d+|\*)?(?:\.(?:\d+|\*))?"
+            r"(?:hh|h|ll|l|j|z|t|L)?[aAeEfFgG]"
+        )
+        for source in self._gcc_source_files():
+            source_path = Path(source)
+            if source_path.suffix.lower() not in {".c", ".cpp", ".cc", ".cxx"}:
+                continue
+            try:
+                content = source_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if float_format.search(content):
+                return True
+        return False
 
     def _gcc_include_reference(self, include_path: str, dest: str) -> str:
         absolute = Path(include_path).resolve(strict=False).as_posix()
@@ -3531,7 +4022,9 @@ SECTIONS
                 [
                     f'cmake -S . -B "{build_dir}" -G "{generator}" -DCMAKE_BUILD_TYPE=Debug',
                     "if errorlevel 1 exit /b %errorlevel%",
-                    f'cmake --build "{build_dir}" --parallel',
+                    'set "BUILD_SWITCH="',
+                    'if /I "%~1"=="rebuild" set "BUILD_SWITCH=--clean-first"',
+                    f'cmake --build "{build_dir}" %BUILD_SWITCH% --parallel',
                     "endlocal",
                     "",
                 ]
@@ -3559,7 +4052,9 @@ SECTIONS
         lines.extend(
             [
                 f'cmake -S . -B "{build_dir}" -G "{generator}" -DCMAKE_BUILD_TYPE=Debug',
-                f'cmake --build "{build_dir}" --parallel',
+                'BUILD_SWITCH=""',
+                'if [ "${1:-}" = "rebuild" ]; then BUILD_SWITCH="--clean-first"; fi',
+                f'cmake --build "{build_dir}" $BUILD_SWITCH --parallel',
                 "",
             ]
         )
@@ -3674,7 +4169,11 @@ SECTIONS
             "cmake.generator": options.generator,
             "cmake.buildDirectory": f"${{workspaceFolder}}/{options.build_dir}",
             "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json",
-            "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
+            "C_Cpp.default.compileCommands": (
+                f"${{workspaceFolder}}/{options.build_dir}/compile_commands.json"
+            ),
+            "C_Cpp.default.browse.path": ["${workspaceFolder}"],
+            "C_Cpp.default.browse.limitSymbolsToIncludedHeaders": False,
         }
 
         env = self._vscode_env(options)
@@ -3696,10 +4195,14 @@ SECTIONS
             "configurations": [
                 {
                     "name": SUPPORTED_HOST_SYSTEMS[options.host_os],
-                    "compilerPath": "arm-none-eabi-gcc"
+                    "compilerPath": (
+                        shutil.which("arm-none-eabi-gcc") or "arm-none-eabi-gcc"
+                    )
                     if options.compiler == "gcc"
-                    else "armclang",
-                    "compileCommands": "${workspaceFolder}/compile_commands.json",
+                    else (shutil.which("armclang") or "armclang"),
+                    "compileCommands": (
+                        f"${{workspaceFolder}}/{options.build_dir}/compile_commands.json"
+                    ),
                     "includePath": include_path,
                     "browse": {
                         "path": include_path,
@@ -3710,6 +4213,128 @@ SECTIONS
             "version": 4,
         }
 
+    def _vscode_workspace_root(self, output_path: Path) -> Path:
+        project_dir = self.project_dir.resolve(strict=False)
+        candidate = project_dir.parent
+        try:
+            output_path.resolve(strict=False).relative_to(candidate)
+        except ValueError:
+            return output_path
+
+        for source in self.source_files:
+            source_path = Path(source).resolve(strict=False)
+            try:
+                source_path.relative_to(candidate)
+            except ValueError:
+                continue
+            try:
+                source_path.relative_to(project_dir)
+            except ValueError:
+                return candidate
+        return output_path
+
+    @staticmethod
+    def _replace_workspace_folder(value: Any, replacement: str) -> Any:
+        if isinstance(value, str):
+            return value.replace("${workspaceFolder}", replacement)
+        if isinstance(value, list):
+            return [
+                KeilProjectToCMake._replace_workspace_folder(item, replacement)
+                for item in value
+            ]
+        if isinstance(value, dict):
+            return {
+                key: KeilProjectToCMake._replace_workspace_folder(item, replacement)
+                for key, item in value.items()
+            }
+        return value
+
+    def _write_root_vscode_configuration(
+        self,
+        output_path: Path,
+        options: GenerationOptions,
+        contents: Dict[str, Any],
+    ) -> None:
+        workspace_root = self._vscode_workspace_root(output_path)
+        if workspace_root.resolve(strict=False) == output_path.resolve(strict=False):
+            return
+
+        root_vscode = workspace_root / ".vscode"
+        ownership_file = root_vscode / "keilforge-workspace.json"
+        managed_names = set(contents)
+        existing = [name for name in managed_names if (root_vscode / name).exists()]
+        if existing and not ownership_file.exists():
+            self.warnings.append(
+                "工程根目录已有 VS Code 配置，保留现有文件: "
+                + ", ".join(sorted(existing))
+            )
+            return
+
+        root_vscode.mkdir(parents=True, exist_ok=True)
+        relative_output = os.path.relpath(output_path, workspace_root).replace("\\", "/")
+        generated_root = f"${{workspaceFolder}}/{relative_output}"
+
+        root_contents = {
+            name: self._replace_workspace_folder(content, generated_root)
+            for name, content in contents.items()
+        }
+        settings = root_contents["settings.json"]
+        settings["cmake.sourceDirectory"] = generated_root
+        settings["cmake.copyCompileCommands"] = "${workspaceFolder}/compile_commands.json"
+        settings["C_Cpp.default.browse.path"] = ["${workspaceFolder}"]
+        settings["clangd.arguments"] = [
+            "--compile-commands-dir=${workspaceFolder}",
+        ]
+
+        cpp_config = root_contents["c_cpp_properties.json"]
+        for configuration in cpp_config.get("configurations", []):
+            include_path = configuration.setdefault("includePath", [])
+            if "${workspaceFolder}" not in include_path:
+                include_path.insert(0, "${workspaceFolder}")
+            browse_path = configuration.setdefault("browse", {}).setdefault("path", [])
+            if "${workspaceFolder}" not in browse_path:
+                browse_path.insert(0, "${workspaceFolder}")
+
+        root_tasks = root_contents["tasks.json"].get("tasks", [])
+        compiler_label = "GCC" if options.compiler == "gcc" else "ArmClang"
+        configure_label = f"Configure {compiler_label} Debug"
+        refresh_label = "Refresh Compile Commands"
+        refresh_task = {
+            "label": refresh_label,
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-E",
+                "copy_if_different",
+                f"{generated_root}/{options.build_dir}/compile_commands.json",
+                "${workspaceFolder}/compile_commands.json",
+            ],
+            "dependsOn": configure_label,
+            "problemMatcher": [],
+        }
+        root_tasks.insert(1, refresh_task)
+        for task in root_tasks:
+            if task.get("dependsOn") == configure_label and task is not refresh_task:
+                task["dependsOn"] = refresh_label
+            task_options = task.setdefault("options", {})
+            task_options["cwd"] = generated_root
+
+        build_compile_commands = output_path / options.build_dir / "compile_commands.json"
+        if build_compile_commands.is_file():
+            shutil.copy2(build_compile_commands, workspace_root / "compile_commands.json")
+
+        for file_name, content in root_contents.items():
+            with open(root_vscode / file_name, "w", encoding="utf-8") as file:
+                json.dump(content, file, indent=4, ensure_ascii=False)
+        with open(ownership_file, "w", encoding="utf-8") as file:
+            json.dump(
+                {"generatedDirectory": relative_output},
+                file,
+                indent=4,
+                ensure_ascii=False,
+            )
+        self.warnings.append(f"VS Code 根工作区配置: {workspace_root}")
+
     def _relative_workspace_path(self, path: Path, output_path: Path) -> str:
         return self._normalize_path(str(path.resolve(strict=False)), str(output_path))
 
@@ -3717,7 +4342,7 @@ SECTIONS
         return f"${{workspaceFolder}}/{options.build_dir}/{self._artifact_name()}{suffix}"
 
     def _jlink_flash_device(self) -> str:
-        return self.cpu or self._clean_device_name() or "Cortex-M4"
+        return self._clean_device_name() or self.cpu or "Cortex-M4"
 
     def _write_jlink_scripts(self, output_path: Path, options: GenerationOptions) -> None:
         if options.compiler != "gcc":
@@ -3734,9 +4359,9 @@ SECTIONS
         vsc_dir.mkdir(parents=True, exist_ok=True)
 
         scripts = {
-            "jlink_flash_elf.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.elf\nr\nq\n",
-            "jlink_flash_hex.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.hex\nr\nq\n",
-            "jlink_flash_bin.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.bin 0x08000000\nr\nq\n",
+            "jlink_flash_elf.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.elf\nr\ng\nq\n",
+            "jlink_flash_hex.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.hex\nr\ng\nq\n",
+            "jlink_flash_bin.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.bin 0x08000000\nr\ng\nq\n",
         }
 
         for file_name, content in scripts.items():
@@ -3790,25 +4415,41 @@ SECTIONS
         if task_options:
             build_task["options"] = task_options
 
-        tasks: List[Dict[str, Any]] = [configure_task, build_task]
-
-        if options.host_os == "windows":
-            rebuild_command = commands["script_command"]
-            rebuild_args: List[str] = []
-        else:
-            rebuild_command = commands["script_command"]
-            rebuild_args = [f"${{workspaceFolder}}/{commands['script_name']}"]
-
+        rebuild_args = list(build_args)
+        rebuild_args.insert(-1, "--clean-first")
         rebuild_task: Dict[str, Any] = {
-            "label": "Rebuild",
+            "label": f"Rebuild {compiler_label} Debug",
             "type": "shell",
-            "command": rebuild_command,
+            "command": commands["cmake"],
             "args": rebuild_args,
+            "dependsOn": configure_label,
             "problemMatcher": [],
         }
         if task_options:
             rebuild_task["options"] = task_options
-        tasks.append(rebuild_task)
+
+        clean_task: Dict[str, Any] = {
+            "label": f"Clean {compiler_label} Debug",
+            "type": "shell",
+            "command": commands["cmake"],
+            "args": [
+                "--build",
+                f"${{workspaceFolder}}/{options.build_dir}",
+                "--target",
+                "clean",
+            ],
+            "dependsOn": configure_label,
+            "problemMatcher": [],
+        }
+        if task_options:
+            clean_task["options"] = task_options
+
+        tasks: List[Dict[str, Any]] = [
+            configure_task,
+            build_task,
+            rebuild_task,
+            clean_task,
+        ]
 
         debuggers = self._selected_debug_backends(options)
         selected_probes = self._selected_probes(options)
@@ -3817,14 +4458,21 @@ SECTIONS
                 for probe in selected_probes:
                     if not self._probe_supports_backend(probe, "openocd"):
                         continue
+                    if probe == "jlink" and "jlink" in debuggers:
+                        continue
                     openocd_probe_label, openocd_configs = (
                         self._resolve_openocd_config_arguments(output_path, probe)
+                    )
+                    flash_probe_label = (
+                        f"{openocd_probe_label} OpenOCD"
+                        if probe == "jlink"
+                        else openocd_probe_label
                     )
                     openocd_file_args = self._openocd_file_args(openocd_configs)
                     tasks.extend(
                         [
                             {
-                                "label": f"Flash {openocd_probe_label} ELF",
+                                "label": f"Flash {flash_probe_label} ELF",
                                 "type": "shell",
                                 "command": commands["openocd"],
                                 "args": openocd_file_args
@@ -3836,7 +4484,7 @@ SECTIONS
                                 "problemMatcher": [],
                             },
                             {
-                                "label": f"Flash {openocd_probe_label} HEX",
+                                "label": f"Flash {flash_probe_label} HEX",
                                 "type": "shell",
                                 "command": commands["openocd"],
                                 "args": openocd_file_args
@@ -3848,7 +4496,7 @@ SECTIONS
                                 "problemMatcher": [],
                             },
                             {
-                                "label": f"Flash {openocd_probe_label} BIN",
+                                "label": f"Flash {flash_probe_label} BIN",
                                 "type": "shell",
                                 "command": commands["openocd"],
                                 "args": openocd_file_args
@@ -3927,6 +4575,32 @@ SECTIONS
                             "problemMatcher": [],
                             }
                         )
+                tasks.append(
+                    {
+                        "label": "Start J-Link GDB Server",
+                        "type": "shell",
+                        "command": commands["jlink_gdb_server"],
+                        "args": [
+                            "-device", self._jlink_flash_device(),
+                            "-if", "SWD",
+                            "-speed", "1000",
+                            "-port", "2331",
+                            "-singlerun",
+                        ],
+                        "dependsOn": build_label,
+                        "isBackground": True,
+                        "presentation": presentation,
+                        "problemMatcher": {
+                            "owner": "jlink",
+                            "pattern": [{"regexp": ".", "file": 0, "location": 0, "message": 0}],
+                            "background": {
+                                "activeOnStart": True,
+                                "beginsPattern": ".*J-Link GDB Server.*",
+                                "endsPattern": ".*Listening on TCP/IP port 2331.*",
+                            },
+                        },
+                    }
+                )
         else:
             if "openocd" in debuggers:
                 for probe in selected_probes:
@@ -3968,7 +4642,6 @@ SECTIONS
                             },
                         }
                     )
-
             if "keil" in debuggers and options.host_os == "windows":
                 mdk_info = self.mdk_info or {}
                 uv4_exe = mdk_info.get(
@@ -4212,6 +4885,7 @@ SECTIONS
     def _write_gcc_cmake_content(
         self, f: TextIOWrapper, dest: str, options: GenerationOptions
     ) -> None:
+        self._emit_generation_progress(2, "解析 GCC 设备与链接配置")
         cmake_target = self._cmake_target_name()
         artifacts_target = self._cmake_artifacts_target_name()
         self._add_gcc_device_assets()
@@ -4250,21 +4924,29 @@ SECTIONS
         rel_linker_script = self._normalize_path(linker_script, dest)
         artifact_name = self._artifact_name()
         source_files = self._prepared_gcc_source_files(dest)
+        self._emit_generation_progress(62, "生成运行时兼容文件")
         runtime_compat_source = self._generate_gcc_runtime_compat_source(dest)
         if runtime_compat_source:
             source_files.append(runtime_compat_source)
         gcc_libraries = self._prepared_gcc_libraries(dest)
         symbol_fragments = self._generate_gcc_symbol_fragments(dest)
+        self._emit_generation_progress(70, "检查头文件兼容性")
         forced_headers = self._generate_legacy_stdint_compat_headers(dest)
         cxx_compat_header = self._generate_gcc_cxx_compat_header(
             dest, forced_headers
         )
+        self._emit_generation_progress(78, "整理包含目录")
         gcc_include_paths = self._prepared_gcc_include_paths(dest)
         cpu_options = self._gcc_cpu_options()
         optimization_flag = self._gcc_optimization_flag()
+        compatible_compile_options = self._gcc_compatible_compile_options()
+        lto_default = "ON" if self._gcc_lto_enabled() else "OFF"
+        inline_assembly_symbols = self._gcc_inline_assembly_symbols()
+        uses_printf_float = self._gcc_uses_printf_float()
         cxx_multilib_includes = self._gcc_cxx_multilib_include_fallbacks(
             cpu_options
         )
+        self._emit_generation_progress(82, "写入 CMake 目标配置")
 
         f.write(
             f'set(LINKER_SCRIPT "${{CMAKE_CURRENT_LIST_DIR}}/{rel_linker_script}")\n'
@@ -4276,6 +4958,38 @@ SECTIONS
         f.write(f'set(BIN_FILE "{artifact_name}.bin")\n')
         f.write(f'set(ARTIFACT_STAMP "{artifact_name}.artifacts.stamp")\n')
         f.write('set(ARTIFACT_SCRIPT "run_artifacts.bat")\n')
+        if optimization_flag == "-Oz":
+            f.write('set(KEIL_OPTIMIZATION_FLAG "-Os")\n')
+            f.write(
+                'if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND '
+                'CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "12")\n'
+            )
+            f.write('    set(KEIL_OPTIMIZATION_FLAG "-Oz")\n')
+            f.write("endif()\n")
+        else:
+            f.write(f'set(KEIL_OPTIMIZATION_FLAG "{optimization_flag}")\n')
+        f.write(f'set(KEIL_GCC_PROJECT_LTO_DEFAULT "{lto_default}")\n')
+        f.write(
+            'if(NOT DEFINED KEIL_GCC_CACHED_PROJECT_LTO_DEFAULT OR '\
+            'NOT "${KEIL_GCC_CACHED_PROJECT_LTO_DEFAULT}" STREQUAL '\
+            '"${KEIL_GCC_PROJECT_LTO_DEFAULT}")\n'
+        )
+        f.write(
+            '    set(KEIL_GCC_ENABLE_LTO "${KEIL_GCC_PROJECT_LTO_DEFAULT}" '
+            'CACHE BOOL "Enable GCC link-time optimization" FORCE)\n'
+        )
+        f.write("else()\n")
+        f.write(
+            '    option(KEIL_GCC_ENABLE_LTO '
+            '"Enable GCC link-time optimization" '
+            '${KEIL_GCC_PROJECT_LTO_DEFAULT})\n'
+        )
+        f.write("endif()\n")
+        f.write(
+            'set(KEIL_GCC_CACHED_PROJECT_LTO_DEFAULT '
+            '"${KEIL_GCC_PROJECT_LTO_DEFAULT}" CACHE INTERNAL '
+            '"Last generated Keil LTO default" FORCE)\n'
+        )
         f.write(
             'file(RELATIVE_PATH COMPILE_COMMANDS_COPY_TARGET "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json")\n\n'
         )
@@ -4311,6 +5025,32 @@ SECTIONS
         f.write(
             'file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/${ARTIFACT_SCRIPT}" "if errorlevel 1 exit /b %errorlevel%\\r\\n\\r\\n")\n'
         )
+
+        for original_source, staged_source in self._copy_staged_source_mappings:
+            staged_reference = self._normalize_path(str(staged_source), dest)
+            original_reference = original_source.as_posix()
+            staged_parent = self._normalize_path(str(staged_source.parent), dest)
+            f.write("add_custom_command(\n")
+            f.write(
+                f'    OUTPUT "${{CMAKE_CURRENT_LIST_DIR}}/{staged_reference}"\n'
+            )
+            f.write(
+                f'    COMMAND ${{CMAKE_COMMAND}} -E make_directory '
+                f'"${{CMAKE_CURRENT_LIST_DIR}}/{staged_parent}"\n'
+            )
+            f.write(
+                f'    COMMAND ${{CMAKE_COMMAND}} -E copy_if_different '
+                f'"{original_reference}" '
+                f'"${{CMAKE_CURRENT_LIST_DIR}}/{staged_reference}"\n'
+            )
+            f.write(f'    DEPENDS "{original_reference}"\n')
+            f.write("    VERBATIM\n")
+            f.write(")\n")
+            f.write(
+                f'set_source_files_properties('
+                f'"${{CMAKE_CURRENT_LIST_DIR}}/{staged_reference}" '
+                f'PROPERTIES GENERATED TRUE)\n\n'
+            )
 
         f.write("set(PROJECT_SOURCES\n")
         for source_file in source_files:
@@ -4354,11 +5094,19 @@ SECTIONS
         f.write("    -fno-common\n")
         f.write("    -Wall\n")
         f.write("    -Wextra\n")
-        f.write(f"    {optimization_flag}\n")
+        for flag in compatible_compile_options:
+            f.write(f"    {flag}\n")
+        f.write('    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:-flto>"\n')
+        f.write(
+            '    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:-flto-partition=1to1>"\n'
+        )
+        f.write("    ${KEIL_OPTIMIZATION_FLAG}\n")
         f.write(f"    $<$<COMPILE_LANGUAGE:C>:{self._gcc_c_standard()}>\n")
         f.write("    $<$<CONFIG:Debug>:-g3>\n")
         if "CXX" in languages:
             f.write(f"    $<$<COMPILE_LANGUAGE:CXX>:{self._gcc_cpp_standard()}>\n")
+            if "-fno-rtti" in self.c_cpp_flags:
+                f.write("    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>\n")
         f.write("    $<$<COMPILE_LANGUAGE:ASM>:-x>\n")
         f.write("    $<$<COMPILE_LANGUAGE:ASM>:assembler-with-cpp>\n")
         f.write(")\n\n")
@@ -4366,6 +5114,15 @@ SECTIONS
         f.write(f"target_link_options({cmake_target} PRIVATE\n")
         for flag in cpu_options:
             f.write(f"    {flag}\n")
+        f.write('    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:-flto>"\n')
+        f.write(
+            '    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:-flto-partition=1to1>"\n'
+        )
+        for symbol in inline_assembly_symbols:
+            f.write(
+                '    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:'
+                f'-Wl,--undefined={symbol}>"\n'
+            )
         f.write("    -T${LINKER_SCRIPT}\n")
         f.write('    "-L${LINKER_SCRIPT_DIR}"\n')
         for fragment in symbol_fragments:
@@ -4374,12 +5131,15 @@ SECTIONS
                 f"    -T${{CMAKE_CURRENT_LIST_DIR}}/{normalized_fragment}\n"
             )
         f.write("    -Wl,--gc-sections\n")
+        f.write("    -Wl,--relax\n")
         if linker_source == "generated":
             f.write("    -Wl,--require-defined=Reset_Handler\n")
         f.write("    -Wl,-Map=${MAP_FILE}\n")
         f.write("    -Wl,--print-memory-usage\n")
         f.write("    -specs=nano.specs\n")
         f.write("    -specs=nosys.specs\n")
+        if uses_printf_float:
+            f.write("    -u _printf_float\n")
         f.write(")\n\n")
 
         libraries = self._dedupe_keep_order(gcc_libraries + ["m"])
@@ -4411,17 +5171,33 @@ SECTIONS
         else:
             self._write_armclang_cmake_content(f, dest, options)
 
+    @staticmethod
+    def _clean_generated_cmake_assets(output_path: Path) -> None:
+        generated_cmake_dir = output_path / "cmake"
+        if generated_cmake_dir.is_dir():
+            shutil.rmtree(generated_cmake_dir)
+
     def _generate_configured_output(
-        self, output_dir: Optional[str], options: GenerationOptions
+        self,
+        output_dir: Optional[str],
+        options: GenerationOptions,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> bool:
         self.last_error = ""
         output_path = Path(output_dir) if output_dir else self._default_output_path(options)
         output_path.mkdir(parents=True, exist_ok=True)
+        previous_callback = self._generation_progress_callback
+        self._generation_progress_callback = progress_callback
 
         try:
+            self._emit_generation_progress(0, "准备输出目录")
+            self._copy_staged_source_mappings = []
+            self._lvgl_lazy_new_allocator_cache = None
+            self._clean_generated_cmake_assets(output_path)
             with open(output_path / "CMakeLists.txt", "w", encoding="utf-8") as f:
                 self._write_cmake_content_with_options(f, str(output_path), options)
 
+            self._emit_generation_progress(88, "写入工具链和构建脚本")
             self._write_toolchain_files(output_path, options)
             script_name = self._host_command_names(options.host_os)["script_name"]
             self._write_text_file(
@@ -4429,34 +5205,44 @@ SECTIONS
             )
 
             if options.export_vsc_settings:
+                self._emit_generation_progress(94, "写入 VS Code 配置")
                 vsc_dir = output_path / ".vscode"
                 vsc_dir.mkdir(parents=True, exist_ok=True)
                 self._write_jlink_scripts(output_path, options)
 
-                for file_name, content in {
+                vscode_contents = {
                     "settings.json": self._build_vscode_settings(options),
                     "tasks.json": self._build_vscode_tasks(output_path, options),
                     "launch.json": self._build_vscode_launch(output_path, options),
                     "c_cpp_properties.json": self._build_vscode_c_cpp_properties(
                         output_path, options
                     ),
-                }.items():
+                }
+                for file_name, content in vscode_contents.items():
                     with open(vsc_dir / file_name, "w", encoding="utf-8") as f:
                         json.dump(content, f, indent=4, ensure_ascii=False)
+                self._write_root_vscode_configuration(
+                    output_path, options, vscode_contents
+                )
 
+            self._emit_generation_progress(98, "写入转换报告")
             self._write_conversion_report(output_path, options)
+            self._emit_generation_progress(100, "CMake 工程生成完成")
 
             return True
         except Exception as e:
             self.last_error = f"Error generating CMake files: {e}"
             print(self.last_error, file=sys.stderr)
             return False
+        finally:
+            self._generation_progress_callback = previous_callback
 
     def generate_cmake(
         self,
         output_dir: Optional[str] = None,
         export_vsc_settings: bool = False,
         generation_options: Optional[GenerationOptions] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> bool:
         """生成 CMake 文件"""
         self.last_error = ""
@@ -4468,17 +5254,23 @@ SECTIONS
             self.last_error = f"Invalid generation options: {e}"
             print(self.last_error, file=sys.stderr)
             return False
-        return self._generate_configured_output(output_dir, options)
+        return self._generate_configured_output(
+            output_dir, options, progress_callback
+        )
 
     def validate_generated_build(
         self,
         output_dir: Optional[str],
         generation_options: GenerationOptions,
         timeout_seconds: int = 300,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> BuildValidationReport:
         options = generation_options.normalized()
         output_path = Path(output_dir) if output_dir else self._default_output_path(options)
-        validator = BuildValidator(timeout_seconds=timeout_seconds)
+        validator = BuildValidator(
+            timeout_seconds=timeout_seconds,
+            progress_callback=progress_callback,
+        )
         report = validator.validate(output_path.resolve(strict=False), options)
         with open(output_path / "build-validation.json", "w", encoding="utf-8") as f:
             json.dump(asdict(report), f, indent=2, ensure_ascii=False)

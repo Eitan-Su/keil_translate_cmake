@@ -4,6 +4,27 @@
 
 ---
 
+## Keil 工程验证文档维护
+
+开始芯片兼容性分析、Keil 工程转换测试、GCC 构建验证或转换器修改任务前，必须读取以下文档：
+
+1. `docs/verified_keil_projects.md`
+2. `docs/keil_to_gcc_universal_plan.md`
+
+新增 Keil 工程验证记录后，必须在同一任务中维护 `docs/verified_keil_projects.md`。工程只有同时满足以下条件才能写入通过清单：
+
+1. 使用 `keil_to_cmake.py` 从原始 `.uvprojx` 或 `.uvproj` 生成 CMake 工程。
+2. 转换和测试过程中没有手工修改原始 Keil 工程或生成后的工程源码。
+3. CMake 配置成功。
+4. `arm-none-eabi-gcc` 完成全部源文件编译和最终链接。
+5. 输出目录存在对应 ELF 固件。
+
+维护验证文档时必须同步更新：通过工程总数、器件规格总数、器件表中的工程数量、工程来源路径、批量例程分类统计、验证日期和工具链版本。相同工程的重复构建只计一次，新的 SDK 版本或不同 Keil 工程文件可分别记录。
+
+仅完成 XML 解析、CMake 文件生成、单个源文件编译或静态检查的工程不得写入通过清单。构建失败时保留测试产物和诊断记录，修复并完成全量构建后再加入通过清单。
+
+---
+
 ## using-superpowers skill调用限制
 
 除非用户明确要求，否则不要主动调用任何 using-superpowers skill。

@@ -27,6 +27,8 @@
 
 其他系列通常可以完成基础转换，但编译参数、启动文件、链接脚本、器件宏、OpenOCD 配置与 J-Link 设备名常需补充规则。
 
+实际完成 GCC 编译和链接的工程、器件规格及 AT32F415 官方例程覆盖情况见 [Keil 工程转换验证清单](docs/verified_keil_projects.md)。
+
 ## 目录说明
 
 | 文件 | 作用 |
@@ -132,14 +134,19 @@ GCC 模式下，任务配置中通常会包含以下项目：
 
 1. `Configure GCC Debug`
 2. `Build GCC Debug`
-3. `Rebuild`
-4. `Flash ST-Link ELF`
-5. `Flash ST-Link HEX`
-6. `Flash ST-Link BIN`
-7. `Start ST-Link OpenOCD GDB Server`
-8. `Flash J-Link ELF`
-9. `Flash J-Link HEX`
+3. `Rebuild GCC Debug`
+4. `Clean GCC Debug`
+5. `Flash ST-Link ELF`
+6. `Flash ST-Link HEX`
+7. `Flash ST-Link BIN`
+8. `Start ST-Link OpenOCD GDB Server`
+9. `Flash J-Link OpenOCD BIN`
 10. `Flash J-Link BIN`
+
+`Build GCC Debug` 和直接执行 `do_build.bat` 使用增量构建。`Rebuild GCC Debug`
+和 `do_build.bat rebuild` 会先清理构建目标，再进行全量编译。普通 ASCII 源文件由
+CMake 直接引用；非 ASCII 目录中的安全副本通过源文件依赖规则自动同步，因此保存源码后
+再次构建会更新 ELF、HEX 和 BIN 固件。
 
 ## 详细文档
 

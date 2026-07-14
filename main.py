@@ -69,11 +69,12 @@ def _resource_path(relative_path: str) -> Path:
 APP_STYLE = """
 QWidget {
     color: #17243a;
-    background: #edf2f7;
     font-family: "Segoe UI Variable", "Microsoft YaHei UI";
     font-size: 12px;
 }
 QMainWindow { background: #edf2f7; }
+QWidget#pageSurface { background: #edf2f7; }
+QLabel, QCheckBox, QSvgWidget { background: transparent; border: none; }
 QFrame#navRail { background: #ffffff; border-right: 1px solid #b9c6d3; }
 QLabel#railMark {
     color: #ffffff; background: #126fe8; border-radius: 12px;
@@ -175,7 +176,8 @@ QTextBrowser {
     padding: 8px 16px; font-family: "Cascadia Mono", "Consolas"; font-size: 11px;
 }
 QProgressBar#mainProgress {
-    min-height: 3px; max-height: 3px; background: #dfe9f2; border: none;
+    min-height: 18px; max-height: 18px; color: #27445d; background: #dfe9f2;
+    border: none; text-align: center; font-family: "Bahnschrift"; font-size: 10px;
 }
 QProgressBar#mainProgress::chunk { background: #19a6d8; }
 QProgressBar#memoryBar {
@@ -193,6 +195,7 @@ QSplitter::handle:vertical { height: 2px; }
 
 class ConversionWorker(QObject):
     log = Signal(str)
+    progress = Signal(int, str)
     memory_usage = Signal(int, int, int, int)
     finished = Signal(bool, str, str)
 
@@ -214,23 +217,46 @@ class ConversionWorker(QObject):
         self.validate_build = validate_build
 
     @staticmethod
+    def _map_progress(value, start, end):
+        value = max(0, min(100, int(value)))
+        return start + round((end - start) * value / 100)
+
+    def _generation_progress(self, value, message):
+        end = 45 if self.validate_build else 99
+        self.progress.emit(self._map_progress(value, 20, end), message)
+
+    def _validation_progress(self, value, message):
+        self.progress.emit(self._map_progress(value, 45, 99), message)
+
+    @staticmethod
     def _memory_bytes(value, unit):
         factors = {"B": 1, "KB": 1024, "MB": 1024 * 1024}
         return int(float(value) * factors.get(unit.upper(), 1))
 
     @classmethod
-    def _parse_memory_usage(cls, output, parser):
-        values = {}
+    def _parse_memory_regions(cls, output):
+        values = []
         pattern = re.compile(
-            r"^\s*(FLASH|RAM):\s+([0-9.]+)\s+(B|KB|MB)\s+"
+            r"^\s*([A-Za-z_][A-Za-z0-9_.-]*):\s+([0-9.]+)\s+(B|KB|MB)\s+"
             r"([0-9.]+)\s+(B|KB|MB)",
             re.MULTILINE | re.IGNORECASE,
         )
         for match in pattern.finditer(output or ""):
-            values[match.group(1).upper()] = (
-                cls._memory_bytes(match.group(2), match.group(3)),
-                cls._memory_bytes(match.group(4), match.group(5)),
+            values.append(
+                (
+                    match.group(1),
+                    cls._memory_bytes(match.group(2), match.group(3)),
+                    cls._memory_bytes(match.group(4), match.group(5)),
+                )
             )
+        return values
+
+    @classmethod
+    def _parse_memory_usage(cls, output, parser):
+        values = {
+            name.upper(): (used, total)
+            for name, used, total in cls._parse_memory_regions(output)
+        }
 
         flash_used, flash_total = values.get(
             "FLASH", (0, int(parser.flash_length or 0))
@@ -238,13 +264,71 @@ class ConversionWorker(QObject):
         ram_used, ram_total = values.get("RAM", (0, int(parser.ram_length or 0)))
         return flash_used, flash_total, ram_used, ram_total
 
+    @staticmethod
+    def _format_size(value):
+        value = int(value)
+        for unit in ("B", "KB", "MB"):
+            if value < 1024 or unit == "MB":
+                if unit == "B":
+                    return f"{value} {unit}"
+                return f"{value:.2f} {unit}"
+            value /= 1024
+        return f"{value:.2f} MB"
+
+    def _build_success_message(self, parser, memory_regions):
+        build_dir = Path(self.output_dir) / str(self.options.build_dir)
+        artifact_name = parser._artifact_name()
+        firmware_files = [
+            build_dir / f"{artifact_name}{suffix}"
+            for suffix in (".elf", ".hex", ".bin")
+        ]
+        firmware_lines = [
+            f"{path.name}: {self._format_size(path.stat().st_size)}"
+            for path in firmware_files
+            if path.is_file()
+        ]
+
+        memory_lines = []
+        for name, used, total in memory_regions:
+            percent = used * 100 / total if total else 0
+            memory_lines.append(
+                f"{name}: {self._format_size(used)} / "
+                f"{self._format_size(total)} ({percent:.1f}%)"
+            )
+
+        probes = [
+            SUPPORTED_DEBUG_PROBES.get(probe, probe)
+            for probe in parser._selected_probes(self.options)
+        ]
+        backends = [
+            SUPPORTED_DEBUG_BACKENDS.get(backend, backend)
+            for backend in parser._selected_debug_backends(self.options)
+        ]
+        sections = ["构建验证通过。"]
+        if firmware_lines:
+            sections.append("固件文件\n" + "\n".join(firmware_lines))
+        if memory_lines:
+            sections.append("内存占用\n" + "\n".join(memory_lines))
+        sections.append(
+            "调试配置\n"
+            f"探针: {', '.join(probes) if probes else '未启用'}\n"
+            f"后端: {', '.join(backends) if backends else '未启用'}\n"
+            f"VS Code 配置: {'生成' if self.options.export_vsc_settings else '未生成'}\n"
+            f"CMake 生成器: {self.options.generator}"
+        )
+        sections.append(f"输出目录\n{Path(self.output_dir).resolve()}")
+        return "\n\n".join(sections)
+
     @Slot()
     def run(self):
         try:
+            success_message = "CMake 工程生成完成。"
+            self.progress.emit(2, "初始化转换任务")
             self.log.emit(
                 f"构建配置: 编译器={self.options.compiler} | "
                 f"生成器={self.options.generator} | 构建目录={self.options.build_dir}"
             )
+            self.progress.emit(5, "解析 Keil 工程")
             self.log.emit("解析 Keil 工程...")
             parser = KeilProjectToCMake(
                 self.project_file,
@@ -255,6 +339,7 @@ class ConversionWorker(QObject):
                 self.finished.emit(False, parser.last_error or "解析失败", "")
                 return
 
+            self.progress.emit(20, "工程解析完成")
             self.log.emit(
                 f"目标: {parser.target_name} | 设备: {parser.device_name} | 源文件: {len(parser.source_files)}"
             )
@@ -263,6 +348,7 @@ class ConversionWorker(QObject):
                 self.output_dir,
                 self.options.export_vsc_settings,
                 self.options,
+                progress_callback=self._generation_progress,
             ):
                 self.finished.emit(False, parser.last_error or "生成失败", "")
                 return
@@ -276,6 +362,7 @@ class ConversionWorker(QObject):
                     self.output_dir,
                     self.options,
                     timeout_seconds=600,
+                    progress_callback=self._validation_progress,
                 )
                 if report.status != "success":
                     categories = ", ".join(
@@ -319,12 +406,15 @@ class ConversionWorker(QObject):
                     for part in (report.build.stdout, report.build.stderr)
                     if part
                 )
-                self.memory_usage.emit(
-                    *self._parse_memory_usage(build_output, parser)
+                memory_regions = self._parse_memory_regions(build_output)
+                self.memory_usage.emit(*self._parse_memory_usage(build_output, parser))
+                success_message = self._build_success_message(
+                    parser, memory_regions
                 )
                 self.log.emit("构建验证通过，ELF、HEX、BIN 产物生成完成。")
 
-            self.finished.emit(True, "转换完成", self.output_dir)
+            self.progress.emit(100, "转换完成")
+            self.finished.emit(True, success_message, self.output_dir)
         except Exception as exc:
             self.finished.emit(False, str(exc), self.output_dir)
 
@@ -414,14 +504,15 @@ class MainWindow(QMainWindow):
         shell_layout.addWidget(top_bar)
 
         self.progress = QProgressBar(objectName="mainProgress")
-        self.progress.setRange(0, 1)
+        self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setTextVisible(False)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("0% · 就绪")
         shell_layout.addWidget(self.progress)
 
         self.page_stack = QStackedWidget()
 
-        project_page = QWidget()
+        project_page = QWidget(objectName="pageSurface")
         project_page_layout = QVBoxLayout(project_page)
         project_page_layout.setContentsMargins(0, 0, 0, 0)
         project_page_layout.setSpacing(0)
@@ -431,7 +522,7 @@ class MainWindow(QMainWindow):
         content_scroll.setWidgetResizable(True)
         content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         content_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        content = QWidget()
+        content = QWidget(objectName="pageSurface")
         content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(26, 22, 26, 24)
@@ -580,7 +671,7 @@ class MainWindow(QMainWindow):
 
         config_page = QScrollArea()
         config_page.setWidgetResizable(True)
-        config_content = QWidget()
+        config_content = QWidget(objectName="pageSurface")
         config_layout = QVBoxLayout(config_content)
         config_layout.setContentsMargins(30, 26, 30, 30)
         config_layout.setSpacing(18)
@@ -624,7 +715,7 @@ class MainWindow(QMainWindow):
 
         debug_page = QScrollArea()
         debug_page.setWidgetResizable(True)
-        debug_content = QWidget()
+        debug_content = QWidget(objectName="pageSurface")
         debug_layout = QVBoxLayout(debug_content)
         debug_layout.setContentsMargins(30, 26, 30, 30)
         debug_layout.setSpacing(18)
@@ -749,7 +840,7 @@ class MainWindow(QMainWindow):
         self.debug_open_vscode_button.clicked.connect(self._open_vscode)
         self.host_combo.currentIndexChanged.connect(self._update_generators)
         self.probe_combo.currentIndexChanged.connect(self._sync_backends)
-        self.project_edit.textChanged.connect(self._refresh_inspector)
+        self.project_edit.textChanged.connect(self._project_path_changed)
         self.compiler_combo.currentIndexChanged.connect(self._refresh_inspector)
         self.target_edit.textChanged.connect(self._refresh_inspector)
         self.probe_combo.currentIndexChanged.connect(self._refresh_inspector)
@@ -779,9 +870,18 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         self.project_edit.setText(QDir.toNativeSeparators(file_path))
-        if not self.output_edit.text().strip():
-            output = Path(file_path).parent / "cmake-generated"
-            self.output_edit.setText(str(output))
+
+    @staticmethod
+    def _default_output_directory(project_path):
+        project_path = project_path.strip()
+        if not project_path:
+            return ""
+        return str(Path(project_path).parent / "cmake-generated")
+
+    def _project_path_changed(self, project_path):
+        output = self._default_output_directory(project_path)
+        self.output_edit.setText(QDir.toNativeSeparators(output))
+        self._refresh_inspector()
 
     def _browse_output(self):
         directory = QFileDialog.getExistingDirectory(
@@ -903,6 +1003,13 @@ class MainWindow(QMainWindow):
             self._advance_stage(3)
         self._log(message)
 
+    @Slot(int, str)
+    def _update_conversion_progress(self, value, message):
+        value = max(0, min(100, value))
+        self.progress.setRange(0, 100)
+        self.progress.setValue(value)
+        self.progress.setFormat(f"{value}% · {message}")
+
     def _options(self):
         return GenerationOptions(
             compiler=self.compiler_combo.currentData() or "gcc",
@@ -942,7 +1049,9 @@ class MainWindow(QMainWindow):
         self.flash_bar.setValue(0)
         self.ram_bar.setValue(0)
         self._reset_stages()
-        self.progress.setRange(0, 0)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("0% · 准备转换")
         self.log_browser.clear()
         self._log(f"输入: {project_file}")
         self._log(f"输出: {output_dir}")
@@ -963,6 +1072,7 @@ class MainWindow(QMainWindow):
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.log.connect(self._handle_worker_log)
+        self.worker.progress.connect(self._update_conversion_progress)
         self.worker.memory_usage.connect(self._update_memory_usage)
         self.worker.finished.connect(self._conversion_finished)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -972,8 +1082,12 @@ class MainWindow(QMainWindow):
 
     @Slot(bool, str, str)
     def _conversion_finished(self, success, message, output_dir):
-        self.progress.setRange(0, 1)
-        self.progress.setValue(1 if success else 0)
+        self.progress.setRange(0, 100)
+        if success:
+            self.progress.setValue(100)
+            self.progress.setFormat("100% · 转换完成")
+        else:
+            self.progress.setFormat(f"{self.progress.value()}% · 转换失败")
         self.convert_button.setEnabled(True)
         self.open_output_button.setEnabled(bool(output_dir))
         self._set_status(
@@ -991,7 +1105,7 @@ class MainWindow(QMainWindow):
                 self.ram_usage_label.setText("构建失败")
         self._log(message)
         if success:
-            QMessageBox.information(self, "转换完成", "CMake 工程生成完成。")
+            QMessageBox.information(self, "转换完成", message)
         else:
             self._show_page(3)
             QMessageBox.critical(self, "转换失败", message)
