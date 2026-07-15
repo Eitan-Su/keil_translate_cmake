@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -10,8 +11,10 @@ from PySide6.QtCore import (
     QObject,
     QPropertyAnimation,
     QSettings,
+    QStringListModel,
     Qt,
     QThread,
+    QTimer,
     QUrl,
     Signal,
     Slot,
@@ -22,6 +25,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
@@ -144,10 +148,14 @@ QLineEdit, QComboBox {
 QLineEdit:hover, QComboBox:hover { border-color: #587a99; background: #fbfdff; }
 QLineEdit:focus, QComboBox:focus { border: 2px solid #0878c9; padding: 0 9px; }
 QComboBox::drop-down { border: none; width: 26px; }
-QComboBox QAbstractItemView {
+QAbstractItemView {
     color: #1d3048; background: #ffffff; border: 1px solid #8296aa;
-    selection-background-color: #dceefa; padding: 4px;
+    selection-color: #075f9d; selection-background-color: #dceefa;
+    outline: none; padding: 4px;
 }
+QAbstractItemView::item { min-height: 28px; padding: 4px 8px; }
+QAbstractItemView::item:hover { color: #075f9d; background: #dceefa; }
+QAbstractItemView::item:selected { color: #ffffff; background: #1387d4; }
 QPushButton {
     min-height: 35px; color: #294158; background: #ffffff;
     border: 1px solid #8fa2b5; border-radius: 6px; padding: 0 14px; font-weight: 650;
@@ -185,19 +193,76 @@ QProgressBar#memoryBar {
 }
 QProgressBar#memoryBar::chunk { background: #18a8c9; border-radius: 3px; }
 QScrollArea { border: none; background: #edf2f7; }
+QScrollBar:vertical {
+    width: 10px; margin: 2px; background: transparent; border: none;
+}
+QScrollBar::handle:vertical {
+    min-height: 30px; background: #a8bac9; border-radius: 4px;
+}
+QScrollBar::handle:vertical:hover { background: #1688d0; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0; background: transparent; border: none;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+QScrollBar:horizontal {
+    height: 10px; margin: 2px; background: transparent; border: none;
+}
+QScrollBar::handle:horizontal {
+    min-width: 30px; background: #a8bac9; border-radius: 4px;
+}
+QScrollBar::handle:horizontal:hover { background: #1688d0; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0; background: transparent; border: none;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: transparent;
+}
 QStackedWidget { background: #edf2f7; }
-QSplitter::handle { background: #aebdcb; }
-QSplitter::handle:hover { background: #9fc8df; }
-QSplitter::handle:horizontal { width: 2px; }
-QSplitter::handle:vertical { height: 2px; }
+QSplitter::handle { background: #d6e2eb; border-radius: 2px; }
+QSplitter::handle:hover { background: #1688d0; }
+QSplitter::handle:horizontal { width: 6px; margin: 4px 1px; }
+QSplitter::handle:vertical { height: 6px; margin: 1px 4px; }
 """
+
+
+class PathHistoryEdit(QLineEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._history = []
+        self._history_model = QStringListModel(self)
+        self._history_completer = QCompleter(self._history_model, self)
+        self._history_completer.setCaseSensitivity(
+            Qt.CaseSensitivity.CaseInsensitive
+        )
+        self._history_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._history_completer.setCompletionMode(
+            QCompleter.CompletionMode.PopupCompletion
+        )
+        self._history_completer.popup().setMouseTracking(True)
+        self.setCompleter(self._history_completer)
+
+    def set_history(self, values):
+        self._history = list(values)
+        self._history_model.setStringList(self._history)
+
+    def history(self):
+        return list(self._history)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if not self._history:
+            return
+        self._history_completer.setCompletionPrefix("")
+        self._history_completer.complete()
 
 
 class ConversionWorker(QObject):
     log = Signal(str)
     progress = Signal(int, str)
     memory_usage = Signal(int, int, int, int)
-    finished = Signal(bool, str, str)
+    finished = Signal(bool, str, str, float)
 
     def __init__(
         self,
@@ -321,6 +386,7 @@ class ConversionWorker(QObject):
 
     @Slot()
     def run(self):
+        validation_started = None
         try:
             success_message = "CMake 工程生成完成。"
             self.progress.emit(2, "初始化转换任务")
@@ -336,7 +402,7 @@ class ConversionWorker(QObject):
                 target_name=self.target_name or None,
             )
             if not parser.parse():
-                self.finished.emit(False, parser.last_error or "解析失败", "")
+                self.finished.emit(False, parser.last_error or "解析失败", "", -1.0)
                 return
 
             self.progress.emit(20, "工程解析完成")
@@ -350,13 +416,14 @@ class ConversionWorker(QObject):
                 self.options,
                 progress_callback=self._generation_progress,
             ):
-                self.finished.emit(False, parser.last_error or "生成失败", "")
+                self.finished.emit(False, parser.last_error or "生成失败", "", -1.0)
                 return
 
             for warning in parser.warnings:
                 self.log.emit(f"警告: {warning}")
 
             if self.validate_build:
+                validation_started = time.monotonic()
                 self.log.emit("执行 CMake 配置与编译验证...")
                 report = parser.validate_generated_build(
                     self.output_dir,
@@ -399,7 +466,10 @@ class ConversionWorker(QObject):
                     message = f"构建验证失败: {categories}"
                     if summary:
                         message += "\n\n" + summary
-                    self.finished.emit(False, message, self.output_dir)
+                    validation_seconds = time.monotonic() - validation_started
+                    self.finished.emit(
+                        False, message, self.output_dir, validation_seconds
+                    )
                     return
                 build_output = "\n".join(
                     part
@@ -414,12 +484,30 @@ class ConversionWorker(QObject):
                 self.log.emit("构建验证通过，ELF、HEX、BIN 产物生成完成。")
 
             self.progress.emit(100, "转换完成")
-            self.finished.emit(True, success_message, self.output_dir)
+            validation_seconds = (
+                time.monotonic() - validation_started
+                if validation_started is not None
+                else -1.0
+            )
+            self.finished.emit(
+                True, success_message, self.output_dir, validation_seconds
+            )
         except Exception as exc:
-            self.finished.emit(False, str(exc), self.output_dir)
+            validation_seconds = (
+                time.monotonic() - validation_started
+                if validation_started is not None
+                else -1.0
+            )
+            self.finished.emit(
+                False, str(exc), self.output_dir, validation_seconds
+            )
 
 
 class MainWindow(QMainWindow):
+    DEFAULT_WINDOW_SIZE = (929, 480)
+    MINIMUM_WINDOW_SIZE = (520, 440)
+    COMPACT_LAYOUT_WIDTH = 800
+
     def __init__(self):
         super().__init__()
         self.worker_thread = None
@@ -427,10 +515,14 @@ class MainWindow(QMainWindow):
         self.stage_badges = []
         self.stage_names = []
         self.current_stage = 0
+        self.validation_started = None
+        self.validation_timer = QTimer(self)
+        self.validation_timer.setInterval(100)
+        self.validation_timer.timeout.connect(self._refresh_validation_elapsed)
         self._entrance_animation = None
         self.setWindowTitle("Keil Forge · CMake Converter")
-        self.setMinimumSize(960, 520)
-        self.resize(1400, 900)
+        self.setMinimumSize(*self.MINIMUM_WINDOW_SIZE)
+        self.resize(*self.DEFAULT_WINDOW_SIZE)
         self._build_ui()
         self._connect_signals()
         self._load_config()
@@ -444,14 +536,14 @@ class MainWindow(QMainWindow):
 
         self.nav_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.nav_splitter.setChildrenCollapsible(False)
-        self.nav_splitter.setHandleWidth(2)
+        self.nav_splitter.setHandleWidth(6)
 
         rail = QFrame(objectName="navRail")
-        rail.setMinimumWidth(108)
-        rail.setMaximumWidth(220)
+        rail.setMinimumWidth(72)
+        rail.setMaximumWidth(180)
         rail_layout = QVBoxLayout(rail)
-        rail_layout.setContentsMargins(18, 22, 18, 18)
-        rail_layout.setSpacing(10)
+        rail_layout.setContentsMargins(14, 18, 14, 14)
+        rail_layout.setSpacing(8)
 
         rail_mark = QSvgWidget(str(_resource_path("assets/keilforge-mark.svg")))
         rail_mark.setFixedSize(48, 48)
@@ -483,9 +575,9 @@ class MainWindow(QMainWindow):
         shell_layout.setSpacing(0)
 
         top_bar = QFrame(objectName="topBar")
-        top_bar.setFixedHeight(64)
+        top_bar.setFixedHeight(58)
         top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(24, 0, 24, 0)
+        top_layout.setContentsMargins(18, 0, 18, 0)
         top_layout.setSpacing(12)
 
         top_layout.addStretch(1)
@@ -517,7 +609,8 @@ class MainWindow(QMainWindow):
         project_page_layout.setContentsMargins(0, 0, 0, 0)
         project_page_layout.setSpacing(0)
         self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.setChildrenCollapsible(True)
+        self.workspace_splitter.setHandleWidth(6)
         content_scroll = QScrollArea()
         content_scroll.setWidgetResizable(True)
         content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -525,8 +618,8 @@ class MainWindow(QMainWindow):
         content = QWidget(objectName="pageSurface")
         content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(26, 22, 26, 24)
-        content_layout.setSpacing(16)
+        content_layout.setContentsMargins(20, 16, 20, 18)
+        content_layout.setSpacing(12)
 
         heading = QHBoxLayout()
         heading_box = QVBoxLayout()
@@ -618,8 +711,8 @@ class MainWindow(QMainWindow):
 
         inspector = QFrame(objectName="inspector")
         inspector_layout = QVBoxLayout(inspector)
-        inspector_layout.setContentsMargins(20, 22, 20, 20)
-        inspector_layout.setSpacing(14)
+        inspector_layout.setContentsMargins(16, 16, 16, 16)
+        inspector_layout.setSpacing(10)
         inspector_layout.addWidget(QLabel("工程检查", objectName="eyebrow"))
         inspector_layout.addWidget(QLabel("转换上下文", objectName="section"))
         self.inspector_project = self._metric("工程", "未选择", inspector_layout)
@@ -627,6 +720,9 @@ class MainWindow(QMainWindow):
         self.inspector_target = self._metric("目标", "自动识别", inspector_layout)
         self.inspector_probe = self._metric("调试探针", "全部", inspector_layout)
         self.inspector_status = self._metric("构建状态", "等待转换", inspector_layout)
+        self.inspector_validation_time = self._metric(
+            "验证耗时", "等待验证", inspector_layout
+        )
 
         inspector_layout.addSpacing(4)
         inspector_layout.addWidget(QLabel("内存估算", objectName="fieldLabel"))
@@ -654,18 +750,20 @@ class MainWindow(QMainWindow):
         inspector_layout.addWidget(self.ram_bar)
         inspector_layout.addStretch(1)
 
-        inspector_scroll = QScrollArea(objectName="inspectorScroll")
-        inspector_scroll.setWidgetResizable(True)
-        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        inspector_scroll.setMinimumWidth(270)
-        inspector_scroll.setMaximumWidth(420)
-        inspector_scroll.setWidget(inspector)
+        self.inspector_scroll = QScrollArea(objectName="inspectorScroll")
+        self.inspector_scroll.setWidgetResizable(True)
+        self.inspector_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.inspector_scroll.setMinimumWidth(240)
+        self.inspector_scroll.setMaximumWidth(340)
+        self.inspector_scroll.setWidget(inspector)
 
         self.workspace_splitter.addWidget(content_scroll)
-        self.workspace_splitter.addWidget(inspector_scroll)
+        self.workspace_splitter.addWidget(self.inspector_scroll)
         self.workspace_splitter.setStretchFactor(0, 1)
         self.workspace_splitter.setStretchFactor(1, 0)
-        self.workspace_splitter.setSizes([950, 300])
+        self.workspace_splitter.setSizes([800, 270])
         project_page_layout.addWidget(self.workspace_splitter)
         self.page_stack.addWidget(project_page)
 
@@ -769,7 +867,7 @@ class MainWindow(QMainWindow):
         console_header.addWidget(self.clear_log_button)
         console_layout.addLayout(console_header)
         self.log_browser = QTextBrowser()
-        self.log_browser.setMinimumHeight(240)
+        self.log_browser.setMinimumHeight(180)
         console_layout.addWidget(self.log_browser, 1)
         self.page_stack.addWidget(console)
         shell_layout.addWidget(self.page_stack, 1)
@@ -786,7 +884,7 @@ class MainWindow(QMainWindow):
         self.nav_splitter.addWidget(shell)
         self.nav_splitter.setStretchFactor(0, 0)
         self.nav_splitter.setStretchFactor(1, 1)
-        self.nav_splitter.setSizes([140, 1260])
+        self.nav_splitter.setSizes([84, 476])
         root_layout.addWidget(self.nav_splitter)
         self.setCentralWidget(root)
         self._fade_effect = QGraphicsOpacityEffect(root)
@@ -808,7 +906,7 @@ class MainWindow(QMainWindow):
 
     def _path_field(self, grid, row, label, placeholder):
         label_widget = QLabel(label, objectName="fieldLabel")
-        edit = QLineEdit()
+        edit = PathHistoryEdit()
         edit.setPlaceholderText(placeholder)
         button = QPushButton("浏览")
         button.setFixedWidth(78)
@@ -850,6 +948,19 @@ class MainWindow(QMainWindow):
         for button, (compact, full, _) in zip(self.nav_buttons, self.nav_labels):
             button.setText(full if expanded else compact)
 
+    @classmethod
+    def _is_compact_width(cls, width):
+        return int(width) < cls.COMPACT_LAYOUT_WIDTH
+
+    def _update_compact_layout(self):
+        if not hasattr(self, "inspector_scroll"):
+            return
+        compact = self._is_compact_width(self.width())
+        self.inspector_scroll.setVisible(not compact)
+        if compact:
+            self.nav_splitter.setSizes([84, max(1, self.width() - 84)])
+        self._update_nav_labels()
+
     def _show_page(self, index):
         if not 0 <= index < self.page_stack.count():
             return
@@ -870,6 +981,7 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         self.project_edit.setText(QDir.toNativeSeparators(file_path))
+        self._remember_path(self.project_edit, file_path)
 
     @staticmethod
     def _default_output_directory(project_path):
@@ -889,6 +1001,7 @@ class MainWindow(QMainWindow):
         )
         if directory:
             self.output_edit.setText(QDir.toNativeSeparators(directory))
+            self._remember_path(self.output_edit, directory)
 
     def _browse_uv4(self):
         directory = QFileDialog.getExistingDirectory(
@@ -1001,7 +1114,52 @@ class MainWindow(QMainWindow):
             self._advance_stage(2)
         elif "编译验证" in message or "构建验证" in message:
             self._advance_stage(3)
+            if message.startswith("执行 CMake 配置与编译验证"):
+                self._start_validation_timer()
         self._log(message)
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(0.0, float(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours >= 1:
+            return f"{int(hours)} 小时 {int(minutes):02d} 分 {seconds:04.1f} 秒"
+        if minutes >= 1:
+            return f"{int(minutes)} 分 {seconds:04.1f} 秒"
+        return f"{seconds:.1f} 秒"
+
+    @classmethod
+    def _with_validation_duration(cls, message, validation_seconds):
+        timing_text = (
+            cls._format_duration(validation_seconds)
+            if validation_seconds >= 0
+            else "未执行"
+        )
+        return f"{message}\n\n验证耗时\n{timing_text}"
+
+    def _start_validation_timer(self):
+        if self.validation_started is not None:
+            return
+        self.validation_started = time.monotonic()
+        self.inspector_validation_time.setText("0.0 秒")
+        self.validation_timer.start()
+
+    def _refresh_validation_elapsed(self):
+        if self.validation_started is None:
+            return
+        elapsed = time.monotonic() - self.validation_started
+        self.inspector_validation_time.setText(self._format_duration(elapsed))
+
+    def _stop_validation_timer(self, validation_seconds):
+        self.validation_timer.stop()
+        self.validation_started = None
+        if validation_seconds >= 0:
+            self.inspector_validation_time.setText(
+                self._format_duration(validation_seconds)
+            )
+        else:
+            self.inspector_validation_time.setText("未执行")
 
     @Slot(int, str)
     def _update_conversion_progress(self, value, message):
@@ -1038,11 +1196,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "配置错误", str(exc))
             return
 
+        self._remember_path(self.project_edit, project_file)
+        self._remember_path(self.output_edit, output_dir)
         self._save_config()
         self.convert_button.setEnabled(False)
         self.open_output_button.setEnabled(False)
         self._set_status("转换中", "running")
         self.inspector_status.setText("正在转换")
+        self.validation_timer.stop()
+        self.validation_started = None
+        self.inspector_validation_time.setText(
+            "等待开始" if self.validate_check.isChecked() else "未执行"
+        )
         memory_state = "正在构建" if self.validate_check.isChecked() else "未执行验证"
         self.flash_usage_label.setText(memory_state)
         self.ram_usage_label.setText(memory_state)
@@ -1080,8 +1245,10 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
 
-    @Slot(bool, str, str)
-    def _conversion_finished(self, success, message, output_dir):
+    @Slot(bool, str, str, float)
+    def _conversion_finished(self, success, message, output_dir, validation_seconds):
+        self._stop_validation_timer(validation_seconds)
+        message = self._with_validation_duration(message, validation_seconds)
         self.progress.setRange(0, 100)
         if success:
             self.progress.setValue(100)
@@ -1130,10 +1297,54 @@ class MainWindow(QMainWindow):
     def _log(self, message):
         self.log_browser.append(message)
 
+    @staticmethod
+    def _history_values(value):
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        text = str(value).strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _merge_path_history(path, history, limit=12):
+        values = []
+        candidates = [path, *history]
+        seen = set()
+        for candidate in candidates:
+            value = str(candidate).strip()
+            if not value:
+                continue
+            key = os.path.normcase(os.path.normpath(value))
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(value)
+            if len(values) >= limit:
+                break
+        return values
+
+    def _remember_path(self, edit, path):
+        edit.set_history(self._merge_path_history(path, edit.history()))
+
     def _load_config(self):
         settings = QSettings(str(_config_file_path()), QSettings.Format.IniFormat)
-        self.project_edit.setText(str(settings.value("uvproj_filepath", "")))
-        self.output_edit.setText(str(settings.value("output_directory", "")))
+        project_path = str(settings.value("uvproj_filepath", ""))
+        output_directory = str(settings.value("output_directory", ""))
+        project_history = self._history_values(
+            settings.value("uvproj_history", [])
+        )
+        output_history = self._history_values(
+            settings.value("output_history", [])
+        )
+        self.project_edit.set_history(
+            self._merge_path_history(project_path, project_history)
+        )
+        self.output_edit.set_history(
+            self._merge_path_history(output_directory, output_history)
+        )
+        self.project_edit.setText(project_path)
+        self.output_edit.setText(output_directory)
         self.uv4_edit.setText(
             str(settings.value("uv4_path", find_keil_mdk_root() or ""))
         )
@@ -1153,13 +1364,16 @@ class MainWindow(QMainWindow):
             str(settings.value("validate_build", "true")).lower()
             in {"1", "true", "yes"}
         )
-        nav_width = int(settings.value("nav_width", 140))
-        inspector_width = int(settings.value("inspector_width", 300))
+        nav_width = int(settings.value("nav_width", 84))
+        inspector_width = int(settings.value("inspector_width", 270))
+        if self._is_compact_width(self.width()):
+            nav_width = min(nav_width, 84)
         self.nav_splitter.setSizes([nav_width, max(1, self.width() - nav_width)])
         self.workspace_splitter.setSizes(
             [max(1, self.width() - nav_width - inspector_width), inspector_width]
         )
         self._update_nav_labels()
+        self._update_compact_layout()
         self._refresh_inspector()
 
     def showEvent(self, event):
@@ -1175,11 +1389,17 @@ class MainWindow(QMainWindow):
         self._entrance_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._entrance_animation.start()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_compact_layout()
+
     def _save_config(self):
         settings = QSettings(str(_config_file_path()), QSettings.Format.IniFormat)
         values = {
             "uvproj_filepath": self.project_edit.text().strip(),
             "output_directory": self.output_edit.text().strip(),
+            "uvproj_history": self.project_edit.history(),
+            "output_history": self.output_edit.history(),
             "uv4_path": self.uv4_edit.text().strip(),
             "target_name": self.target_edit.text().strip(),
             "build_dir": self.build_dir_edit.text().strip(),

@@ -4270,17 +4270,39 @@ SECTIONS
                     ]
                 )
 
-            lines.extend(
-                [
-                    f'cmake -S . -B "{build_dir}" -G "{generator}" -DCMAKE_BUILD_TYPE=Debug',
-                    "if errorlevel 1 exit /b %errorlevel%",
-                    'set "BUILD_SWITCH="',
-                    'if /I "%~1"=="rebuild" set "BUILD_SWITCH=--clean-first"',
-                    f'cmake --build "{build_dir}" %BUILD_SWITCH% --parallel',
-                    "endlocal",
-                    "",
-                ]
-            )
+            if options.compiler == "gcc":
+                lines.extend(
+                    [
+                        'set "BUILD_TYPE=Debug"',
+                        f'set "ACTIVE_BUILD_DIR={build_dir}"',
+                        'set "BUILD_SWITCH="',
+                        'if /I "%~1"=="release" (',
+                        '    set "BUILD_TYPE=Release"',
+                        f'    set "ACTIVE_BUILD_DIR={build_dir}-release"',
+                        '    if /I "%~2"=="rebuild" set "BUILD_SWITCH=--clean-first"',
+                        ') else if /I "%~1"=="rebuild" (',
+                        '    set "BUILD_SWITCH=--clean-first"',
+                        ')',
+                        "",
+                        f'cmake -S . -B "%ACTIVE_BUILD_DIR%" -G "{generator}" -DCMAKE_BUILD_TYPE=%BUILD_TYPE%',
+                        "if errorlevel 1 exit /b %errorlevel%",
+                        'cmake --build "%ACTIVE_BUILD_DIR%" %BUILD_SWITCH% --parallel',
+                        "endlocal",
+                        "",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        f'cmake -S . -B "{build_dir}" -G "{generator}" -DCMAKE_BUILD_TYPE=Debug',
+                        "if errorlevel 1 exit /b %errorlevel%",
+                        'set "BUILD_SWITCH="',
+                        'if /I "%~1"=="rebuild" set "BUILD_SWITCH=--clean-first"',
+                        f'cmake --build "{build_dir}" %BUILD_SWITCH% --parallel',
+                        "endlocal",
+                        "",
+                    ]
+                )
             return "\n".join(lines)
 
         lines = ["#!/usr/bin/env sh", "set -eu", ""]
@@ -4301,15 +4323,35 @@ SECTIONS
                 ]
             )
 
-        lines.extend(
-            [
-                f'cmake -S . -B "{build_dir}" -G "{generator}" -DCMAKE_BUILD_TYPE=Debug',
-                'BUILD_SWITCH=""',
-                'if [ "${1:-}" = "rebuild" ]; then BUILD_SWITCH="--clean-first"; fi',
-                f'cmake --build "{build_dir}" $BUILD_SWITCH --parallel',
-                "",
-            ]
-        )
+        if options.compiler == "gcc":
+            lines.extend(
+                [
+                    'BUILD_TYPE="Debug"',
+                    f'ACTIVE_BUILD_DIR="{build_dir}"',
+                    'BUILD_SWITCH=""',
+                    'if [ "${1:-}" = "release" ]; then',
+                    '    BUILD_TYPE="Release"',
+                    f'    ACTIVE_BUILD_DIR="{build_dir}-release"',
+                    '    if [ "${2:-}" = "rebuild" ]; then BUILD_SWITCH="--clean-first"; fi',
+                    'elif [ "${1:-}" = "rebuild" ]; then',
+                    '    BUILD_SWITCH="--clean-first"',
+                    "fi",
+                    "",
+                    f'cmake -S . -B "$ACTIVE_BUILD_DIR" -G "{generator}" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"',
+                    'cmake --build "$ACTIVE_BUILD_DIR" $BUILD_SWITCH --parallel',
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f'cmake -S . -B "{build_dir}" -G "{generator}" -DCMAKE_BUILD_TYPE=Debug',
+                    'BUILD_SWITCH=""',
+                    'if [ "${1:-}" = "rebuild" ]; then BUILD_SWITCH="--clean-first"; fi',
+                    f'cmake --build "{build_dir}" $BUILD_SWITCH --parallel',
+                    "",
+                ]
+            )
         return "\n".join(lines)
 
     def _armclang_toolchain_content(self, options: GenerationOptions) -> str:
@@ -4515,12 +4557,17 @@ SECTIONS
         ownership_file = root_vscode / "keilforge-workspace.json"
         managed_names = set(contents)
         existing = [name for name in managed_names if (root_vscode / name).exists()]
-        if existing and not ownership_file.exists():
+        legacy_generated = self._is_legacy_generated_vscode_configuration(
+            root_vscode
+        )
+        if existing and not ownership_file.exists() and not legacy_generated:
             self.warnings.append(
                 "工程根目录已有 VS Code 配置，保留现有文件: "
                 + ", ".join(sorted(existing))
             )
             return
+        if legacy_generated and not ownership_file.exists():
+            self.warnings.append("检测到旧版生成的 VS Code 配置，自动更新根目录任务")
 
         root_vscode.mkdir(parents=True, exist_ok=True)
         relative_output = os.path.relpath(output_path, workspace_root).replace("\\", "/")
@@ -4587,11 +4634,49 @@ SECTIONS
             )
         self.warnings.append(f"VS Code 根工作区配置: {workspace_root}")
 
+    @staticmethod
+    def _is_legacy_generated_vscode_configuration(vscode_dir: Path) -> bool:
+        tasks_file = vscode_dir / "tasks.json"
+        settings_file = vscode_dir / "settings.json"
+        if not tasks_file.is_file() or not settings_file.is_file():
+            return False
+        try:
+            with open(tasks_file, "r", encoding="utf-8") as file:
+                tasks = json.load(file).get("tasks", [])
+            with open(settings_file, "r", encoding="utf-8") as file:
+                settings = json.load(file)
+        except (OSError, ValueError, TypeError):
+            return False
+
+        labels = {
+            str(task.get("label", ""))
+            for task in tasks
+            if isinstance(task, dict)
+        }
+        has_generated_tasks = {
+            "Configure GCC Debug",
+            "Build GCC Debug",
+        }.issubset(labels) and any(label.startswith("Flash ") for label in labels)
+        has_generated_settings = (
+            "cmake.buildDirectory" in settings
+            and "cmake.copyCompileCommands" in settings
+        )
+        return has_generated_tasks and has_generated_settings
+
     def _relative_workspace_path(self, path: Path, output_path: Path) -> str:
         return self._normalize_path(str(path.resolve(strict=False)), str(output_path))
 
-    def _artifact_path(self, options: GenerationOptions, suffix: str) -> str:
-        return f"${{workspaceFolder}}/{options.build_dir}/{self._artifact_name()}{suffix}"
+    def _artifact_path(
+        self,
+        options: GenerationOptions,
+        suffix: str,
+        build_dir: Optional[str] = None,
+    ) -> str:
+        active_build_dir = build_dir or options.build_dir
+        return (
+            f"${{workspaceFolder}}/{active_build_dir}/"
+            f"{self._artifact_name()}{suffix}"
+        )
 
     def _jlink_flash_device(self) -> str:
         return self._clean_device_name() or self.cpu or "Cortex-M4"
@@ -4614,6 +4699,9 @@ SECTIONS
             "jlink_flash_elf.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.elf\nr\ng\nq\n",
             "jlink_flash_hex.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.hex\nr\ng\nq\n",
             "jlink_flash_bin.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.bin 0x08000000\nr\ng\nq\n",
+            "jlink_flash_elf_release.jlink": f"r\nloadfile {options.build_dir}-release/{self._artifact_name()}.elf\nr\ng\nq\n",
+            "jlink_flash_hex_release.jlink": f"r\nloadfile {options.build_dir}-release/{self._artifact_name()}.hex\nr\ng\nq\n",
+            "jlink_flash_bin_release.jlink": f"r\nloadfile {options.build_dir}-release/{self._artifact_name()}.bin 0x08000000\nr\ng\nq\n",
         }
 
         for file_name, content in scripts.items():
@@ -4703,6 +4791,84 @@ SECTIONS
             clean_task,
         ]
 
+        if options.compiler == "gcc":
+            release_build_dir = f"{options.build_dir}-release"
+            release_configure_label = f"Configure {compiler_label} Release"
+            release_build_label = f"Build {compiler_label} Release"
+            release_configure_task: Dict[str, Any] = {
+                "label": release_configure_label,
+                "type": "shell",
+                "command": commands["cmake"],
+                "args": [
+                    "-S",
+                    "${workspaceFolder}",
+                    "-B",
+                    f"${{workspaceFolder}}/{release_build_dir}",
+                    "-G",
+                    options.generator,
+                    "-DCMAKE_BUILD_TYPE=Release",
+                ],
+                "problemMatcher": [],
+            }
+            if task_options:
+                release_configure_task["options"] = task_options
+
+            release_build_args: List[str] = [
+                "--build",
+                f"${{workspaceFolder}}/{release_build_dir}",
+                "--target",
+                self._cmake_artifacts_target_name(),
+                "--parallel",
+            ]
+            release_build_task: Dict[str, Any] = {
+                "label": release_build_label,
+                "type": "shell",
+                "command": commands["cmake"],
+                "args": release_build_args,
+                "dependsOn": release_configure_label,
+                "problemMatcher": [],
+            }
+            if task_options:
+                release_build_task["options"] = task_options
+
+            release_rebuild_args = list(release_build_args)
+            release_rebuild_args.insert(-1, "--clean-first")
+            release_rebuild_task: Dict[str, Any] = {
+                "label": f"Rebuild {compiler_label} Release",
+                "type": "shell",
+                "command": commands["cmake"],
+                "args": release_rebuild_args,
+                "dependsOn": release_configure_label,
+                "problemMatcher": [],
+            }
+            if task_options:
+                release_rebuild_task["options"] = task_options
+
+            release_clean_task: Dict[str, Any] = {
+                "label": f"Clean {compiler_label} Release",
+                "type": "shell",
+                "command": commands["cmake"],
+                "args": [
+                    "--build",
+                    f"${{workspaceFolder}}/{release_build_dir}",
+                    "--target",
+                    "clean",
+                ],
+                "dependsOn": release_configure_label,
+                "problemMatcher": [],
+            }
+            if task_options:
+                release_clean_task["options"] = task_options
+
+            tasks.extend(
+                [
+                    release_configure_task,
+                    release_build_task,
+                    release_rebuild_task,
+                    release_clean_task,
+                ]
+            )
+
         debuggers = self._selected_debug_backends(options)
         selected_probes = self._selected_probes(options)
         if options.compiler == "gcc":
@@ -4791,6 +4957,31 @@ SECTIONS
                             },
                         ]
                     )
+                    for suffix in ("elf", "hex", "bin"):
+                        program_args = [
+                            "-c",
+                            (
+                                f"program {{{self._artifact_path(options, f'.{suffix}', release_build_dir)}}} "
+                                + (
+                                    "0x08000000 verify reset exit"
+                                    if suffix == "bin"
+                                    else "verify reset exit"
+                                )
+                            ),
+                        ]
+                        tasks.append(
+                            {
+                                "label": (
+                                    f"Flash {flash_probe_label} "
+                                    f"{suffix.upper()} Release"
+                                ),
+                                "type": "shell",
+                                "command": commands["openocd"],
+                                "args": openocd_file_args + program_args,
+                                "dependsOn": release_build_label,
+                                "problemMatcher": [],
+                            }
+                        )
 
             if "jlink" in debuggers and any(
                 self._probe_supports_backend(probe, "jlink")
@@ -4806,7 +4997,24 @@ SECTIONS
                     ("Flash J-Link ELF", "jlink_flash_elf.jlink"),
                     ("Flash J-Link HEX", "jlink_flash_hex.jlink"),
                     ("Flash J-Link BIN", "jlink_flash_bin.jlink"),
+                    (
+                        "Flash J-Link ELF Release",
+                        "jlink_flash_elf_release.jlink",
+                    ),
+                    (
+                        "Flash J-Link HEX Release",
+                        "jlink_flash_hex_release.jlink",
+                    ),
+                    (
+                        "Flash J-Link BIN Release",
+                        "jlink_flash_bin_release.jlink",
+                    ),
                 ]:
+                    depends_on = (
+                        release_build_label
+                        if label.endswith(" Release")
+                        else build_label
+                    )
                     tasks.append(
                         {
                             "label": label,
@@ -4822,11 +5030,11 @@ SECTIONS
                                 "-CommanderScript",
                                 f"${{workspaceFolder}}/.vscode/{script_name}",
                             ],
-                            "dependsOn": build_label,
+                            "dependsOn": depends_on,
                             "presentation": presentation,
                             "problemMatcher": [],
-                            }
-                        )
+                        }
+                    )
                 tasks.append(
                     {
                         "label": "Start J-Link GDB Server",
@@ -4868,7 +5076,7 @@ SECTIONS
                             "type": "shell",
                             "command": commands["openocd"],
                             "args": openocd_file_args,
-                            "dependsOn": build_label,
+                            "dependsOn": depends_on,
                             "isBackground": True,
                             "presentation": {
                                 "echo": True,
@@ -5246,6 +5454,17 @@ SECTIONS
             '"${KEIL_GCC_PROJECT_LTO_DEFAULT}" CACHE INTERNAL '
             '"Last generated Keil LTO default" FORCE)\n'
         )
+        f.write('find_program(KEIL_GCC_COMPILER_CACHE NAMES sccache ccache)\n')
+        f.write('if(KEIL_GCC_COMPILER_CACHE)\n')
+        f.write('    set(CMAKE_C_COMPILER_LAUNCHER "${KEIL_GCC_COMPILER_CACHE}")\n')
+        f.write('    set(CMAKE_CXX_COMPILER_LAUNCHER "${KEIL_GCC_COMPILER_CACHE}")\n')
+        f.write('endif()\n')
+        f.write('foreach(KEIL_LANGUAGE C CXX ASM)\n')
+        f.write('    set(CMAKE_${KEIL_LANGUAGE}_FLAGS_DEBUG "")\n')
+        f.write('    set(CMAKE_${KEIL_LANGUAGE}_FLAGS_RELEASE "")\n')
+        f.write('    set(CMAKE_${KEIL_LANGUAGE}_FLAGS_RELWITHDEBINFO "")\n')
+        f.write('    set(CMAKE_${KEIL_LANGUAGE}_FLAGS_MINSIZEREL "")\n')
+        f.write('endforeach()\n')
         f.write(
             'file(RELATIVE_PATH COMPILE_COMMANDS_COPY_TARGET "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/compile_commands.json")\n\n'
         )
@@ -5348,17 +5567,23 @@ SECTIONS
         f.write("    -ffunction-sections\n")
         f.write("    -fdata-sections\n")
         f.write("    -fno-common\n")
+        f.write("    -pipe\n")
         f.write("    -Wall\n")
         f.write("    -Wextra\n")
         for flag in compatible_compile_options:
             f.write(f"    {flag}\n")
-        f.write('    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:-flto>"\n')
-        f.write(
-            '    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:-flto-partition=1to1>"\n'
+        lto_condition = (
+            '$<AND:$<BOOL:${KEIL_GCC_ENABLE_LTO}>,'
+            '$<NOT:$<CONFIG:Debug>>>'
         )
-        f.write("    ${KEIL_OPTIMIZATION_FLAG}\n")
+        f.write(f'    "$<{lto_condition}:-flto>"\n')
+        f.write(
+            f'    "$<{lto_condition}:-flto-partition=1to1>"\n'
+        )
+        f.write('    "$<$<CONFIG:Debug>:-Og>"\n')
+        f.write('    "$<$<NOT:$<CONFIG:Debug>>:${KEIL_OPTIMIZATION_FLAG}>"\n')
         f.write(f"    $<$<COMPILE_LANGUAGE:C>:{self._gcc_c_standard()}>\n")
-        f.write("    $<$<CONFIG:Debug>:-g3>\n")
+        f.write('    "$<$<CONFIG:Debug>:-g2>"\n')
         if "CXX" in languages:
             f.write(f"    $<$<COMPILE_LANGUAGE:CXX>:{self._gcc_cpp_standard()}>\n")
             if "-fno-rtti" in self.c_cpp_flags:
@@ -5370,13 +5595,13 @@ SECTIONS
         f.write(f"target_link_options({cmake_target} PRIVATE\n")
         for flag in cpu_options:
             f.write(f"    {flag}\n")
-        f.write('    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:-flto>"\n')
+        f.write(f'    "$<{lto_condition}:-flto>"\n')
         f.write(
-            '    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:-flto-partition=1to1>"\n'
+            f'    "$<{lto_condition}:-flto-partition=1to1>"\n'
         )
         for symbol in inline_assembly_symbols:
             f.write(
-                '    "$<$<BOOL:${KEIL_GCC_ENABLE_LTO}>:'
+                f'    "$<{lto_condition}:'
                 f'-Wl,--undefined={symbol}>"\n'
             )
         f.write("    -T${LINKER_SCRIPT}\n")

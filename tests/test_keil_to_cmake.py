@@ -291,11 +291,27 @@ class KeilToCMakeTests(unittest.TestCase):
             self.assertIn("Build GCC Debug", by_label)
             self.assertIn("Rebuild GCC Debug", by_label)
             self.assertIn("Clean GCC Debug", by_label)
+            self.assertIn("Configure GCC Release", by_label)
+            self.assertIn("Build GCC Release", by_label)
+            self.assertIn("Rebuild GCC Release", by_label)
+            self.assertIn("Clean GCC Release", by_label)
             self.assertIn("--clean-first", by_label["Rebuild GCC Debug"]["args"])
+            self.assertIn(
+                "--clean-first", by_label["Rebuild GCC Release"]["args"]
+            )
             self.assertEqual(
                 by_label["Clean GCC Debug"]["args"][-2:], ["--target", "clean"]
             )
+            self.assertIn(
+                "${workspaceFolder}/build-gcc-release",
+                by_label["Configure GCC Release"]["args"],
+            )
+            self.assertIn(
+                "-DCMAKE_BUILD_TYPE=Release",
+                by_label["Configure GCC Release"]["args"],
+            )
             self.assertIn("Flash J-Link BIN", by_label)
+            self.assertIn("Flash J-Link BIN Release", by_label)
             self.assertIn("Start J-Link GDB Server", by_label)
             self.assertNotIn("Flash J-Link OpenOCD BIN", by_label)
             jlink_args = by_label["Flash J-Link BIN"]["args"]
@@ -313,6 +329,14 @@ class KeilToCMakeTests(unittest.TestCase):
                 by_label["Start J-Link GDB Server"]["args"][-3:],
                 ["-port", "2331", "-singlerun"],
             )
+            self.assertEqual(
+                by_label["Flash J-Link BIN Release"]["dependsOn"],
+                "Build GCC Release",
+            )
+            release_script = (
+                output_dir / ".vscode" / "jlink_flash_bin_release.jlink"
+            ).read_text(encoding="utf-8")
+            self.assertIn("build-gcc-release/", release_script)
 
             openocd_output_dir = root / "out-openocd"
             self.assertTrue(
@@ -334,13 +358,24 @@ class KeilToCMakeTests(unittest.TestCase):
             )["tasks"]
             openocd_by_label = {task["label"]: task for task in openocd_tasks}
             self.assertIn("Flash J-Link OpenOCD BIN", openocd_by_label)
+            self.assertIn(
+                "Flash J-Link OpenOCD BIN Release", openocd_by_label
+            )
             self.assertNotIn("Flash J-Link BIN", openocd_by_label)
+            self.assertEqual(
+                openocd_by_label["Flash J-Link OpenOCD BIN Release"][
+                    "dependsOn"
+                ],
+                "Build GCC Release",
+            )
             self.assertEqual(len(openocd_by_label), len(openocd_tasks))
 
             build_script = (output_dir / "do_build.bat").read_text(
                 encoding="utf-8"
             )
             self.assertIn('if /I "%~1"=="rebuild"', build_script)
+            self.assertIn('if /I "%~1"=="release"', build_script)
+            self.assertIn('set "ACTIVE_BUILD_DIR=build-gcc-release"', build_script)
             self.assertIn("--clean-first", build_script)
 
     def test_vscode_configuration_is_mirrored_to_project_root(self):
@@ -410,6 +445,78 @@ class KeilToCMakeTests(unittest.TestCase):
                 (build_dir / "compile_commands.json").read_text(encoding="utf-8"),
             )
 
+    def test_legacy_generated_root_vscode_tasks_are_upgraded(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir) / "firmware"
+            project_dir = root / "MDK-ARM"
+            source_dir = root / "USER"
+            project_dir.mkdir(parents=True)
+            source_dir.mkdir(parents=True)
+            uvprojx = self._write_minimal_project(project_dir)
+            external_source = source_dir / "app.c"
+            external_source.write_text("void app(void) {}\n", encoding="utf-8")
+
+            root_vscode = root / ".vscode"
+            root_vscode.mkdir()
+            (root_vscode / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "cmake.buildDirectory": "${workspaceFolder}/build-gcc",
+                        "cmake.copyCompileCommands": (
+                            "${workspaceFolder}/compile_commands.json"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root_vscode / "tasks.json").write_text(
+                json.dumps(
+                    {
+                        "version": "2.0.0",
+                        "tasks": [
+                            {"label": "Configure GCC Debug"},
+                            {"label": "Build GCC Debug"},
+                            {"label": "Flash ST-Link BIN"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            parser.project_dir = project_dir
+            parser.source_files.append(str(external_source))
+            output_dir = project_dir / "cmake-generated"
+
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(output_dir),
+                    True,
+                    GenerationOptions(
+                        compiler="gcc",
+                        generator="Ninja",
+                        debug_probe="all",
+                        debug_backend="all",
+                    ),
+                )
+            )
+
+            tasks = json.loads(
+                (root_vscode / "tasks.json").read_text(encoding="utf-8")
+            )["tasks"]
+            labels = {task["label"] for task in tasks}
+            self.assertIn("Flash ST-Link BIN", labels)
+            self.assertIn("Flash DAPLink BIN", labels)
+            self.assertIn("Flash Nu-Link BIN", labels)
+            self.assertIn("Flash ULINK BIN", labels)
+            self.assertIn("Flash J-Link BIN", labels)
+            self.assertTrue(
+                (root_vscode / "keilforge-workspace.json").is_file()
+            )
+
     def test_jlink_flash_prefers_keil_device_over_cpu_core(self):
         with TemporaryDirectory() as temp_dir, patch(
             "keil_to_cmake.find_keil_mdk_root", return_value=None
@@ -458,9 +565,16 @@ class KeilToCMakeTests(unittest.TestCase):
                 'set(KEIL_GCC_PROJECT_LTO_DEFAULT "OFF")',
                 cmake_text,
             )
-            self.assertIn("    ${KEIL_OPTIMIZATION_FLAG}\n", cmake_text)
-            self.assertNotIn("$<$<CONFIG:Debug>:-Og>", cmake_text)
-            self.assertIn("$<$<CONFIG:Debug>:-g3>", cmake_text)
+            self.assertIn("find_program(KEIL_GCC_COMPILER_CACHE", cmake_text)
+            self.assertIn('set(CMAKE_${KEIL_LANGUAGE}_FLAGS_RELEASE "")', cmake_text)
+            self.assertIn("    -pipe\n", cmake_text)
+            self.assertIn('$<$<CONFIG:Debug>:-Og>', cmake_text)
+            self.assertIn(
+                '$<$<NOT:$<CONFIG:Debug>>:${KEIL_OPTIMIZATION_FLAG}>',
+                cmake_text,
+            )
+            self.assertIn('$<$<CONFIG:Debug>:-g2>', cmake_text)
+            self.assertNotIn('$<$<CONFIG:Debug>:-g3>', cmake_text)
 
             parser.keil_optimize_for_time = "1"
             self.assertEqual(parser._gcc_optimization_flag(), "-O3")
@@ -505,7 +619,12 @@ class KeilToCMakeTests(unittest.TestCase):
                 'set(KEIL_GCC_PROJECT_LTO_DEFAULT "ON")',
                 cmake_text,
             )
-            self.assertEqual(cmake_text.count("KEIL_GCC_ENABLE_LTO}>:-flto>"), 2)
+            self.assertEqual(
+                cmake_text.count(
+                    "$<AND:$<BOOL:${KEIL_GCC_ENABLE_LTO}>,$<NOT:$<CONFIG:Debug>>>"
+                ),
+                4,
+            )
 
     def test_fallback_linker_uses_armasm_stack_and_heap_sizes(self):
         with TemporaryDirectory() as temp_dir, patch(

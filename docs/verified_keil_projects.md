@@ -1,6 +1,6 @@
 # Keil 工程转换验证清单
 
-本文档记录经过实际转换和 GCC 构建验证的 Keil 工程。统计日期为 2026 年 7 月 14 日。
+本文档记录经过实际转换和 GCC 构建验证的 Keil 工程。统计日期为 2026 年 7 月 16 日。
 
 ## 验证标准
 
@@ -12,7 +12,7 @@
 4. 使用 `arm-none-eabi-gcc` 完成源文件编译和最终链接。
 5. 输出目录中存在对应的 ELF 固件。
 
-多数工程还生成 BIN、HEX、MAP 和构建诊断报告。验证环境为 Windows 10、CMake、MinGW Makefiles 和 GNU Arm Embedded Toolchain 13.3.1。
+多数工程还生成 BIN、HEX、MAP 和构建诊断报告。验证环境为 Windows、CMake 4.3.1、Ninja 1.13.2、MinGW Makefiles 和 GNU Arm Embedded Toolchain 13.3.1。
 
 本清单证明所列工程在当前样本和工具链环境下通过构建。相同芯片的其他 SDK 版本、启动文件、链接脚本和中间件组合仍需单独验证。
 
@@ -20,10 +20,10 @@
 
 | 项目 | 数量 |
 | --- | ---: |
-| 通过验证的独立 Keil 工程 | 142 |
+| 通过验证的独立 Keil 工程 | 143 |
 | 通过验证的器件规格 | 21 |
 | AT32F415 官方 examples | 118 |
-| 其他代表工程和 utility 工程 | 24 |
+| 其他代表工程和 utility 工程 | 25 |
 
 ## 器件规格
 
@@ -32,7 +32,7 @@
 | ArteryTek | `AT32F415RCT7` | 119 | 官方 examples 全量验证 118 项，加 USB IAP utility 1 项 |
 | ArteryTek | `AT32F415CBT7` | 1 | EEPROM/FOC ESC 代表工程 |
 | ArteryTek | `AT32F421K8T7` | 1 | FOC 代表工程 |
-| ArteryTek | `AT32F435RGT7` | 1 | SDIO 代表工程 |
+| ArteryTek | `AT32F435RGT7` | 2 | SDIO 与 E-Track 代表工程 |
 | Texas Instruments | `MSP432P401R` | 1 | GPIO LED 代表工程 |
 | Nationstech | `N32WB031` | 3 | HID、RF Test、WWDG |
 | Nationstech | `N32WB031KEQ6-2` | 1 | Beacon/TOTP 工程 |
@@ -91,6 +91,7 @@ utilities/at32f415_usb_iap_demo/source_code/app_led4_toggle/mdk_v5/app_led4_togg
 | `AT32F421K8T7` | `AT32/at32_foc/project/MDK_V5/project_file.uvprojx` |
 | `AT32F415CBT7` | `AT32_ESC/mdk_v5/eeprom.uvprojx` |
 | `AT32F435RGT7` | `AT32F435RGT7_SDIO/MDK-ARM_F435/proj.uvprojx` |
+| `AT32F435RGT7` | `E-Track/MDK-ARM_F435/proj.uvprojx` |
 | `MSP432P401R` | `MSP432_Quick_entry-master/02_RNA_LED/keil/empty.uvprojx` |
 | `N32WB031` | `N32WB_HID/MDK-ARM/touch_screen.uvprojx` |
 | `N32WB031` | `N32WB03x_SDK_V2.0.0/projects/n32wb03x_EVAL/prod_test/RF_Test/MDK-ARM/RF_Test.uvprojx` |

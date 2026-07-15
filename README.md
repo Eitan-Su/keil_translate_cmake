@@ -136,18 +136,31 @@ GCC 模式下，任务配置中通常会包含以下项目：
 2. `Build GCC Debug`
 3. `Rebuild GCC Debug`
 4. `Clean GCC Debug`
-5. `Flash ST-Link ELF`
-6. `Flash ST-Link HEX`
-7. `Flash ST-Link BIN`
-8. `Start ST-Link OpenOCD GDB Server`
-9. `Flash J-Link OpenOCD BIN`
-10. `Flash J-Link BIN`
-11. `Start J-Link GDB Server`
+5. `Configure GCC Release`
+6. `Build GCC Release`
+7. `Rebuild GCC Release`
+8. `Clean GCC Release`
+9. `Flash ST-Link ELF`
+10. `Flash ST-Link HEX`
+11. `Flash ST-Link BIN`
+12. `Start ST-Link OpenOCD GDB Server`
+13. `Flash J-Link OpenOCD BIN`
+14. `Flash J-Link BIN`
+15. `Start J-Link GDB Server`
+
+各探针的 ELF、HEX、BIN 烧录任务同时提供 Debug 与 Release 版本。未带
+`Release` 后缀的任务烧录 `build-gcc` 目录中的 Debug 固件；带 `Release`
+后缀的任务烧录 `build-gcc-release` 目录中的 Release 固件。
 
 `Build GCC Debug` 和直接执行 `do_build.bat` 使用增量构建。`Rebuild GCC Debug`
 和 `do_build.bat rebuild` 会先清理构建目标，再进行全量编译。普通 ASCII 源文件由
 CMake 直接引用；非 ASCII 目录中的安全副本通过源文件依赖规则自动同步，因此保存源码后
 再次构建会更新 ELF、HEX 和 BIN 固件。
+
+Debug 构建使用 `-Og -g2 -pipe`，用于缩短日常编译时间并保留源级调试信息。Release
+构建继续采用 Keil 工程映射得到的优化参数，输出目录为 `build-gcc-release`。执行
+`do_build.bat release` 可增量构建 Release，执行 `do_build.bat release rebuild`
+可重新构建 Release。系统存在 `sccache` 或 `ccache` 时，生成工程会自动启用编译缓存。
 
 ## GCC 迁移检查
 
