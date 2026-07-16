@@ -15,6 +15,7 @@ import json
 import hashlib
 import queue
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -128,6 +129,21 @@ class GenerationOptions:
         if backend_raw == "jlink" and debug_probe not in {"default", "all", "jlink"}:
             raise ValueError(
                 f"Probe '{debug_probe}' is incompatible with J-Link backend."
+            )
+        if backend_raw == "pyocd" and debug_probe not in {
+            "default",
+            "all",
+            "daplink",
+            "ulink",
+        }:
+            raise ValueError(
+                f"Probe '{debug_probe}' is incompatible with PyOCD backend."
+            )
+        if backend_raw == "keil" and host_os != "windows":
+            raise ValueError("Keil backend is only available on Windows.")
+        if backend_raw == "keil" and compiler != "armclang":
+            raise ValueError(
+                "Keil backend requires the ArmClang compiler configuration."
             )
 
         generator = (self.generator or DEFAULT_GENERATOR_BY_HOST[host_os]).strip()
@@ -268,6 +284,50 @@ class BuildValidator:
         percent = 10 + round(88 * current / total)
         self._emit_progress(percent, f"编译 {current}/{total}")
 
+    @staticmethod
+    def _process_group_options() -> Dict[str, Any]:
+        if os.name == "nt":
+            return {
+                "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            }
+        return {"start_new_session": True}
+
+    @staticmethod
+    def _terminate_process_tree(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+
+        terminated = False
+        if os.name == "nt":
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+                terminated = completed.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                terminated = False
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                terminated = True
+            except OSError:
+                terminated = False
+
+        if not terminated and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+        try:
+            process.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     def _run_streaming(
         self, command: List[str], cwd: Path, phase: str
     ) -> CommandResult:
@@ -284,6 +344,7 @@ class BuildValidator:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                **self._process_group_options(),
             )
         except OSError as exc:
             return CommandResult(
@@ -322,9 +383,9 @@ class BuildValidator:
 
         completed_streams = 0
         error = ""
-        while completed_streams < len(readers):
+        while completed_streams < len(readers) or process.poll() is None:
             if time.monotonic() - started >= self.timeout_seconds:
-                process.kill()
+                self._terminate_process_tree(process)
                 error = f"Command timed out after {self.timeout_seconds} seconds"
                 break
             try:
@@ -354,7 +415,12 @@ class BuildValidator:
             else:
                 stderr_parts.append(line)
 
-        return_code = process.wait()
+        try:
+            return_code = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._terminate_process_tree(process)
+            return_code = process.poll()
+            error = error or "Command did not exit after output streams closed"
         return CommandResult(
             command=command,
             return_code=return_code,
@@ -371,31 +437,45 @@ class BuildValidator:
             return self._run_streaming(command, cwd, phase)
         started = time.monotonic()
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 cwd=cwd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=self.timeout_seconds,
-                check=False,
+                **self._process_group_options(),
             )
-            return CommandResult(
-                command=command,
-                return_code=completed.returncode,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-                duration_seconds=round(time.monotonic() - started, 3),
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except OSError as exc:
             return CommandResult(
                 command=command,
                 return_code=None,
-                stdout=getattr(exc, "stdout", "") or "",
-                stderr=getattr(exc, "stderr", "") or "",
+                stdout="",
+                stderr="",
                 duration_seconds=round(time.monotonic() - started, 3),
                 error=str(exc),
+            )
+
+        try:
+            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+            return CommandResult(
+                command=command,
+                return_code=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                duration_seconds=round(time.monotonic() - started, 3),
+            )
+        except subprocess.TimeoutExpired:
+            self._terminate_process_tree(process)
+            stdout, stderr = process.communicate()
+            return CommandResult(
+                command=command,
+                return_code=process.returncode,
+                stdout=stdout or "",
+                stderr=stderr or "",
+                duration_seconds=round(time.monotonic() - started, 3),
+                error=f"Command timed out after {self.timeout_seconds} seconds",
             )
 
     def _classify(self, phase: str, result: CommandResult) -> List[BuildDiagnostic]:
@@ -420,7 +500,10 @@ class BuildValidator:
         return diagnostics
 
     def validate(
-        self, source_dir: Path, options: GenerationOptions
+        self,
+        source_dir: Path,
+        options: GenerationOptions,
+        expected_artifacts: Optional[List[Path]] = None,
     ) -> BuildValidationReport:
         self._last_progress = -1
         self._emit_progress(0, "准备 CMake 配置")
@@ -446,6 +529,23 @@ class BuildValidator:
         diagnostics.extend(self._classify("build", build))
         status = "success" if build.succeeded else "build_failed"
         if build.succeeded:
+            missing_artifacts = [
+                artifact
+                for artifact in expected_artifacts or []
+                if not artifact.is_file()
+            ]
+            if missing_artifacts:
+                diagnostics.append(
+                    BuildDiagnostic(
+                        category="missing_artifact",
+                        phase="artifact",
+                        message="Expected build artifacts are missing: "
+                        + ", ".join(str(path) for path in missing_artifacts),
+                    )
+                )
+                return BuildValidationReport(
+                    "artifact_failed", configure, build, diagnostics
+                )
             self._emit_progress(100, "构建验证完成")
         return BuildValidationReport(status, configure, build, diagnostics)
 
@@ -4139,6 +4239,8 @@ SECTIONS
         backend = (options.debug_backend or options.debugger or "default").strip().lower()
         if backend == "jlink":
             return "jlink"
+        if backend == "pyocd":
+            return "daplink"
         return "stlink"
 
     def _probe_display_name(self, probe: str) -> str:
@@ -4180,7 +4282,7 @@ SECTIONS
             return "interface/nulink.cfg"
         return "interface/stlink.cfg"
 
-    def _default_openocd_target_script(self) -> str:
+    def _default_openocd_target_script(self) -> Optional[str]:
         clean_device = self._clean_device_name().upper()
         vendor = (self.vendor or "").upper()
 
@@ -4196,7 +4298,38 @@ SECTIONS
             return "target/stm32f4x.cfg"
         if clean_device.startswith("STM32G0"):
             return "target/stm32g0x.cfg"
-        return "target/stm32f4x.cfg"
+        if clean_device.startswith("STM32F7"):
+            return "target/stm32f7x.cfg"
+        if clean_device.startswith("STM32H7"):
+            return "target/stm32h7x.cfg"
+        if clean_device.startswith("STM32L4"):
+            return "target/stm32l4x.cfg"
+        if clean_device.startswith("NRF51"):
+            return "target/nordic/nrf51.cfg"
+        if clean_device.startswith("NRF52"):
+            return "target/nordic/nrf52.cfg"
+        if clean_device.startswith("NRF53"):
+            return "target/nordic/nrf53.cfg"
+        if clean_device.startswith("NRF54L"):
+            return "target/nordic/nrf54l.cfg"
+        if clean_device.startswith("NRF91"):
+            return "target/nordic/nrf91.cfg"
+        if clean_device.startswith("MSP432"):
+            return "target/ti_msp432.cfg"
+        return None
+
+    def _write_openocd_jlink_swd_wrapper(
+        self, output_path: Path, target_script: str
+    ) -> str:
+        wrapper = output_path / ".vscode" / "openocd-jlink-swd.cfg"
+        self._write_text_file(
+            wrapper,
+            "source [find interface/jlink.cfg]\n"
+            "transport select swd\n"
+            f"source [find {target_script}]\n",
+        )
+        relative = self._relative_workspace_path(wrapper, output_path)
+        return f"${{workspaceFolder}}/{relative}"
 
     def _resolve_openocd_config_arguments(
         self, output_path: Path, probe: str
@@ -4205,9 +4338,22 @@ SECTIONS
         probe_label = self._probe_display_name(probe)
         if openocd_cfg is not None:
             return probe_label, [self._relative_workspace_path(openocd_cfg, output_path)]
+        target_script = self._default_openocd_target_script()
+        if target_script is None:
+            warning = (
+                f"OpenOCD 目标脚本无法确定，跳过 {probe_label} 配置: "
+                f"{self.device_name or self.target_name}"
+            )
+            if warning not in self.warnings:
+                self.warnings.append(warning)
+            return probe_label, []
+        if probe == "jlink":
+            return probe_label, [
+                self._write_openocd_jlink_swd_wrapper(output_path, target_script)
+            ]
         return probe_label, [
             self._default_openocd_interface_script(probe),
-            self._default_openocd_target_script(),
+            target_script,
         ]
 
     @staticmethod
@@ -4648,20 +4794,52 @@ SECTIONS
         except (OSError, ValueError, TypeError):
             return False
 
-        labels = {
-            str(task.get("label", ""))
+        task_by_label = {
+            str(task.get("label", "")): task
             for task in tasks
             if isinstance(task, dict)
         }
-        has_generated_tasks = {
-            "Configure GCC Debug",
-            "Build GCC Debug",
-        }.issubset(labels) and any(label.startswith("Flash ") for label in labels)
-        has_generated_settings = (
-            "cmake.buildDirectory" in settings
-            and "cmake.copyCompileCommands" in settings
+        generated_task_pattern = re.compile(
+            r"^(Configure|Build|Rebuild|Clean) (GCC|ArmClang) (Debug|Release)$"
         )
-        return has_generated_tasks and has_generated_settings
+        has_only_generated_task_labels = bool(task_by_label) and all(
+            generated_task_pattern.fullmatch(label)
+            or label.startswith("Flash ")
+            or label.startswith("Start ")
+            or label in {"Debug (Keil MDK)", "Refresh Compile Commands"}
+            for label in task_by_label
+        )
+        has_generated_tasks = False
+        for compiler_label in ("GCC", "ArmClang"):
+            configure = task_by_label.get(f"Configure {compiler_label} Debug", {})
+            build = task_by_label.get(f"Build {compiler_label} Debug", {})
+            configure_args = [str(value) for value in configure.get("args", [])]
+            build_args = [str(value) for value in build.get("args", [])]
+            if (
+                configure.get("command") == "cmake"
+                and "-S" in configure_args
+                and "-B" in configure_args
+                and "-DCMAKE_BUILD_TYPE=Debug" in configure_args
+                and build.get("command") == "cmake"
+                and "--build" in build_args
+            ):
+                has_generated_tasks = True
+                break
+        build_directory = settings.get("cmake.buildDirectory")
+        compile_commands = settings.get("C_Cpp.default.compileCommands")
+        has_generated_settings = (
+            isinstance(build_directory, str)
+            and build_directory.startswith("${workspaceFolder}")
+            and settings.get("cmake.copyCompileCommands")
+            == "${workspaceFolder}/compile_commands.json"
+            and compile_commands
+            == f"{build_directory.rstrip('/')}/compile_commands.json"
+        )
+        return (
+            has_only_generated_task_labels
+            and has_generated_tasks
+            and has_generated_settings
+        )
 
     def _relative_workspace_path(self, path: Path, output_path: Path) -> str:
         return self._normalize_path(str(path.resolve(strict=False)), str(output_path))
@@ -4677,6 +4855,12 @@ SECTIONS
             f"${{workspaceFolder}}/{active_build_dir}/"
             f"{self._artifact_name()}{suffix}"
         )
+
+    def _flash_load_address(self) -> int:
+        return int(self.flash_origin if self.flash_origin is not None else 0x08000000)
+
+    def _flash_load_address_text(self) -> str:
+        return f"0x{self._flash_load_address():08X}"
 
     def _jlink_flash_device(self) -> str:
         return self._clean_device_name() or self.cpu or "Cortex-M4"
@@ -4695,13 +4879,14 @@ SECTIONS
         vsc_dir = output_path / ".vscode"
         vsc_dir.mkdir(parents=True, exist_ok=True)
 
+        flash_address = self._flash_load_address_text()
         scripts = {
             "jlink_flash_elf.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.elf\nr\ng\nq\n",
             "jlink_flash_hex.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.hex\nr\ng\nq\n",
-            "jlink_flash_bin.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.bin 0x08000000\nr\ng\nq\n",
+            "jlink_flash_bin.jlink": f"r\nloadfile {options.build_dir}/{self._artifact_name()}.bin {flash_address}\nr\ng\nq\n",
             "jlink_flash_elf_release.jlink": f"r\nloadfile {options.build_dir}-release/{self._artifact_name()}.elf\nr\ng\nq\n",
             "jlink_flash_hex_release.jlink": f"r\nloadfile {options.build_dir}-release/{self._artifact_name()}.hex\nr\ng\nq\n",
-            "jlink_flash_bin_release.jlink": f"r\nloadfile {options.build_dir}-release/{self._artifact_name()}.bin 0x08000000\nr\ng\nq\n",
+            "jlink_flash_bin_release.jlink": f"r\nloadfile {options.build_dir}-release/{self._artifact_name()}.bin {flash_address}\nr\ng\nq\n",
         }
 
         for file_name, content in scripts.items():
@@ -4716,6 +4901,7 @@ SECTIONS
         build_label = f"Build {compiler_label} Debug"
         task_env = self._vscode_env(options)
         task_options = {"env": task_env} if task_env else {}
+        flash_address = self._flash_load_address_text()
 
         configure_task: Dict[str, Any] = {
             "label": configure_label,
@@ -4881,6 +5067,8 @@ SECTIONS
                     openocd_probe_label, openocd_configs = (
                         self._resolve_openocd_config_arguments(output_path, probe)
                     )
+                    if not openocd_configs:
+                        continue
                     flash_probe_label = (
                         f"{openocd_probe_label} OpenOCD"
                         if probe == "jlink"
@@ -4920,7 +5108,7 @@ SECTIONS
                                 "args": openocd_file_args
                                 + [
                                     "-c",
-                                    f"program {{{self._artifact_path(options, '.bin')}}} 0x08000000 verify reset exit",
+                                    f"program {{{self._artifact_path(options, '.bin')}}} {flash_address} verify reset exit",
                                 ],
                                 "dependsOn": build_label,
                                 "problemMatcher": [],
@@ -4963,7 +5151,7 @@ SECTIONS
                             (
                                 f"program {{{self._artifact_path(options, f'.{suffix}', release_build_dir)}}} "
                                 + (
-                                    "0x08000000 verify reset exit"
+                                    f"{flash_address} verify reset exit"
                                     if suffix == "bin"
                                     else "verify reset exit"
                                 )
@@ -5069,6 +5257,8 @@ SECTIONS
                     openocd_probe_label, openocd_configs = (
                         self._resolve_openocd_config_arguments(output_path, probe)
                     )
+                    if not openocd_configs:
+                        continue
                     openocd_file_args = self._openocd_file_args(openocd_configs)
                     tasks.append(
                         {
@@ -5076,7 +5266,7 @@ SECTIONS
                             "type": "shell",
                             "command": commands["openocd"],
                             "args": openocd_file_args,
-                            "dependsOn": depends_on,
+                            "dependsOn": build_label,
                             "isBackground": True,
                             "presentation": {
                                 "echo": True,
@@ -5151,6 +5341,8 @@ SECTIONS
                 openocd_probe_label, openocd_configs = (
                     self._resolve_openocd_config_arguments(output_path, probe)
                 )
+                if not openocd_configs:
+                    continue
                 launch_configs.append(
                     {
                         "name": f"{jlink_device or self.target_name} / {openocd_probe_label} / OpenOCD",
@@ -5754,7 +5946,20 @@ SECTIONS
             timeout_seconds=timeout_seconds,
             progress_callback=progress_callback,
         )
-        report = validator.validate(output_path.resolve(strict=False), options)
+        artifact_suffixes = (
+            [".elf", ".hex", ".bin"] if options.compiler == "gcc" else [".axf"]
+        )
+        expected_artifacts = [
+            (
+                output_path
+                / str(options.build_dir)
+                / f"{self._artifact_name()}{suffix}"
+            ).resolve(strict=False)
+            for suffix in artifact_suffixes
+        ]
+        report = validator.validate(
+            output_path.resolve(strict=False), options, expected_artifacts
+        )
         with open(output_path / "build-validation.json", "w", encoding="utf-8") as f:
             json.dump(asdict(report), f, indent=2, ensure_ascii=False)
         return report

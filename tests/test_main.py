@@ -39,7 +39,11 @@ class MainWindowPathTests(unittest.TestCase):
         )
         self.assertRegex(
             APP_STYLE,
-            r"QSplitter::handle:hover\s*\{[^}]*background\s*:\s*#1688d0",
+            r"QSplitter::handle:horizontal:hover\s*\{[^}]*border-left\s*:\s*1px solid #1688d0",
+        )
+        self.assertRegex(
+            APP_STYLE,
+            r"QSplitter::handle\s*\{[^}]*background\s*:\s*transparent",
         )
 
     def test_default_window_uses_compact_dimensions(self):
@@ -47,6 +51,32 @@ class MainWindowPathTests(unittest.TestCase):
         self.assertEqual(MainWindow.MINIMUM_WINDOW_SIZE, (520, 440))
         self.assertTrue(MainWindow._is_compact_width(560))
         self.assertFalse(MainWindow._is_compact_width(800))
+
+    def test_collapsed_inspector_width_is_not_persisted(self):
+        self.assertEqual(MainWindow._normalized_inspector_width(0), 270)
+        self.assertEqual(MainWindow._normalized_inspector_width(120), 240)
+        self.assertEqual(MainWindow._normalized_inspector_width(300), 300)
+        self.assertEqual(MainWindow._normalized_inspector_width(900), 340)
+
+    def test_invalid_navigation_width_uses_bounded_default(self):
+        self.assertEqual(MainWindow._normalized_nav_width("invalid"), 84)
+        self.assertEqual(MainWindow._normalized_nav_width(0), 72)
+        self.assertEqual(MainWindow._normalized_nav_width(120), 120)
+        self.assertEqual(MainWindow._normalized_nav_width(900), 180)
+
+    def test_host_change_uses_default_generator(self):
+        self.assertEqual(
+            MainWindow._generator_target(
+                "linux", "", "MinGW Makefiles", host_changed=True
+            ),
+            "Ninja",
+        )
+        self.assertEqual(
+            MainWindow._generator_target(
+                "linux", "Custom Generator", "Ninja", host_changed=False
+            ),
+            "Custom Generator",
+        )
 
     def test_default_output_directory_follows_project_directory(self):
         with TemporaryDirectory() as temp_dir:

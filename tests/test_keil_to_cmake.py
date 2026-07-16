@@ -7,9 +7,16 @@ import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from keil_to_cmake import BuildValidator, GenerationOptions, KeilProjectToCMake
+from keil_to_cmake import (
+    BuildValidator,
+    CommandResult,
+    GenerationOptions,
+    KeilProjectToCMake,
+    SUPPORTED_DEBUG_BACKENDS,
+    SUPPORTED_DEBUG_PROBES,
+)
 
 
 class KeilToCMakeTests(unittest.TestCase):
@@ -219,7 +226,12 @@ class KeilToCMakeTests(unittest.TestCase):
                 parser.generate_cmake(
                     str(output_dir),
                     False,
-                    GenerationOptions(compiler="gcc", generator="Ninja"),
+                    GenerationOptions(
+                        compiler="gcc",
+                        generator="Ninja",
+                        debug_probe="all",
+                        debug_backend="all",
+                    ),
                 )
             )
 
@@ -378,6 +390,203 @@ class KeilToCMakeTests(unittest.TestCase):
             self.assertIn('set "ACTIVE_BUILD_DIR=build-gcc-release"', build_script)
             self.assertIn("--clean-first", build_script)
 
+    def test_bin_flash_tasks_use_project_flash_origin(self):
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            parser = KeilProjectToCMake(str(output_dir / "sample.uvprojx"))
+            parser.target_name = "sample"
+            parser.device_name = "nRF52840_xxAA"
+            parser.cpu = "Cortex-M4"
+            parser.flash_origin = 0
+            parser._guess_openocd_config = lambda _token: None
+
+            openocd_options = GenerationOptions(
+                compiler="gcc",
+                debug_probe="stlink",
+                debug_backend="openocd",
+            ).normalized()
+            tasks = parser._build_vscode_tasks(output_dir, openocd_options)[
+                "tasks"
+            ]
+            bin_task = next(
+                task for task in tasks if task["label"] == "Flash ST-Link BIN"
+            )
+            self.assertIn("0x00000000", bin_task["args"][-1])
+
+            jlink_options = GenerationOptions(
+                compiler="gcc",
+                debug_probe="jlink",
+                debug_backend="jlink",
+            ).normalized()
+            parser._write_jlink_scripts(output_dir, jlink_options)
+            debug_script = (
+                output_dir / ".vscode" / "jlink_flash_bin.jlink"
+            ).read_text(encoding="utf-8")
+            release_script = (
+                output_dir / ".vscode" / "jlink_flash_bin_release.jlink"
+            ).read_text(encoding="utf-8")
+            self.assertIn("0x00000000", debug_script)
+            self.assertIn("0x00000000", release_script)
+
+            parser.flash_origin = None
+            self.assertEqual(parser._flash_load_address_text(), "0x08000000")
+
+    def test_vscode_debug_option_matrix_has_valid_task_references(self):
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            parser = KeilProjectToCMake(str(output_dir / "sample.uvprojx"))
+            parser.target_name = "sample"
+            parser.device_name = "STM32F407VGTx"
+            parser.cpu = "Cortex-M4"
+            parser.uv4_path = str(output_dir / "Keil")
+            parser._guess_openocd_config = lambda _token: None
+
+            checked = 0
+            for compiler in ("gcc", "armclang"):
+                for probe in SUPPORTED_DEBUG_PROBES:
+                    for backend in SUPPORTED_DEBUG_BACKENDS:
+                        try:
+                            options = GenerationOptions(
+                                compiler=compiler,
+                                debug_probe=probe,
+                                debug_backend=backend,
+                            ).normalized()
+                        except ValueError:
+                            continue
+
+                        task_data = parser._build_vscode_tasks(
+                            output_dir, options
+                        )
+                        tasks = task_data["tasks"]
+                        labels = [task["label"] for task in tasks]
+                        self.assertEqual(len(labels), len(set(labels)))
+                        label_set = set(labels)
+                        for task in tasks:
+                            depends_on = task.get("dependsOn")
+                            if isinstance(depends_on, str):
+                                self.assertIn(depends_on, label_set)
+
+                        launch_data = parser._build_vscode_launch(
+                            output_dir, options
+                        )
+                        for configuration in launch_data["configurations"]:
+                            self.assertIn(
+                                configuration["preLaunchTask"], label_set
+                            )
+                        checked += 1
+
+            self.assertEqual(checked, 77)
+
+    def test_debug_backend_probe_compatibility_is_validated(self):
+        pyocd_options = GenerationOptions(
+            compiler="gcc",
+            debug_probe="default",
+            debug_backend="pyocd",
+        ).normalized()
+        parser = KeilProjectToCMake("sample.uvprojx")
+        self.assertEqual(parser._selected_probes(pyocd_options), ["daplink"])
+
+        for probe in ("stlink", "jlink", "nulink"):
+            with self.subTest(probe=probe):
+                with self.assertRaises(ValueError):
+                    GenerationOptions(
+                        compiler="gcc",
+                        debug_probe=probe,
+                        debug_backend="pyocd",
+                    ).normalized()
+
+        with self.assertRaises(ValueError):
+            GenerationOptions(
+                compiler="gcc",
+                host_os="linux",
+                debug_backend="keil",
+            ).normalized()
+
+        with self.assertRaises(ValueError):
+            GenerationOptions(
+                compiler="gcc",
+                host_os="windows",
+                debug_backend="keil",
+            ).normalized()
+
+        self.assertEqual(
+            GenerationOptions(
+                compiler="armclang",
+                host_os="windows",
+                debug_backend="keil",
+            ).normalized().debug_backend,
+            "keil",
+        )
+
+    def test_openocd_target_is_specific_or_omitted(self):
+        parser = KeilProjectToCMake("sample.uvprojx")
+        parser.device_name = "nRF52840_xxAA"
+        parser.vendor = "Nordic Semiconductor"
+        self.assertEqual(
+            parser._default_openocd_target_script(),
+            "target/nordic/nrf52.cfg",
+        )
+
+        parser.device_name = "N32WB031"
+        parser.vendor = "Nationstech"
+        parser.target_name = "sample"
+        parser.cpu = "Cortex-M0"
+        parser._guess_openocd_config = lambda _token: None
+        options = GenerationOptions(
+            compiler="gcc",
+            debug_probe="all",
+            debug_backend="all",
+        ).normalized()
+        tasks = parser._build_vscode_tasks(Path.cwd(), options)["tasks"]
+        labels = {task["label"] for task in tasks}
+        self.assertFalse(any("OpenOCD" in label for label in labels))
+        self.assertIn("Flash J-Link BIN", labels)
+        self.assertTrue(
+            any("OpenOCD 目标脚本无法确定" in warning for warning in parser.warnings)
+        )
+
+    def test_openocd_device_family_mapping_is_specific(self):
+        parser = KeilProjectToCMake("sample.uvprojx")
+        parser.vendor = "Nordic Semiconductor"
+        parser.device_name = "nRF5340_xxAA"
+        self.assertEqual(
+            parser._default_openocd_target_script(),
+            "target/nordic/nrf53.cfg",
+        )
+
+        parser.vendor = "Texas Instruments"
+        parser.device_name = "CC1352R1F3"
+        self.assertIsNone(parser._default_openocd_target_script())
+
+    def test_openocd_jlink_wrapper_selects_swd_before_target(self):
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            parser = KeilProjectToCMake(str(output_dir / "sample.uvprojx"))
+            parser.device_name = "nRF52840_xxAA"
+            parser.vendor = "Nordic Semiconductor"
+            parser._guess_openocd_config = lambda _token: None
+
+            label, configs = parser._resolve_openocd_config_arguments(
+                output_dir, "jlink"
+            )
+
+            self.assertEqual(label, "J-Link")
+            self.assertEqual(
+                configs,
+                ["${workspaceFolder}/.vscode/openocd-jlink-swd.cfg"],
+            )
+            wrapper = (
+                output_dir / ".vscode" / "openocd-jlink-swd.cfg"
+            ).read_text(encoding="utf-8")
+            self.assertEqual(
+                wrapper.splitlines(),
+                [
+                    "source [find interface/jlink.cfg]",
+                    "transport select swd",
+                    "source [find target/nordic/nrf52.cfg]",
+                ],
+            )
+
     def test_vscode_configuration_is_mirrored_to_project_root(self):
         with TemporaryDirectory() as temp_dir, patch(
             "keil_to_cmake.find_keil_mdk_root", return_value=None
@@ -406,7 +615,12 @@ class KeilToCMakeTests(unittest.TestCase):
                 parser.generate_cmake(
                     str(output_dir),
                     True,
-                    GenerationOptions(compiler="gcc", generator="Ninja"),
+                    GenerationOptions(
+                        compiler="gcc",
+                        generator="Ninja",
+                        debug_probe="all",
+                        debug_backend="all",
+                    ),
                 )
             )
 
@@ -417,6 +631,9 @@ class KeilToCMakeTests(unittest.TestCase):
             tasks = json.loads(
                 (root_vscode / "tasks.json").read_text(encoding="utf-8")
             )["tasks"]
+            launch = json.loads(
+                (root_vscode / "launch.json").read_text(encoding="utf-8")
+            )["configurations"]
             self.assertEqual(
                 settings["cmake.sourceDirectory"],
                 "${workspaceFolder}/MDK-ARM/cmake-generated",
@@ -444,6 +661,22 @@ class KeilToCMakeTests(unittest.TestCase):
                 (root / "compile_commands.json").read_text(encoding="utf-8"),
                 (build_dir / "compile_commands.json").read_text(encoding="utf-8"),
             )
+            jlink_openocd = next(
+                configuration
+                for configuration in launch
+                if configuration.get("servertype") == "openocd"
+                and "J-Link" in configuration["name"]
+            )
+            self.assertEqual(
+                jlink_openocd["configFiles"],
+                [
+                    "${workspaceFolder}/MDK-ARM/cmake-generated/"
+                    ".vscode/openocd-jlink-swd.cfg"
+                ],
+            )
+            self.assertTrue(
+                (output_dir / ".vscode" / "openocd-jlink-swd.cfg").is_file()
+            )
 
     def test_legacy_generated_root_vscode_tasks_are_upgraded(self):
         with TemporaryDirectory() as temp_dir, patch(
@@ -467,6 +700,9 @@ class KeilToCMakeTests(unittest.TestCase):
                         "cmake.copyCompileCommands": (
                             "${workspaceFolder}/compile_commands.json"
                         ),
+                        "C_Cpp.default.compileCommands": (
+                            "${workspaceFolder}/build-gcc/compile_commands.json"
+                        ),
                     }
                 ),
                 encoding="utf-8",
@@ -476,8 +712,22 @@ class KeilToCMakeTests(unittest.TestCase):
                     {
                         "version": "2.0.0",
                         "tasks": [
-                            {"label": "Configure GCC Debug"},
-                            {"label": "Build GCC Debug"},
+                            {
+                                "label": "Configure GCC Debug",
+                                "command": "cmake",
+                                "args": [
+                                    "-S",
+                                    "${workspaceFolder}",
+                                    "-B",
+                                    "${workspaceFolder}/build-gcc",
+                                    "-DCMAKE_BUILD_TYPE=Debug",
+                                ],
+                            },
+                            {
+                                "label": "Build GCC Debug",
+                                "command": "cmake",
+                                "args": ["--build", "build-gcc"],
+                            },
                             {"label": "Flash ST-Link BIN"},
                         ],
                     }
@@ -515,6 +765,108 @@ class KeilToCMakeTests(unittest.TestCase):
             self.assertIn("Flash J-Link BIN", labels)
             self.assertTrue(
                 (root_vscode / "keilforge-workspace.json").is_file()
+            )
+
+    def test_legacy_armclang_vscode_without_flash_tasks_is_detected(self):
+        with TemporaryDirectory() as temp_dir:
+            vscode_dir = Path(temp_dir)
+            (vscode_dir / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "cmake.buildDirectory": "${workspaceFolder}/build",
+                        "cmake.copyCompileCommands": (
+                            "${workspaceFolder}/compile_commands.json"
+                        ),
+                        "C_Cpp.default.compileCommands": (
+                            "${workspaceFolder}/build/compile_commands.json"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (vscode_dir / "tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "label": "Configure ArmClang Debug",
+                                "command": "cmake",
+                                "args": [
+                                    "-S",
+                                    "${workspaceFolder}",
+                                    "-B",
+                                    "${workspaceFolder}/build",
+                                    "-DCMAKE_BUILD_TYPE=Debug",
+                                ],
+                            },
+                            {
+                                "label": "Build ArmClang Debug",
+                                "command": "cmake",
+                                "args": ["--build", "build"],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                KeilProjectToCMake._is_legacy_generated_vscode_configuration(
+                    vscode_dir
+                )
+            )
+
+    def test_user_vscode_tasks_are_not_treated_as_legacy_generated_files(self):
+        with TemporaryDirectory() as temp_dir:
+            vscode_dir = Path(temp_dir)
+            (vscode_dir / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "cmake.buildDirectory": "${workspaceFolder}/build",
+                        "cmake.copyCompileCommands": (
+                            "${workspaceFolder}/compile_commands.json"
+                        ),
+                        "C_Cpp.default.compileCommands": (
+                            "${workspaceFolder}/build/compile_commands.json"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (vscode_dir / "tasks.json").write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "label": "Configure ArmClang Debug",
+                                "command": "cmake",
+                                "args": [
+                                    "-S",
+                                    "${workspaceFolder}",
+                                    "-B",
+                                    "${workspaceFolder}/build",
+                                    "-DCMAKE_BUILD_TYPE=Debug",
+                                ],
+                            },
+                            {
+                                "label": "Build ArmClang Debug",
+                                "command": "cmake",
+                                "args": ["--build", "build"],
+                            },
+                            {
+                                "label": "User Packaging Task",
+                                "command": "custom-packager",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(
+                KeilProjectToCMake._is_legacy_generated_vscode_configuration(
+                    vscode_dir
+                )
             )
 
     def test_jlink_flash_prefers_keil_device_over_cpu_core(self):
@@ -1226,18 +1578,16 @@ class KeilToCMakeTests(unittest.TestCase):
 
     def test_build_validator_classifies_configure_failure(self):
         validator = BuildValidator(timeout_seconds=10)
-        completed = type(
-            "Completed",
-            (),
-            {
-                "returncode": 1,
-                "stdout": "",
-                "stderr": "CMake Error: arm-none-eabi-gcc was not found",
-            },
-        )()
+        completed = CommandResult(
+            command=["cmake"],
+            return_code=1,
+            stdout="",
+            stderr="CMake Error: arm-none-eabi-gcc was not found",
+            duration_seconds=0.1,
+        )
 
-        with TemporaryDirectory() as temp_dir, patch(
-            "keil_to_cmake.subprocess.run", return_value=completed
+        with TemporaryDirectory() as temp_dir, patch.object(
+            validator, "_run", return_value=completed
         ):
             report = validator.validate(
                 Path(temp_dir),
@@ -1252,23 +1602,23 @@ class KeilToCMakeTests(unittest.TestCase):
 
     def test_build_validator_classifies_link_failure(self):
         validator = BuildValidator(timeout_seconds=10)
-        configure = type(
-            "Completed",
-            (),
-            {"returncode": 0, "stdout": "configured", "stderr": ""},
-        )()
-        build = type(
-            "Completed",
-            (),
-            {
-                "returncode": 1,
-                "stdout": "",
-                "stderr": "ld: undefined reference to `_sidata'",
-            },
-        )()
+        configure = CommandResult(
+            command=["cmake"],
+            return_code=0,
+            stdout="configured",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        build = CommandResult(
+            command=["cmake", "--build"],
+            return_code=1,
+            stdout="",
+            stderr="ld: undefined reference to `_sidata'",
+            duration_seconds=0.1,
+        )
 
-        with TemporaryDirectory() as temp_dir, patch(
-            "keil_to_cmake.subprocess.run", side_effect=[configure, build]
+        with TemporaryDirectory() as temp_dir, patch.object(
+            validator, "_run", side_effect=[configure, build]
         ):
             report = validator.validate(
                 Path(temp_dir),
@@ -1279,6 +1629,71 @@ class KeilToCMakeTests(unittest.TestCase):
         self.assertIn(
             "undefined_symbol",
             [diagnostic.category for diagnostic in report.diagnostics],
+        )
+
+    def test_build_validator_rejects_missing_artifacts(self):
+        validator = BuildValidator(timeout_seconds=10)
+        configure = CommandResult(
+            command=["cmake"],
+            return_code=0,
+            stdout="configured",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        build = CommandResult(
+            command=["cmake", "--build"],
+            return_code=0,
+            stdout="built",
+            stderr="",
+            duration_seconds=0.1,
+        )
+
+        with TemporaryDirectory() as temp_dir, patch.object(
+            validator, "_run", side_effect=[configure, build]
+        ):
+            missing = Path(temp_dir) / "build-gcc" / "firmware.elf"
+            report = validator.validate(
+                Path(temp_dir),
+                GenerationOptions(compiler="gcc", generator="Ninja").normalized(),
+                [missing],
+            )
+
+        self.assertEqual(report.status, "artifact_failed")
+        self.assertIn(
+            "missing_artifact",
+            [diagnostic.category for diagnostic in report.diagnostics],
+        )
+
+    def test_build_validator_timeout_terminates_process_group(self):
+        validator = BuildValidator(timeout_seconds=0.1)
+
+        with TemporaryDirectory() as temp_dir, patch.object(
+            validator,
+            "_terminate_process_tree",
+            wraps=validator._terminate_process_tree,
+        ) as terminate:
+            result = validator._run(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                Path(temp_dir),
+                "build",
+            )
+
+        self.assertIn("timed out", result.error)
+        terminate.assert_called_once()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows taskkill test")
+    def test_windows_process_tree_termination_uses_recursive_taskkill(self):
+        process = Mock()
+        process.pid = 1234
+        process.poll.return_value = None
+        completed = Mock(returncode=0)
+
+        with patch("keil_to_cmake.subprocess.run", return_value=completed) as run:
+            BuildValidator._terminate_process_tree(process)
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["taskkill", "/PID", "1234", "/T", "/F"],
         )
 
     def test_build_validator_parses_ninja_and_make_progress(self):

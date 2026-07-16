@@ -220,10 +220,19 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: transparent;
 }
 QStackedWidget { background: #edf2f7; }
-QSplitter::handle { background: #d6e2eb; border-radius: 2px; }
-QSplitter::handle:hover { background: #1688d0; }
-QSplitter::handle:horizontal { width: 6px; margin: 4px 1px; }
-QSplitter::handle:vertical { height: 6px; margin: 1px 4px; }
+QSplitter::handle { background: transparent; }
+QSplitter::handle:horizontal {
+    width: 6px; border-left: 1px solid #c5d2dd;
+}
+QSplitter::handle:horizontal:hover {
+    border-left: 1px solid #1688d0;
+}
+QSplitter::handle:vertical {
+    height: 6px; border-top: 1px solid #c5d2dd;
+}
+QSplitter::handle:vertical:hover {
+    border-top: 1px solid #1688d0;
+}
 """
 
 
@@ -507,6 +516,12 @@ class MainWindow(QMainWindow):
     DEFAULT_WINDOW_SIZE = (929, 480)
     MINIMUM_WINDOW_SIZE = (520, 440)
     COMPACT_LAYOUT_WIDTH = 800
+    DEFAULT_NAV_WIDTH = 84
+    MINIMUM_NAV_WIDTH = 72
+    MAXIMUM_NAV_WIDTH = 180
+    DEFAULT_INSPECTOR_WIDTH = 270
+    MINIMUM_INSPECTOR_WIDTH = 240
+    MAXIMUM_INSPECTOR_WIDTH = 340
 
     def __init__(self):
         super().__init__()
@@ -937,9 +952,11 @@ class MainWindow(QMainWindow):
         self.debug_open_output_button.clicked.connect(self._open_output)
         self.debug_open_vscode_button.clicked.connect(self._open_vscode)
         self.host_combo.currentIndexChanged.connect(self._update_generators)
+        self.host_combo.currentIndexChanged.connect(self._sync_backends)
         self.probe_combo.currentIndexChanged.connect(self._sync_backends)
         self.project_edit.textChanged.connect(self._project_path_changed)
         self.compiler_combo.currentIndexChanged.connect(self._refresh_inspector)
+        self.compiler_combo.currentIndexChanged.connect(self._sync_backends)
         self.target_edit.textChanged.connect(self._refresh_inspector)
         self.probe_combo.currentIndexChanged.connect(self._refresh_inspector)
 
@@ -952,13 +969,39 @@ class MainWindow(QMainWindow):
     def _is_compact_width(cls, width):
         return int(width) < cls.COMPACT_LAYOUT_WIDTH
 
+    @classmethod
+    def _normalized_inspector_width(cls, width):
+        try:
+            width = int(width)
+        except (TypeError, ValueError):
+            return cls.DEFAULT_INSPECTOR_WIDTH
+        if width <= 0:
+            return cls.DEFAULT_INSPECTOR_WIDTH
+        return max(
+            cls.MINIMUM_INSPECTOR_WIDTH,
+            min(cls.MAXIMUM_INSPECTOR_WIDTH, width),
+        )
+
+    @classmethod
+    def _normalized_nav_width(cls, width):
+        try:
+            width = int(width)
+        except (TypeError, ValueError):
+            return cls.DEFAULT_NAV_WIDTH
+        return max(cls.MINIMUM_NAV_WIDTH, min(cls.MAXIMUM_NAV_WIDTH, width))
+
     def _update_compact_layout(self):
         if not hasattr(self, "inspector_scroll"):
             return
         compact = self._is_compact_width(self.width())
         self.inspector_scroll.setVisible(not compact)
         if compact:
-            self.nav_splitter.setSizes([84, max(1, self.width() - 84)])
+            self.nav_splitter.setSizes(
+                [
+                    self.DEFAULT_NAV_WIDTH,
+                    max(1, self.width() - self.DEFAULT_NAV_WIDTH),
+                ]
+            )
         self._update_nav_labels()
 
     def _show_page(self, index):
@@ -1015,16 +1058,23 @@ class MainWindow(QMainWindow):
         if index >= 0:
             combo.setCurrentIndex(index)
 
+    @staticmethod
+    def _generator_target(host, preferred, current, host_changed):
+        if host_changed:
+            return DEFAULT_GENERATOR_BY_HOST.get(host, "Ninja")
+        return preferred or current or DEFAULT_GENERATOR_BY_HOST.get(host, "Ninja")
+
     def _update_generators(self, preferred=""):
-        if not isinstance(preferred, str):
+        host_changed = not isinstance(preferred, str)
+        current = self.generator_combo.currentText().strip()
+        if host_changed:
             preferred = ""
-        preferred = preferred or self.generator_combo.currentText().strip()
         host = self.host_combo.currentData() or "windows"
         values = get_supported_generators(host)
         self.generator_combo.blockSignals(True)
         self.generator_combo.clear()
         self.generator_combo.addItems(values)
-        target = preferred or DEFAULT_GENERATOR_BY_HOST.get(host, "Ninja")
+        target = self._generator_target(host, preferred, current, host_changed)
         index = self.generator_combo.findText(target)
         if index >= 0:
             self.generator_combo.setCurrentIndex(index)
@@ -1034,11 +1084,17 @@ class MainWindow(QMainWindow):
 
     def _sync_backends(self):
         probe = self.probe_combo.currentData() or "default"
+        host = self.host_combo.currentData() or "windows"
+        compiler = self.compiler_combo.currentData() or "gcc"
         current = self.backend_combo.currentData() or "default"
         self.backend_combo.blockSignals(True)
         self.backend_combo.clear()
         for key, label in SUPPORTED_DEBUG_BACKENDS.items():
             if probe not in {"default", "all", "jlink"} and key == "jlink":
+                continue
+            if probe not in {"default", "all", "daplink", "ulink"} and key == "pyocd":
+                continue
+            if (host != "windows" or compiler != "armclang") and key == "keil":
                 continue
             self.backend_combo.addItem(label, key)
         self._set_combo(self.backend_combo, current)
@@ -1364,10 +1420,14 @@ class MainWindow(QMainWindow):
             str(settings.value("validate_build", "true")).lower()
             in {"1", "true", "yes"}
         )
-        nav_width = int(settings.value("nav_width", 84))
-        inspector_width = int(settings.value("inspector_width", 270))
+        nav_width = self._normalized_nav_width(
+            settings.value("nav_width", self.DEFAULT_NAV_WIDTH)
+        )
+        inspector_width = self._normalized_inspector_width(
+            settings.value("inspector_width", self.DEFAULT_INSPECTOR_WIDTH)
+        )
         if self._is_compact_width(self.width()):
-            nav_width = min(nav_width, 84)
+            nav_width = min(nav_width, self.DEFAULT_NAV_WIDTH)
         self.nav_splitter.setSizes([nav_width, max(1, self.width() - nav_width)])
         self.workspace_splitter.setSizes(
             [max(1, self.width() - nav_width - inspector_width), inspector_width]
@@ -1410,8 +1470,12 @@ class MainWindow(QMainWindow):
             "debug_backend": self.backend_combo.currentData(),
             "export_vsc_settings": "true" if self.vscode_check.isChecked() else "false",
             "validate_build": "true" if self.validate_check.isChecked() else "false",
-            "nav_width": self.nav_splitter.sizes()[0],
-            "inspector_width": self.workspace_splitter.sizes()[1],
+            "nav_width": self._normalized_nav_width(
+                self.nav_splitter.sizes()[0]
+            ),
+            "inspector_width": self._normalized_inspector_width(
+                self.workspace_splitter.sizes()[1]
+            ),
         }
         for key, value in values.items():
             settings.setValue(key, value)
