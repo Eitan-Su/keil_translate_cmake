@@ -1,5 +1,7 @@
 import io
 import json
+import shutil
+import subprocess
 import sys
 import textwrap
 import unittest
@@ -162,7 +164,14 @@ class KeilToCMakeTests(unittest.TestCase):
             cmake_text = (output_dir / "CMakeLists.txt").read_text(encoding="utf-8")
             normalized_cmake_text = cmake_text.replace("\\", "/")
             self.assertIn("set(CMAKE_OBJECT_PATH_MAX 140)", cmake_text)
-            self.assertIn("../Src/main.c", normalized_cmake_text)
+            self.assertIn(
+                '"${CMAKE_CURRENT_LIST_DIR}/../Src/main.c"',
+                normalized_cmake_text,
+            )
+            self.assertIn(
+                '"${CMAKE_CURRENT_LIST_DIR}/../Inc"',
+                normalized_cmake_text,
+            )
             self.assertNotIn(
                 '"${CMAKE_CURRENT_LIST_DIR}/../Src"', normalized_cmake_text
             )
@@ -205,6 +214,611 @@ class KeilToCMakeTests(unittest.TestCase):
             self.assertIn("TargetName=Missing", parser.last_error)
             self.assertIn("First", parser.last_error)
             self.assertIn("Second", parser.last_error)
+
+    def test_parse_is_idempotent(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+
+            with patch("keil_to_cmake.find_keil_mdk_root", return_value=None), patch(
+                "keil_to_cmake.get_keil_mdk_info", return_value=None
+            ):
+                parser = KeilProjectToCMake(
+                    str(uvprojx),
+                    str(root / "missing_mdk"),
+                    target_name="Second",
+                )
+
+            self.assertTrue(parser.parse(), parser.last_error)
+            first_state = (
+                list(parser.source_files),
+                list(parser.header_files),
+                list(parser.include_path_order),
+                set(parser.defines),
+                list(parser.cpu_flags),
+                list(parser.c_cpp_flags),
+                list(parser.c_flags),
+                list(parser.cpp_flags),
+                list(parser.asm_flags),
+                list(parser.linker_flags),
+                list(parser.linker_inputs),
+                list(parser.libraries),
+            )
+
+            self.assertTrue(parser.parse(), parser.last_error)
+            second_state = (
+                list(parser.source_files),
+                list(parser.header_files),
+                list(parser.include_path_order),
+                set(parser.defines),
+                list(parser.cpu_flags),
+                list(parser.c_cpp_flags),
+                list(parser.c_flags),
+                list(parser.cpp_flags),
+                list(parser.asm_flags),
+                list(parser.linker_flags),
+                list(parser.linker_inputs),
+                list(parser.libraries),
+            )
+            self.assertEqual(second_state, first_state)
+
+    def test_file_type_object_is_included_in_generated_sources(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            object_file = root / "Src" / "algorithm.o"
+            object_file.write_bytes(b"prebuilt object fixture")
+            tree = ET.parse(uvprojx)
+            files = tree.getroot().find(".//Target[TargetName='Second']//Files")
+            self.assertIsNotNone(files)
+            file_node = ET.SubElement(files, "File")
+            ET.SubElement(file_node, "FileName").text = object_file.name
+            ET.SubElement(file_node, "FileType").text = "3"
+            ET.SubElement(file_node, "FilePath").text = "..\\..\\Src\\algorithm.o"
+            tree.write(uvprojx, encoding="utf-8", xml_declaration=True)
+
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            self.assertIn(str(object_file), parser.source_files)
+            output = root / "out"
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(output),
+                    False,
+                    GenerationOptions(compiler="gcc", generator="Ninja"),
+                ),
+                parser.last_error,
+            )
+
+            cmake_text = (output / "CMakeLists.txt").read_text(encoding="utf-8")
+            self.assertIn("../Src/algorithm.o", cmake_text.replace("\\", "/"))
+
+    def test_group_and_file_controls_remain_source_scoped(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            (root / "Src" / "other.c").write_text(
+                "int other(void) { return 0; }\n", encoding="utf-8"
+            )
+            group_include = root / "Group Include"
+            file_include = root / "File Include"
+            group_include.mkdir()
+            file_include.mkdir()
+
+            tree = ET.parse(uvprojx)
+            target = tree.getroot().find(".//Target[TargetName='Second']")
+            self.assertIsNotNone(target)
+            controls = target.find(".//TargetOption//Cads/VariousControls")
+            self.assertIsNotNone(controls)
+            controls.find("Define").text = (
+                "GLOBAL=1,TARGET_REMOVE=1,TARGET_GLOBAL_UNDEF=1"
+            )
+            ET.SubElement(controls, "Undefine").text = "TARGET_GLOBAL_UNDEF"
+
+            group = target.find(".//Groups/Group")
+            self.assertIsNotNone(group)
+            group_option = ET.SubElement(group, "GroupOption")
+            group_ads = ET.SubElement(group_option, "GroupArmAds")
+            group_cads = ET.SubElement(group_ads, "Cads")
+            group_controls = ET.SubElement(group_cads, "VariousControls")
+            ET.SubElement(group_controls, "Define").text = "GROUP_ONLY=1"
+            ET.SubElement(group_controls, "IncludePath").text = (
+                "..\\..\\Group Include"
+            )
+
+            main_file = group.find(".//File[FileName='main.c']")
+            self.assertIsNotNone(main_file)
+            file_option = ET.SubElement(main_file, "FileOption")
+            file_ads = ET.SubElement(file_option, "FileArmAds")
+            file_cads = ET.SubElement(file_ads, "Cads")
+            file_controls = ET.SubElement(file_cads, "VariousControls")
+            ET.SubElement(file_controls, "Define").text = (
+                "FILE_ONLY=1,FUNC(x)=((x)+1)"
+            )
+            ET.SubElement(file_controls, "Undefine").text = "TARGET_REMOVE"
+            ET.SubElement(file_controls, "IncludePath").text = (
+                "..\\..\\File Include"
+            )
+
+            groups = target.find(".//Groups")
+            other_group = ET.SubElement(groups, "Group")
+            ET.SubElement(other_group, "GroupName").text = "Other"
+            other_files = ET.SubElement(other_group, "Files")
+            other_file = ET.SubElement(other_files, "File")
+            ET.SubElement(other_file, "FileName").text = "other.c"
+            ET.SubElement(other_file, "FileType").text = "1"
+            ET.SubElement(other_file, "FilePath").text = "..\\..\\Src\\other.c"
+            tree.write(uvprojx, encoding="utf-8", xml_declaration=True)
+
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+
+            self.assertIn("GLOBAL=1", parser.defines)
+            self.assertIn("TARGET_REMOVE=1", parser.defines)
+            self.assertNotIn("GROUP_ONLY=1", parser.defines)
+            self.assertNotIn("FILE_ONLY=1", parser.defines)
+            self.assertNotIn(
+                "TARGET_GLOBAL_UNDEF=1", parser._effective_defines("gcc")
+            )
+            main_path = str((root / "Src" / "main.c").resolve(strict=False))
+            other_path = str((root / "Src" / "other.c").resolve(strict=False))
+            main_settings = parser._source_compile_settings_for(main_path)
+            other_settings = parser._source_compile_settings_for(other_path)
+            self.assertEqual(
+                main_settings.macro_actions,
+                {
+                    "GROUP_ONLY": "GROUP_ONLY=1",
+                    "FILE_ONLY": "FILE_ONLY=1",
+                    "FUNC": "FUNC(x)=((x)+1)",
+                    "TARGET_REMOVE": None,
+                },
+            )
+            self.assertEqual(
+                main_settings.include_paths,
+                [str(group_include), str(file_include)],
+            )
+            self.assertFalse(other_settings.macro_actions)
+            self.assertFalse(other_settings.include_paths)
+
+            for compiler in ("gcc", "armclang"):
+                with self.subTest(compiler=compiler):
+                    output = root / f"source-settings-{compiler}"
+                    self.assertTrue(
+                        parser.generate_cmake(
+                            str(output),
+                            False,
+                            GenerationOptions(
+                                compiler=compiler, generator="Ninja"
+                            ),
+                        ),
+                        parser.last_error,
+                    )
+                    cmake_text = (output / "CMakeLists.txt").read_text(
+                        encoding="utf-8"
+                    )
+                    if compiler == "gcc":
+                        source_marker = (
+                            'set_property(SOURCE '
+                            '"${CMAKE_CURRENT_LIST_DIR}/../Src/main.c" '
+                            'APPEND PROPERTY\n'
+                        )
+                        group_include_option = (
+                            '    "-I${CMAKE_CURRENT_LIST_DIR}/../Group Include"\n'
+                        )
+                        file_include_option = (
+                            '    "-I${CMAKE_CURRENT_LIST_DIR}/../File Include"\n'
+                        )
+                    else:
+                        source_marker = (
+                            'set_property(SOURCE "../Src/main.c" '
+                            'APPEND PROPERTY\n'
+                        )
+                        group_include_option = (
+                            f'    "-I{group_include.resolve().as_posix()}"\n'
+                        )
+                        file_include_option = (
+                            f'    "-I{file_include.resolve().as_posix()}"\n'
+                        )
+                    self.assertEqual(cmake_text.count(source_marker), 1)
+                    self.assertIn(
+                        source_marker
+                        + '    COMPILE_OPTIONS\n'
+                        + '    "-UGROUP_ONLY"\n'
+                        + '    "-DGROUP_ONLY=1"\n'
+                        + '    "-UTARGET_REMOVE"\n'
+                        + '    "-UFILE_ONLY"\n'
+                        + '    "-DFILE_ONLY=1"\n'
+                        + '    "-UFUNC"\n'
+                        + '    "-DFUNC(x)=((x)+1)"\n'
+                        + group_include_option
+                        + file_include_option
+                        + ')\n',
+                        cmake_text,
+                    )
+                    self.assertIn('"-UTARGET_GLOBAL_UNDEF"', cmake_text)
+                    self.assertNotIn('"TARGET_GLOBAL_UNDEF=1"', cmake_text)
+                    self.assertNotIn(
+                        'set_property(SOURCE "../Src/other.c"', cmake_text
+                    )
+
+    def test_dot_include_paths_resolve_to_project_directory(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            tree = ET.parse(uvprojx)
+            include = tree.getroot().find(
+                ".//Target[TargetName='Second']//Cads/VariousControls/IncludePath"
+            )
+            self.assertIsNotNone(include)
+            include.text = ".;..\\..\\Inc"
+            tree.write(uvprojx, encoding="utf-8", xml_declaration=True)
+
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            project_dir = str(uvprojx.parent.resolve(strict=False))
+            self.assertEqual(parser.include_path_order[0], project_dir)
+
+            group = ET.fromstring(
+                "<Group><GroupOption><GroupArmAds><Cads><VariousControls>"
+                "<IncludePath>.</IncludePath>"
+                "</VariousControls></Cads></GroupArmAds></GroupOption></Group>"
+            )
+            local_settings = parser._parse_local_controls(
+                group, ".//GroupOption"
+            )
+            self.assertEqual(local_settings.include_paths, [project_dir])
+
+    def test_linker_misc_objects_are_emitted_for_both_compilers(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            linker_object = root / "Object Inputs" / "algorithm.o"
+            linker_object.parent.mkdir()
+            linker_object.write_bytes(b"ordinary object fixture")
+            symbol_file = root / "Object Inputs" / "symbols.o"
+            symbol_file.write_text(
+                "#<SYMDEFS>#\n0x08000100 T exported_symbol\n",
+                encoding="utf-8",
+            )
+            tree = ET.parse(uvprojx)
+            linker = tree.getroot().find(
+                ".//Target[TargetName='Second']//LDads"
+            )
+            self.assertIsNotNone(linker)
+            misc = ET.SubElement(linker, "Misc")
+            misc.text = (
+                '"..\\..\\Object Inputs\\algorithm.o" '
+                '"..\\..\\Object Inputs\\symbols.o"'
+            )
+            tree.write(uvprojx, encoding="utf-8", xml_declaration=True)
+
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            expected = str(linker_object.resolve(strict=False))
+            expected_symbols = str(symbol_file.resolve(strict=False))
+            self.assertEqual(parser.linker_inputs, [expected, expected_symbols])
+
+            for compiler in ("gcc", "armclang"):
+                with self.subTest(compiler=compiler):
+                    output = root / f"generated-{compiler}"
+                    self.assertTrue(
+                        parser.generate_cmake(
+                            str(output),
+                            False,
+                            GenerationOptions(
+                                compiler=compiler, generator="Ninja"
+                            ),
+                        ),
+                        parser.last_error,
+                    )
+                    cmake_text = (output / "CMakeLists.txt").read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertIn(
+                        "../Object Inputs/algorithm.o",
+                        cmake_text.replace("\\", "/"),
+                    )
+                    normalized_cmake = cmake_text.replace("\\", "/")
+                    if compiler == "gcc":
+                        self.assertNotIn(
+                            "../Object Inputs/symbols.o", normalized_cmake
+                        )
+                        self.assertIn(
+                            "cmake/linker/symbols/symbols_", normalized_cmake
+                        )
+                    else:
+                        self.assertIn(
+                            "../Object Inputs/symbols.o", normalized_cmake
+                        )
+
+    def test_missing_source_search_stays_inside_project_content_root(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            project_dir = root / "project-a"
+            foreign_dir = root / "project-b"
+            project_dir.mkdir()
+            foreign_dir.mkdir()
+            foreign_source = foreign_dir / "main.c"
+            foreign_source.write_text("int foreign(void) { return 1; }\n")
+            missing_source = project_dir / "missing" / "main.c"
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+
+            resolved = parser._resolve_missing_source(missing_source)
+
+            self.assertEqual(resolved, missing_source)
+            self.assertNotEqual(resolved.resolve(), foreign_source.resolve())
+
+    def test_linker_search_stays_inside_project_content_root(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            project_dir = root / "project-a"
+            foreign_dir = root / "project-b"
+            project_dir.mkdir()
+            foreign_dir.mkdir()
+            startup = project_dir / "startup.s"
+            startup.write_text(".syntax unified\n", encoding="utf-8")
+            (foreign_dir / "foreign_FLASH.ld").write_text(
+                "SECTIONS { .text : { *(.text*) } }\n", encoding="utf-8"
+            )
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+            parser.device_name = "STM32F103C8"
+            parser.source_files = [str(startup)]
+
+            self.assertIsNone(parser._guess_gcc_linker_script())
+            self.assertEqual(parser._mcu_family_token(), "STM32F103")
+
+    def test_stm32f0_fallback_uses_cortex_m0(self):
+        parser = KeilProjectToCMake("sample.uvprojx")
+        parser.device_name = "STM32F030C8"
+
+        self.assertEqual(parser._infer_cpu_from_device(), "Cortex-M0")
+        self.assertEqual(parser._mcu_family_token(), "STM32F030")
+        self.assertEqual(parser._device_memory_code(), "8")
+
+    def test_armclang_toolchain_normalizes_and_quotes_environment_path(self):
+        parser = KeilProjectToCMake("sample.uvprojx")
+        parser.cpu = "Cortex-M0+"
+
+        toolchain = parser._armclang_toolchain_content(
+            GenerationOptions(compiler="armclang", host_os="windows").normalized()
+        )
+
+        self.assertIn("set(CMAKE_SYSTEM_PROCESSOR cortex-m0plus)", toolchain)
+        self.assertIn(
+            'set(CMAKE_EXE_LINKER_FLAGS_INIT "--cpu=${CMAKE_SYSTEM_PROCESSOR}")',
+            toolchain,
+        )
+        self.assertIn(
+            'file(TO_CMAKE_PATH "$ENV{ARMCLANG_PATH}" ARMCLANG_PATH)',
+            toolchain,
+        )
+        for variable, executable in (
+            ("CMAKE_C_COMPILER", "armclang"),
+            ("CMAKE_CXX_COMPILER", "armclang"),
+            ("CMAKE_ASM_COMPILER", "armclang"),
+            ("CMAKE_LINKER", "armlink"),
+            ("CMAKE_AR", "armar"),
+            ("CMAKE_OBJCOPY", "fromelf"),
+            ("FROMELF_EXECUTABLE", "fromelf"),
+        ):
+            self.assertIn(
+                f'set({variable} "${{ARMCLANG_PATH}}/{executable}'
+                '${_ARM_EXECUTABLE_SUFFIX}")',
+                toolchain,
+            )
+
+        cmake_output = io.StringIO()
+        parser._write_cmake_header(
+            cmake_output,
+            "cmake/armclang.cmake",
+            ["C"],
+            policies=["CMP0123"],
+        )
+        cmake_text = cmake_output.getvalue()
+        self.assertLess(
+            cmake_text.index("cmake_policy(SET CMP0123 NEW)"),
+            cmake_text.index('project("sample" LANGUAGES C)'),
+        )
+
+    def test_armclang_include_options_use_forward_slashes(self):
+        parser = KeilProjectToCMake("sample.uvprojx")
+        include = Path(r"D:\SDK Folder\Include")
+        parser._add_include_path(str(include))
+        parser.output_name = "sample"
+        cmake_output = io.StringIO()
+
+        parser._write_armclang_cmake_content(
+            cmake_output,
+            r"D:\generated",
+            GenerationOptions(
+                compiler="armclang", generator="Ninja", host_os="windows"
+            ).normalized(),
+        )
+
+        cmake = cmake_output.getvalue()
+        self.assertIn("add_compile_options(", cmake)
+        self.assertIn('"-ID:/SDK Folder/Include"', cmake)
+        self.assertNotIn("include_directories(", cmake)
+
+    def test_generation_removes_stale_build_validation_report(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            output = root / "out"
+            output.mkdir()
+            validation_report = output / "build-validation.json"
+            validation_report.write_text(
+                '{"status": "success"}\n', encoding="utf-8"
+            )
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+
+            self.assertTrue(parser.parse(), parser.last_error)
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(output),
+                    False,
+                    GenerationOptions(compiler="gcc", generator="Ninja"),
+                ),
+                parser.last_error,
+            )
+
+            self.assertFalse(validation_report.exists())
+
+    def test_multiconfig_generators_keep_firmware_in_build_root(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+
+            self.assertTrue(parser.parse(), parser.last_error)
+            for compiler in ("gcc", "armclang"):
+                output = root / f"{compiler}-output"
+                options = GenerationOptions(
+                    compiler=compiler,
+                    generator="Xcode",
+                    host_os="macos",
+                )
+                self.assertTrue(
+                    parser.generate_cmake(str(output), True, options),
+                    parser.last_error,
+                )
+                cmake = (output / "CMakeLists.txt").read_text(encoding="utf-8")
+                self.assertIn(
+                    'RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_CURRENT_BINARY_DIR}>"',
+                    cmake,
+                )
+                response_setting = "ON" if compiler == "gcc" else "OFF"
+                self.assertIn(
+                    f"set(CMAKE_NINJA_FORCE_RESPONSE_FILE {response_setting}",
+                    cmake,
+                )
+                script = (output / "do_build.sh").read_text(encoding="utf-8")
+                tasks = json.loads(
+                    (output / ".vscode" / "tasks.json").read_text(encoding="utf-8")
+                )["tasks"]
+                tasks_by_label = {task["label"]: task for task in tasks}
+                compiler_label = "GCC" if compiler == "gcc" else "ArmClang"
+                debug_args = tasks_by_label[
+                    f"Build {compiler_label} Debug"
+                ]["args"]
+                self.assertEqual(
+                    debug_args[debug_args.index("--config") + 1], "Debug"
+                )
+                if compiler == "gcc":
+                    self.assertIn(
+                        'cmake --build "$ACTIVE_BUILD_DIR" --config "$BUILD_TYPE"',
+                        script,
+                    )
+                    release_args = tasks_by_label["Build GCC Release"]["args"]
+                    self.assertEqual(
+                        release_args[release_args.index("--config") + 1],
+                        "Release",
+                    )
+                else:
+                    self.assertIn(
+                        'cmake --build "build" --config Debug', script
+                    )
+
+    def test_generation_does_not_leak_gcc_assets_into_armclang(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            device_dir = root / "device"
+            device_dir.mkdir()
+            (device_dir / "gcc_startup_nrf52811.S").write_text(
+                ".syntax unified\n.thumb\n", encoding="utf-8"
+            )
+            (device_dir / "system_nrf52811.c").write_text(
+                "void SystemInit(void) {}\n", encoding="utf-8"
+            )
+
+            with patch("keil_to_cmake.find_keil_mdk_root", return_value=None), patch(
+                "keil_to_cmake.get_keil_mdk_info", return_value=None
+            ):
+                parser = KeilProjectToCMake(
+                    str(uvprojx),
+                    str(root / "missing_mdk"),
+                    target_name="Second",
+                )
+
+            self.assertTrue(parser.parse(), parser.last_error)
+            parser.device_name = "nRF52811_xxAA"
+            parser.vendor = "Nordic Semiconductor"
+            parser.cpu = "Cortex-M4"
+            parser._add_include_path(str(device_dir))
+            parsed_sources = list(parser.source_files)
+
+            gcc_output = root / "gcc-output"
+            gcc_options = GenerationOptions(compiler="gcc", generator="Ninja")
+            self.assertTrue(
+                parser.generate_cmake(str(gcc_output), False, gcc_options),
+                parser.last_error,
+            )
+            first_warnings = list(parser.warnings)
+            self.assertIn(
+                "gcc_startup_nrf52811.S",
+                (gcc_output / "CMakeLists.txt").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(parser.source_files, parsed_sources)
+
+            self.assertTrue(
+                parser.generate_cmake(str(gcc_output), False, gcc_options),
+                parser.last_error,
+            )
+            self.assertEqual(parser.warnings, first_warnings)
+
+            armclang_output = root / "armclang-output"
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(armclang_output),
+                    False,
+                    GenerationOptions(compiler="armclang", generator="Ninja"),
+                ),
+                parser.last_error,
+            )
+            armclang_cmake = (armclang_output / "CMakeLists.txt").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("gcc_startup_nrf52811.S", armclang_cmake)
+            self.assertNotIn("system_nrf52811.c", armclang_cmake)
+
+    def test_repeated_gcc_source_queries_do_not_duplicate_warnings(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            redirect_source = root / "rt_sys.c"
+            redirect_source.write_text(
+                '#include "rt_sys.h"\n', encoding="utf-8"
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(redirect_source)]
+
+            self.assertEqual(parser._gcc_source_files(), [])
+            self.assertEqual(parser._gcc_source_files(), [])
+
+            matching_warnings = [
+                warning
+                for warning in parser.warnings
+                if "Keil C Library" in warning
+            ]
+            self.assertEqual(len(matching_warnings), 1)
 
     def test_gcc_stages_sources_from_non_ascii_paths(self):
         with TemporaryDirectory() as temp_dir:
@@ -349,6 +963,39 @@ class KeilToCMakeTests(unittest.TestCase):
                 output_dir / ".vscode" / "jlink_flash_bin_release.jlink"
             ).read_text(encoding="utf-8")
             self.assertIn("build-gcc-release/", release_script)
+
+            custom_debug_script = output_dir / ".vscode" / "custom.jlink"
+            custom_debug_script.write_text("user content\n", encoding="utf-8")
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(output_dir),
+                    True,
+                    GenerationOptions(
+                        compiler="gcc",
+                        generator="Ninja",
+                        debug_backend="none",
+                    ),
+                )
+            )
+            for artifact in ("elf", "hex", "bin"):
+                self.assertFalse(
+                    (
+                        output_dir / ".vscode" / f"jlink_flash_{artifact}.jlink"
+                    ).exists()
+                )
+                self.assertFalse(
+                    (
+                        output_dir
+                        / ".vscode"
+                        / f"jlink_flash_{artifact}_release.jlink"
+                    ).exists()
+                )
+            self.assertFalse(
+                (output_dir / ".vscode" / "openocd-jlink-swd.cfg").exists()
+            )
+            self.assertEqual(
+                custom_debug_script.read_text(encoding="utf-8"), "user content\n"
+            )
 
             openocd_output_dir = root / "out-openocd"
             self.assertTrue(
@@ -558,6 +1205,27 @@ class KeilToCMakeTests(unittest.TestCase):
         parser.device_name = "CC1352R1F3"
         self.assertIsNone(parser._default_openocd_target_script())
 
+    def test_openocd_maps_supported_stm32_families(self):
+        parser = KeilProjectToCMake("sample.uvprojx")
+        parser.vendor = "STMicroelectronics"
+        mappings = {
+            "STM32F205RB": "target/stm32f2x.cfg",
+            "STM32G474RE": "target/stm32g4x.cfg",
+            "STM32L072CZ": "target/stm32l0.cfg",
+            "STM32L152RE": "target/stm32l1.cfg",
+            "STM32U585AI": "target/stm32u5x.cfg",
+            "STM32WB55RG": "target/stm32wbx.cfg",
+            "STM32WL55JC": "target/stm32wlx.cfg",
+            "STM32WBA52CG": "target/stm32wbax.cfg",
+        }
+
+        for device, expected in mappings.items():
+            with self.subTest(device=device):
+                parser.device_name = device
+                self.assertEqual(
+                    parser._default_openocd_target_script(), expected
+                )
+
     def test_openocd_jlink_wrapper_selects_swd_before_target(self):
         with TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
@@ -693,6 +1361,9 @@ class KeilToCMakeTests(unittest.TestCase):
 
             root_vscode = root / ".vscode"
             root_vscode.mkdir()
+            (root / "compile_commands.json").write_text(
+                "stale compile commands\n", encoding="utf-8"
+            )
             (root_vscode / "settings.json").write_text(
                 json.dumps(
                     {
@@ -766,6 +1437,7 @@ class KeilToCMakeTests(unittest.TestCase):
             self.assertTrue(
                 (root_vscode / "keilforge-workspace.json").is_file()
             )
+            self.assertFalse((root / "compile_commands.json").exists())
 
     def test_legacy_armclang_vscode_without_flash_tasks_is_detected(self):
         with TemporaryDirectory() as temp_dir:
@@ -966,7 +1638,7 @@ class KeilToCMakeTests(unittest.TestCase):
             cmake_text = (output_dir / "CMakeLists.txt").read_text(encoding="utf-8")
             self.assertIn("    -funsigned-char\n", cmake_text)
             self.assertIn("    -fshort-enums\n", cmake_text)
-            self.assertNotIn("    -fshort-wchar\n", cmake_text)
+            self.assertIn("    -fshort-wchar\n", cmake_text)
             self.assertIn(
                 'set(KEIL_GCC_PROJECT_LTO_DEFAULT "ON")',
                 cmake_text,
@@ -977,6 +1649,36 @@ class KeilToCMakeTests(unittest.TestCase):
                 ),
                 4,
             )
+
+    def test_gcc_forced_include_supports_output_directory_with_spaces(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            output = root / "generated output"
+
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(output),
+                    False,
+                    GenerationOptions(compiler="gcc", generator="Ninja"),
+                ),
+                parser.last_error,
+            )
+
+            cmake_text = (output / "CMakeLists.txt").read_text(encoding="utf-8")
+            self.assertIn(
+                '"$<$<COMPILE_LANGUAGE:C,CXX>:-include>"', cmake_text
+            )
+            self.assertIn(
+                '"$<$<COMPILE_LANGUAGE:C,CXX>:'
+                '${CMAKE_CURRENT_LIST_DIR}/cmake/gcc_compat.h>"',
+                cmake_text,
+            )
+            self.assertNotIn("SHELL:-include", cmake_text)
 
     def test_fallback_linker_uses_armasm_stack_and_heap_sizes(self):
         with TemporaryDirectory() as temp_dir, patch(
@@ -1081,11 +1783,105 @@ class KeilToCMakeTests(unittest.TestCase):
             )
 
             self.assertIsNotNone(generated)
+            self.assertEqual(
+                Path(generated).parent,
+                (root / "out" / "cmake" / "sources").resolve(),
+            )
             startup_text = Path(generated).read_text(encoding="utf-8")
             self.assertIn(".extern extend_sram_512k", startup_text)
             self.assertLess(
                 startup_text.index("    bl extend_sram_512k"),
                 startup_text.index("    bl SystemInit"),
+            )
+
+    def test_patched_core_source_uses_owned_directory(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            source = root / "core_cm3.c"
+            source.write_text(
+                '__ASM volatile ("strexb %0, %2, [%1]" : "=r" (result) : '
+                '"r" (addr), "r" (value) );\n',
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+
+            generated = parser._generate_patched_core_cm3_source(
+                source, str(root / "out")
+            )
+
+            self.assertIsNotNone(generated)
+            generated_path = Path(generated)
+            self.assertEqual(
+                generated_path.parent,
+                (root / "out" / "cmake" / "sources").resolve(),
+            )
+            KeilProjectToCMake._clean_generated_cmake_assets(root / "out")
+            self.assertFalse(generated_path.exists())
+
+    def test_armclang_patches_legacy_core_naked_functions(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "core_cm3.c"
+            source.write_text(
+                textwrap.dedent(
+                    """\
+                    #include <stdint.h>
+                    #define __ASM __asm
+                    uint32_t __get_PSP(void) __attribute__( ( naked ) );
+                    uint32_t __get_PSP(void)
+                    {
+                      uint32_t result=0;
+                      __ASM volatile ("MRS %0, psp\\n\\t"
+                                      "MOV r0, %0 \\n\\t"
+                                      "BX lr \\n\\t" : "=r" (result) );
+                      return(result);
+                    }
+                    void __set_PSP(uint32_t topOfProcStack) __attribute__( ( naked ) );
+                    void __set_PSP(uint32_t topOfProcStack)
+                    {
+                      __ASM volatile ("MSR psp, %0\\n\\t"
+                                      "BX lr \\n\\t" : : "r" (topOfProcStack) );
+                    }
+                    uint32_t __get_MSP(void) __attribute__( ( naked ) );
+                    uint32_t __get_MSP(void)
+                    {
+                      uint32_t result=0;
+                      __ASM volatile ("MRS %0, msp\\n\\t"
+                                      "MOV r0, %0 \\n\\t"
+                                      "BX lr \\n\\t" : "=r" (result) );
+                      return(result);
+                    }
+                    void __set_MSP(uint32_t topOfMainStack) __attribute__( ( naked ) );
+                    void __set_MSP(uint32_t topOfMainStack)
+                    {
+                      __ASM volatile ("MSR msp, %0\\n\\t"
+                                      "BX lr \\n\\t" : : "r" (topOfMainStack) );
+                    }
+                    """
+                ),
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+
+            prepared = parser._prepared_armclang_source_files(str(root / "out"))
+
+            self.assertEqual(len(prepared), 1)
+            generated = prepared[0]
+            self.assertNotEqual(Path(generated).resolve(), source.resolve())
+            patched = Path(generated).read_text(encoding="utf-8")
+            self.assertNotIn("naked", patched)
+            self.assertNotIn("BX lr", patched)
+            self.assertEqual(patched.count("MRS %0"), 2)
+            self.assertEqual(patched.count("MSR "), 2)
+            self.assertTrue(Path(generated).name.endswith("_armclang.c"))
+            self.assertEqual(
+                parser._prepared_source_origins[
+                    parser._source_control_key(generated)
+                ],
+                parser._source_control_key(source),
             )
 
     def test_runtime_irq_compat_uses_assembly_symbols(self):
@@ -1397,6 +2193,157 @@ class KeilToCMakeTests(unittest.TestCase):
                 KeilProjectToCMake._is_gcc_linker_script_candidate(ride_script)
             )
 
+    def test_gcc_linker_subdirectory_includes_are_rewritten(self):
+        gcc = shutil.which("arm-none-eabi-gcc")
+        if not gcc:
+            self.skipTest("GNU Arm compiler unavailable")
+
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            linker_root = root / "vendor-linker"
+            fragment = linker_root / "fragments" / "memory.ld"
+            fragment.parent.mkdir(parents=True)
+            fragment.write_text(
+                "MEMORY { FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 64K }\n",
+                encoding="utf-8",
+            )
+            source_linker = linker_root / "device.ld"
+            source_linker.write_text(
+                "INCLUDE fragments/memory.ld\n"
+                "SECTIONS { .text : { *(.text*) } > FLASH }\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+
+            prepared = Path(
+                parser._prepare_gcc_linker_script(
+                    str(source_linker), str(root / "output")
+                )
+            )
+            prepared_text = prepared.read_text(encoding="utf-8")
+
+            self.assertIn('INCLUDE "memory.ld"', prepared_text)
+            self.assertTrue((prepared.parent / "memory.ld").is_file())
+            self.assertFalse((prepared.parent / "fragments").exists())
+
+            startup = root / "startup.S"
+            startup.write_text(
+                ".syntax unified\n"
+                ".thumb\n"
+                ".global _start\n"
+                ".section .text\n"
+                "_start:\n"
+                "    b .\n",
+                encoding="utf-8",
+            )
+            startup_object = root / "startup.o"
+            subprocess.run(
+                [
+                    gcc,
+                    "-mcpu=cortex-m3",
+                    "-mthumb",
+                    "-c",
+                    str(startup),
+                    "-o",
+                    str(startup_object),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            firmware = root / "firmware.elf"
+            subprocess.run(
+                [
+                    gcc,
+                    "-mcpu=cortex-m3",
+                    "-mthumb",
+                    "-nostdlib",
+                    f"-T{prepared}",
+                    f"-L{prepared.parent}",
+                    str(startup_object),
+                    "-o",
+                    str(firmware),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(firmware.is_file())
+
+    def test_armcc_library_conversion_preserves_duplicate_member_names(self):
+        tools = {
+            name: shutil.which(name)
+            for name in (
+                "arm-none-eabi-gcc",
+                "arm-none-eabi-ar",
+                "arm-none-eabi-objcopy",
+                "arm-none-eabi-nm",
+            )
+        }
+        missing = [name for name, executable in tools.items() if not executable]
+        if missing:
+            self.skipTest("GNU Arm tools unavailable: " + ", ".join(missing))
+
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            objects = []
+            for directory_name, symbol in (
+                ("first", "first_member_symbol"),
+                ("second", "second_member_symbol"),
+            ):
+                source_dir = root / directory_name
+                source_dir.mkdir()
+                source = source_dir / "member.c"
+                source.write_text(
+                    f"int {symbol}(void) {{ return 0; }}\n", encoding="utf-8"
+                )
+                obj = source_dir / "member.o"
+                subprocess.run(
+                    [tools["arm-none-eabi-gcc"], "-c", str(source), "-o", str(obj)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                objects.append(obj)
+
+            library = root / "duplicate.lib"
+            subprocess.run(
+                [tools["arm-none-eabi-ar"], "qc", str(library), *map(str, objects)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [tools["arm-none-eabi-ar"], "s", str(library)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+
+            converted = parser._convert_armcc_library_for_gcc(
+                library, str(root / "output")
+            )
+
+            self.assertIsNotNone(converted)
+            symbols = subprocess.run(
+                [
+                    tools["arm-none-eabi-nm"],
+                    "-g",
+                    "--defined-only",
+                    str(converted),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(symbols.count("first_member_symbol"), 1)
+            self.assertEqual(symbols.count("second_member_symbol"), 1)
+
     def test_gcc_uses_nordic_linker_beside_gcc_startup_and_copies_includes(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1498,6 +2445,78 @@ class KeilToCMakeTests(unittest.TestCase):
             ["NRF52", "NRF52832_XXAA", "USE_SD_HW_RESOURCES", "VALUE=3"],
         )
 
+    def test_preserves_quoted_define_and_armclang_library_path(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            library = root / "vendor libs" / "algorithm.lib"
+            library.parent.mkdir()
+            library.write_bytes(b"library fixture")
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.target_name = "sample"
+            parser.output_name = "sample"
+            parser.defines = set(
+                parser._split_defines('MESSAGE="hello world",VALUE=1')
+            )
+            parser.libraries = [str(library)]
+            output = io.StringIO()
+
+            parser._write_armclang_cmake_content(
+                output,
+                str(root / "generated"),
+                GenerationOptions(compiler="armclang").normalized(),
+            )
+
+            cmake_text = output.getvalue()
+            self.assertIn('    "-DMESSAGE=\\"hello world\\""', cmake_text)
+            self.assertIn(
+                '    "${CMAKE_CURRENT_LIST_DIR}/../vendor libs/algorithm.lib"',
+                cmake_text,
+            )
+
+    def test_linker_misc_preserves_quoted_file_and_flag_arguments(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            symbol_file = root / "objects with spaces" / "symbols.o"
+            symbol_file.parent.mkdir()
+            symbol_file.write_text(
+                "#<SYMDEFS>#\n0x08000100 X exported_symbol\n",
+                encoding="utf-8",
+            )
+            target = ET.fromstring(
+                '<Target><LDads><Misc>"objects with spaces/symbols.o" '
+                '--keep="symbol one"</Misc></LDads></Target>'
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+
+            parser._parse_linker_settings(target)
+
+            self.assertEqual(parser.linker_inputs, [str(symbol_file)])
+            self.assertEqual(parser.linker_flags[0], '"--keep=symbol one"')
+
+    def test_compiler_misc_preserves_quoted_arguments(self):
+        target = ET.fromstring(
+            "<Target><Cads><VariousControls><MiscControls>"
+            '-include &quot;include files/forced header.h&quot; '
+            "--diag_suppress=1234"
+            "</MiscControls></VariousControls></Cads></Target>"
+        )
+        parser = KeilProjectToCMake("sample.uvprojx")
+
+        parser._parse_compiler_settings(target)
+
+        self.assertEqual(
+            parser.c_cpp_flags[-3:],
+            [
+                "-include",
+                '"include files/forced header.h"',
+                "--diag_suppress=1234",
+            ],
+        )
+
     def test_nordic_devices_without_fpu_force_soft_float(self):
         parser = object.__new__(KeilProjectToCMake)
         parser.device_name = "nRF52820_xxAA"
@@ -1553,9 +2572,18 @@ class KeilToCMakeTests(unittest.TestCase):
             "    (void)task;\n"
             "}\n"
             "static handler_t callback;\n"
+            "/*\n"
+            "static void commented_out(uint32_t value)\n"
+            "{\n"
+            "}\n"
+            "*/\n"
         )
         names = KeilProjectToCMake._find_static_function_names(source)
-        header = "typedef void (*handler_t)(int event);\nvoid worker(uint32_t value);\n"
+        header = (
+            "typedef void (*handler_t)(int event);\n"
+            "void worker(uint32_t value);\n"
+            "void commented_out(uint32_t value);\n"
+        )
 
         patched, count = KeilProjectToCMake._remove_conflicting_static_prototypes(
             header, names
@@ -1565,6 +2593,37 @@ class KeilToCMakeTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertIn("typedef void (*handler_t)(int event);", patched)
         self.assertNotIn("void worker", patched)
+        self.assertIn("void commented_out", patched)
+
+    def test_source_scanners_ignore_raw_strings_and_continued_comments(self):
+        raw_example = (
+            'const char *example = R"doc("\n'
+            "static void raw_fake(void) {}\n"
+            "HAL_UART_Transmit(&RawUartHandle, 0, 0, 0);\n"
+            ')doc";\n'
+        )
+        continued_comment = (
+            "// documented example \\\n"
+            "static void comment_fake(void) { "
+            "HAL_UART_Transmit(&CommentUartHandle, 0, 0, 0); }\n"
+        )
+        source = (
+            "UART_HandleTypeDef UartHandle;\n"
+            + raw_example
+            + continued_comment
+            + "static void worker(void) {}\n"
+            + "void send(void) { "
+            + "HAL_UART_Transmit(&DebugUartHandle, 0, 0, 0); }\n"
+        )
+
+        names = KeilProjectToCMake._find_static_function_names(source)
+        patched, count = KeilProjectToCMake._patch_missing_uart_handle_alias(source)
+
+        self.assertEqual(names, {"worker"})
+        self.assertEqual(count, 1)
+        self.assertIn(raw_example, patched)
+        self.assertIn(continued_comment, patched)
+        self.assertIn("HAL_UART_Transmit(&UartHandle, 0, 0, 0);", patched)
 
     def test_patches_missing_uart_handle_when_single_handle_exists(self):
         source = (
@@ -1575,6 +2634,33 @@ class KeilToCMakeTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertIn("HAL_UART_Transmit(&Uart1_Handle", patched)
+
+    def test_uart_handle_patch_preserves_non_uart_handles(self):
+        source = (
+            "UART_HandleTypeDef UartHandle;\n"
+            "SPI_HandleTypeDef SpiHandle;\n"
+            "I2C_HandleTypeDef I2cHandle;\n"
+            "void send(void) {\n"
+            "    HAL_SPI_Transmit(&SpiHandle, 0, 0, 0);\n"
+            "    HAL_I2C_Master_Transmit(&I2cHandle, 0, 0, 0, 0);\n"
+            "    send_packet(&PacketHandle);\n"
+            "    HAL_UART_Transmit(&DebugUartHandle, 0, 0, 0);\n"
+            "}\n"
+            'const char *uart_log = "HAL_UART_Transmit(&LogUartHandle)";\n'
+            "// HAL_UART_Transmit(&CommentUartHandle, 0, 0, 0);\n"
+            "/* HAL_UART_Transmit(&BlockUartHandle, 0, 0, 0); */\n"
+        )
+
+        patched, count = KeilProjectToCMake._patch_missing_uart_handle_alias(source)
+
+        self.assertEqual(count, 1)
+        self.assertIn("HAL_SPI_Transmit(&SpiHandle", patched)
+        self.assertIn("HAL_I2C_Master_Transmit(&I2cHandle", patched)
+        self.assertIn("send_packet(&PacketHandle", patched)
+        self.assertIn("HAL_UART_Transmit(&UartHandle", patched)
+        self.assertIn('"HAL_UART_Transmit(&LogUartHandle)"', patched)
+        self.assertIn("HAL_UART_Transmit(&CommentUartHandle", patched)
+        self.assertIn("HAL_UART_Transmit(&BlockUartHandle", patched)
 
     def test_build_validator_classifies_configure_failure(self):
         validator = BuildValidator(timeout_seconds=10)
@@ -1664,6 +2750,37 @@ class KeilToCMakeTests(unittest.TestCase):
             [diagnostic.category for diagnostic in report.diagnostics],
         )
 
+    def test_build_validator_selects_debug_for_multiconfig_generator(self):
+        validator = BuildValidator(timeout_seconds=10)
+        configure = CommandResult(
+            command=["cmake"],
+            return_code=0,
+            stdout="configured",
+            stderr="",
+            duration_seconds=0.1,
+        )
+        build = CommandResult(
+            command=["cmake", "--build"],
+            return_code=0,
+            stdout="built",
+            stderr="",
+            duration_seconds=0.1,
+        )
+
+        with TemporaryDirectory() as temp_dir, patch.object(
+            validator, "_run", side_effect=[configure, build]
+        ) as run:
+            report = validator.validate(
+                Path(temp_dir),
+                GenerationOptions(
+                    compiler="gcc", generator="Ninja Multi-Config"
+                ).normalized(),
+            )
+
+        self.assertEqual(report.status, "success")
+        build_command = run.call_args_list[1].args[0]
+        self.assertEqual(build_command[-2:], ["--config", "Debug"])
+
     def test_build_validator_timeout_terminates_process_group(self):
         validator = BuildValidator(timeout_seconds=0.1)
 
@@ -1731,16 +2848,204 @@ class KeilToCMakeTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             output = Path(temp_dir)
             stale_header = output / "cmake" / "compat-includes" / "StdioStream.h"
+            user_cmake = output / "cmake" / "user-owned.cmake"
+            legacy_startup = output / "cmake" / "startup_device_gcc.S"
+            legacy_core = output / "cmake" / "core_cm3_gcc.c"
+            legacy_symbols = output / "cmake" / "symbols_0123456789ab.ld"
+            user_startup = output / "cmake" / "startup_custom_gcc.S"
+            user_linker = output / "cmake" / "custom.ld"
             build_marker = output / "build-gcc" / "keep.txt"
             stale_header.parent.mkdir(parents=True)
             build_marker.parent.mkdir(parents=True)
             stale_header.write_text("stale", encoding="utf-8")
+            user_cmake.write_text("user content", encoding="utf-8")
+            legacy_startup.write_text(
+                "/* Auto-generated GNU startup file converted from a Keil "
+                "ARMASM startup file. */\n",
+                encoding="utf-8",
+            )
+            legacy_core.write_text(
+                '__ASM volatile ("strexb %0" : "=&r" (result));\n',
+                encoding="utf-8",
+            )
+            legacy_symbols.write_text(
+                "/* Converted from ARM Linker SYMDEFS. */\n"
+                "PROVIDE(old_symbol = 0x1234);\n",
+                encoding="utf-8",
+            )
+            user_startup.write_text("custom startup\n", encoding="utf-8")
+            user_linker.write_text(
+                "SECTIONS { .text : { *(.text*) } }\n", encoding="utf-8"
+            )
             build_marker.write_text("keep", encoding="utf-8")
 
             KeilProjectToCMake._clean_generated_cmake_assets(output)
 
-            self.assertFalse((output / "cmake").exists())
+            self.assertFalse(stale_header.exists())
+            self.assertFalse(legacy_startup.exists())
+            self.assertFalse(legacy_core.exists())
+            self.assertFalse(legacy_symbols.exists())
+            self.assertEqual(user_cmake.read_text(encoding="utf-8"), "user content")
+            self.assertEqual(
+                user_startup.read_text(encoding="utf-8"), "custom startup\n"
+            )
+            self.assertTrue(user_linker.is_file())
             self.assertEqual(build_marker.read_text(encoding="utf-8"), "keep")
+
+    def test_generation_migrates_legacy_generated_cmake_files(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            output = root / "out"
+            cmake_dir = output / "cmake"
+            cmake_dir.mkdir(parents=True)
+            (output / "CMakeLists.txt").write_text(
+                "old incorrect configuration\n", encoding="utf-8"
+            )
+            (cmake_dir / "armclang.cmake").write_text(
+                "old incorrect toolchain\n", encoding="utf-8"
+            )
+            (cmake_dir / "startup_device_gcc.S").write_text(
+                "/* Auto-generated GNU startup file converted from a Keil "
+                "ARMASM startup file. */\nold incorrect startup\n",
+                encoding="utf-8",
+            )
+            (cmake_dir / "symbols_0123456789ab.ld").write_text(
+                "/* Converted from ARM Linker SYMDEFS. */\n"
+                "PROVIDE(old_symbol = 0x1234);\n",
+                encoding="utf-8",
+            )
+            user_cmake = cmake_dir / "user-owned.cmake"
+            user_cmake.write_text("user content\n", encoding="utf-8")
+
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(output),
+                    False,
+                    GenerationOptions(compiler="gcc", generator="Ninja"),
+                ),
+                parser.last_error,
+            )
+
+            self.assertIn(
+                "# CMake file generated from Keil uVision project",
+                (output / "CMakeLists.txt").read_text(encoding="utf-8"),
+            )
+            self.assertFalse((cmake_dir / "armclang.cmake").exists())
+            self.assertFalse((cmake_dir / "startup_device_gcc.S").exists())
+            self.assertFalse((cmake_dir / "symbols_0123456789ab.ld").exists())
+            self.assertTrue((cmake_dir / "arm-none-eabi-toolchain.cmake").is_file())
+            self.assertEqual(
+                user_cmake.read_text(encoding="utf-8"), "user content\n"
+            )
+
+    def test_symbol_fragments_use_managed_linker_directory(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            symbols = root / "legacy.symdefs"
+            symbols.write_text(
+                "#<SYMDEFS>#\n0x08000100 T exported_symbol\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.linker_inputs = [str(symbols)]
+
+            fragments = parser._generate_gcc_symbol_fragments(str(root / "out"))
+
+            self.assertEqual(len(fragments), 1)
+            fragment = Path(fragments[0])
+            self.assertEqual(fragment.parent.name, "symbols")
+            self.assertEqual(fragment.parent.parent.name, "linker")
+            self.assertIn(
+                "PROVIDE(exported_symbol = 0x08000100);",
+                fragment.read_text(encoding="utf-8"),
+            )
+
+    def test_gcc_artifact_target_is_host_independent(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            with patch("keil_to_cmake.find_keil_mdk_root", return_value=None), patch(
+                "keil_to_cmake.get_keil_mdk_info", return_value=None
+            ):
+                parser = KeilProjectToCMake(
+                    str(uvprojx),
+                    str(root / "missing_mdk"),
+                    target_name="Second",
+                )
+            self.assertTrue(parser.parse(), parser.last_error)
+            for host_os in ("linux", "macos"):
+                with self.subTest(host_os=host_os):
+                    output = root / f"output-{host_os}"
+                    self.assertTrue(
+                        parser.generate_cmake(
+                            str(output),
+                            False,
+                            GenerationOptions(
+                                compiler="gcc",
+                                host_os=host_os,
+                                generator="Ninja",
+                            ),
+                        ),
+                        parser.last_error,
+                    )
+
+                    cmake = (output / "CMakeLists.txt").read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertIn('COMMAND "${CMAKE_OBJCOPY}" -O ihex', cmake)
+                    self.assertIn('COMMAND "${CMAKE_OBJCOPY}" -O binary', cmake)
+                    self.assertIn("cmake/copy_if_exists.cmake", cmake)
+                    self.assertTrue(
+                        (output / "cmake" / "copy_if_exists.cmake").is_file()
+                    )
+                    self.assertNotIn("ARTIFACT_SCRIPT", cmake)
+                    self.assertNotIn("COMMAND cmd /c", cmake)
+                    self.assertNotIn("COMMAND sh ", cmake)
+
+    def test_gcc_cxx_multilib_headers_are_resolved_during_cmake_configure(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            cpp_source = root / "Src" / "module.cpp"
+            cpp_source.write_text("int module() { return 0; }\n", encoding="utf-8")
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            parser.source_files.append(str(cpp_source))
+            output = root / "out"
+
+            self.assertTrue(
+                parser.generate_cmake(
+                    str(output),
+                    False,
+                    GenerationOptions(compiler="gcc", generator="Ninja"),
+                ),
+                parser.last_error,
+            )
+
+            cmake = (output / "CMakeLists.txt").read_text(encoding="utf-8")
+            self.assertIn("-print-sysroot", cmake)
+            self.assertIn("-dumpfullversion", cmake)
+            self.assertIn("-print-multi-directory", cmake)
+            self.assertIn('string(REPLACE "v7e-m+fp/" "v7+fp/"', cmake)
+            self.assertIn(
+                "target_include_directories(Second SYSTEM PRIVATE", cmake
+            )
+            self.assertIn("${ARM_GXX_MULTILIB_STDINC}", cmake)
+            self.assertIn("${ARM_GXX_TARGET_STDINC}", cmake)
+            self.assertNotIn("arm-gnu-toolchain-13.3.rel1-ming", cmake)
+
+            toolchain = (
+                output / "cmake" / "arm-none-eabi-toolchain.cmake"
+            ).read_text(encoding="utf-8")
+            self.assertIn("ARM_TOOLCHAIN_ROOT", toolchain)
+            self.assertNotIn("D:/", toolchain)
 
     def test_generated_startup_uses_cortex_m0_compatible_copy_loop(self):
         with TemporaryDirectory() as temp_dir, patch(
@@ -1787,6 +3092,11 @@ class KeilToCMakeTests(unittest.TestCase):
             }
             """
         )
+        commented_example = (
+            "// __ASM void documented_delay(uint32_t count) "
+            "{ SUBS r0, #1 BNE documented_delay BX LR }\n"
+        )
+        source += commented_example
 
         patched, functions = KeilProjectToCMake._patch_armcc_embedded_assembly(
             source
@@ -1795,6 +3105,7 @@ class KeilToCMakeTests(unittest.TestCase):
         self.assertEqual(functions, ["system_delay_cycles"])
         self.assertIn("__attribute__((naked))", patched)
         self.assertIn('"subs r0, r0, #1\\n"', patched)
+        self.assertIn(commented_example, patched)
 
     def test_patches_legacy_header_stdint_redefinitions(self):
         header = textwrap.dedent(
@@ -1840,6 +3151,142 @@ class KeilToCMakeTests(unittest.TestCase):
             self.assertIn(
                 str(device_include.resolve(strict=False)), parser.include_paths
             )
+
+    def test_pack_include_paths_map_to_repository_vendor_directories(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = root / "firmware"
+            project_dir = repository / "MDK-ARM"
+            output = project_dir / "cmake-generated"
+            (repository / ".git").mkdir(parents=True)
+            output.mkdir(parents=True)
+
+            pack_root = root / "keil" / "ARM" / "PACK"
+            cmsis_pack = pack_root / "ARM" / "CMSIS" / "5.6.0" / "CMSIS" / "Include"
+            peripheral_pack = (
+                pack_root
+                / "ArteryTek"
+                / "AT32F435_437_DFP"
+                / "2.2.6"
+                / "Device"
+                / "Firmware"
+                / "Peripherals"
+                / "inc"
+            )
+            device_pack = (
+                pack_root
+                / "ArteryTek"
+                / "AT32F435_437_DFP"
+                / "2.2.6"
+                / "Device"
+                / "Include"
+            )
+            for path in (cmsis_pack, peripheral_pack, device_pack):
+                path.mkdir(parents=True)
+
+            vendor_paths = (
+                repository / "vendor" / "CMSIS" / "Include",
+                repository / "vendor" / "AT32F435_437_DFP" / "Peripherals" / "inc",
+                repository / "vendor" / "AT32F435_437_DFP" / "Device" / "Include",
+            )
+            for path in vendor_paths:
+                path.mkdir(parents=True)
+            for source_path, vendor_path in zip(
+                (cmsis_pack, peripheral_pack, device_pack),
+                vendor_paths,
+            ):
+                (source_path / "fixture.h").write_text(
+                    "#pragma once\n", encoding="utf-8"
+                )
+                (vendor_path / "fixture.h").write_text(
+                    "#pragma once\n", encoding="utf-8"
+                )
+
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+            references = [
+                parser._gcc_include_reference(str(path), str(output))
+                for path in (cmsis_pack, peripheral_pack, device_pack)
+            ]
+
+            self.assertEqual(
+                references,
+                [
+                    "${CMAKE_CURRENT_LIST_DIR}/../../vendor/CMSIS/Include",
+                    "${CMAKE_CURRENT_LIST_DIR}/../../vendor/AT32F435_437_DFP/Peripherals/inc",
+                    "${CMAKE_CURRENT_LIST_DIR}/../../vendor/AT32F435_437_DFP/Device/Include",
+                ],
+            )
+
+    def test_external_source_and_unmapped_pack_keep_absolute_paths_with_warnings(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = root / "firmware"
+            project_dir = repository / "MDK-ARM"
+            output = project_dir / "cmake-generated"
+            (repository / ".git").mkdir(parents=True)
+            output.mkdir(parents=True)
+            external_source = root / "external" / "module.c"
+            external_source.parent.mkdir()
+            external_source.write_text("void module(void) {}\n", encoding="utf-8")
+            pack_include = (
+                root
+                / "keil"
+                / "ARM"
+                / "PACK"
+                / "Vendor"
+                / "MissingPack"
+                / "1.0.0"
+                / "Include"
+            )
+            pack_include.mkdir(parents=True)
+
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                source_reference = parser._portable_cmake_reference(
+                    external_source, str(output), "源文件"
+                )
+                include_reference = parser._gcc_include_reference(
+                    str(pack_include), str(output)
+                )
+
+            self.assertEqual(source_reference, external_source.as_posix())
+            self.assertEqual(include_reference, pack_include.as_posix())
+            self.assertTrue(any("仓库树外" in warning for warning in parser.warnings))
+            self.assertTrue(any("vendor 映射" in warning for warning in parser.warnings))
+            self.assertIn("仓库树外", stderr.getvalue())
+            self.assertIn("vendor 映射", stderr.getvalue())
+
+    def test_cmsis_core_include_uses_numeric_version_order(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            for version in ("9.10.0", "10.0.0"):
+                include = (
+                    root
+                    / "ARM"
+                    / "PACK"
+                    / "ARM"
+                    / "CMSIS"
+                    / version
+                    / "CMSIS"
+                    / "Core"
+                    / "Include"
+                )
+                include.mkdir(parents=True)
+                (include / "core_cm3.h").write_text(
+                    "#pragma once\n", encoding="utf-8"
+                )
+            parser = KeilProjectToCMake(
+                str(root / "sample.uvprojx"), str(root)
+            )
+            parser.cpu = "Cortex-M3"
+
+            parser._add_cmsis_core_include()
+
+            selected = Path(parser.include_path_order[-1])
+            self.assertEqual(selected.parents[2].name, "10.0.0")
 
     def test_inline_compat_header_is_forced(self):
         with TemporaryDirectory() as temp_dir, patch(
@@ -1911,6 +3358,555 @@ class KeilToCMakeTests(unittest.TestCase):
             self.assertIn(str(target_dir), parser.include_paths)
             self.assertIn(str(device_dir), parser.include_paths)
             self.assertIn(str(device_dir / "RTE_Device.h"), parser.header_files)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows junction test")
+    def test_generation_cleanup_detaches_cmake_directory_link(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            external = root / "external"
+            marker = external / "compat-includes" / "keep.h"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("keep\n", encoding="utf-8")
+            output = root / "output"
+            output.mkdir()
+            cmake_link = output / "cmake"
+            completed = subprocess.run(
+                [
+                    "cmd",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    str(cmake_link),
+                    str(external),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                self.skipTest(completed.stderr or completed.stdout)
+
+            self.assertTrue(KeilProjectToCMake._is_directory_link(cmake_link))
+            KeilProjectToCMake._clean_generated_cmake_assets(output)
+
+            self.assertFalse(cmake_link.exists())
+            self.assertTrue(marker.is_file())
+            cmake_link.mkdir()
+
+            child_external = root / "child-external"
+            child_marker = child_external / "keep.h"
+            child_external.mkdir()
+            child_marker.write_text("keep\n", encoding="utf-8")
+            child_link = cmake_link / "includes"
+            completed = subprocess.run(
+                [
+                    "cmd",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    str(child_link),
+                    str(child_external),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr or completed.stdout,
+            )
+            KeilProjectToCMake._clean_generated_cmake_assets(output)
+            self.assertTrue(child_marker.is_file())
+
+            vscode_external = root / "vscode-external"
+            vscode_marker = vscode_external / "settings.json"
+            vscode_external.mkdir()
+            vscode_marker.write_text("{}\n", encoding="utf-8")
+            vscode_link = output / ".vscode"
+            completed = subprocess.run(
+                [
+                    "cmd",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    str(vscode_link),
+                    str(vscode_external),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr or completed.stdout,
+            )
+            KeilProjectToCMake._clean_generated_vscode_assets(output)
+            self.assertFalse(vscode_link.exists())
+            self.assertTrue(vscode_marker.is_file())
+
+    def test_portable_reference_keeps_absolute_when_relpath_is_unavailable(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = root / "repository"
+            project_dir = repository / "project"
+            output = project_dir / "generated"
+            source = repository / "src" / "main.c"
+            (repository / ".git").mkdir(parents=True)
+            project_dir.mkdir()
+            output.mkdir()
+            source.parent.mkdir()
+            source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+
+            with patch("keil_to_cmake.os.path.relpath", side_effect=ValueError):
+                reference = parser._portable_cmake_reference(
+                    source, str(output), "源文件"
+                )
+                vscode_reference = parser._vscode_workspace_reference(
+                    source.parent, output, "头文件目录"
+                )
+
+            self.assertEqual(reference, source.resolve(strict=False).as_posix())
+            self.assertNotIn("CMAKE_CURRENT_LIST_DIR", reference)
+            self.assertEqual(
+                vscode_reference,
+                source.parent.resolve(strict=False).as_posix(),
+            )
+            self.assertNotIn("workspaceFolder", vscode_reference)
+
+    def test_armclang_assets_keep_absolute_when_relpath_is_unavailable(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = root / "repository"
+            project_dir = repository / "project"
+            output_dir = project_dir / "generated"
+            library = repository / "vendor" / "algorithm.lib"
+            scatter = repository / "linker" / "memory.sct"
+            (repository / ".git").mkdir(parents=True)
+            output_dir.mkdir(parents=True)
+            library.parent.mkdir()
+            scatter.parent.mkdir()
+            library.write_bytes(b"library")
+            scatter.write_text("LR_IROM1 0x08000000 0x1000 {}\n")
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+            parser.target_name = "sample"
+            parser.output_name = "sample"
+            parser.libraries = [str(library)]
+            parser.linker_script = str(scatter)
+            generated = io.StringIO()
+
+            with patch("keil_to_cmake.os.path.relpath", side_effect=ValueError):
+                parser._write_armclang_cmake_content(
+                    generated,
+                    str(output_dir),
+                    GenerationOptions(compiler="armclang").normalized(),
+                )
+
+            cmake_text = generated.getvalue()
+            self.assertIn(
+                f'set(LINKER_SCRIPT "{scatter.resolve().as_posix()}")',
+                cmake_text,
+            )
+            self.assertIn(
+                f'    "{library.resolve().as_posix()}"',
+                cmake_text,
+            )
+
+    def test_missing_source_search_rejects_ambiguous_same_name_candidates(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sdk = root / "sdk"
+            project_dir = sdk / "examples" / "A" / "MDK"
+            missing = sdk / "examples" / "A" / "Src" / "main.c"
+            candidate_b = sdk / "examples" / "B" / "Src" / "main.c"
+            candidate_c = sdk / "examples" / "C" / "Src" / "main.c"
+            project_dir.mkdir(parents=True)
+            candidate_b.parent.mkdir(parents=True)
+            candidate_c.parent.mkdir(parents=True)
+            candidate_b.write_text("int from_b(void) { return 1; }\n")
+            candidate_c.write_text("int from_c(void) { return 2; }\n")
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+
+            with patch.object(
+                parser, "_project_content_root", return_value=sdk
+            ):
+                resolved = parser._resolve_missing_source(missing)
+
+            self.assertEqual(resolved, missing)
+            self.assertTrue(
+                any("候选存在歧义" in warning for warning in parser.warnings)
+            )
+
+    def test_uart_handle_patch_preserves_names_visible_through_headers(self):
+        source = (
+            '#include "board.h"\n'
+            "UART_HandleTypeDef UartHandle;\n"
+            "void send(void) {\n"
+            "    HAL_UART_Transmit(&DebugUartHandle, 0, 0, 0);\n"
+            "}\n"
+        )
+
+        patched, count = KeilProjectToCMake._patch_missing_uart_handle_alias(source)
+
+        self.assertEqual(count, 0)
+        self.assertEqual(patched, source)
+
+    def test_pack_vendor_mapping_rejects_different_directory_contents(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = root / "firmware"
+            project_dir = repository / "MDK-ARM"
+            output = project_dir / "generated"
+            pack_include = (
+                root
+                / "keil"
+                / "ARM"
+                / "PACK"
+                / "Acme"
+                / "SharedPack"
+                / "1.0.0"
+                / "Include"
+            )
+            legacy_include = repository / "vendor" / "SharedPack" / "Include"
+            (repository / ".git").mkdir(parents=True)
+            output.mkdir(parents=True)
+            pack_include.mkdir(parents=True)
+            legacy_include.mkdir(parents=True)
+            (pack_include / "board.h").write_text("PACK\n", encoding="utf-8")
+            (legacy_include / "board.h").write_text("repository\n", encoding="utf-8")
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+
+            reference = parser._gcc_include_reference(
+                str(pack_include), str(output)
+            )
+
+            self.assertEqual(reference, pack_include.resolve(strict=False).as_posix())
+            self.assertTrue(any("内容不同" in warning for warning in parser.warnings))
+
+    def test_pack_vendor_mapping_preserves_vendor_and_version(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repository = root / "firmware"
+            project_dir = repository / "MDK-ARM"
+            output = project_dir / "generated"
+            pack_include = (
+                root
+                / "keil"
+                / "ARM"
+                / "PACK"
+                / "Acme"
+                / "SharedPack"
+                / "2.0.0"
+                / "Include"
+            )
+            versioned_include = (
+                repository
+                / "vendor"
+                / "Acme"
+                / "SharedPack"
+                / "2.0.0"
+                / "Include"
+            )
+            legacy_include = repository / "vendor" / "SharedPack" / "Include"
+            (repository / ".git").mkdir(parents=True)
+            output.mkdir(parents=True)
+            pack_include.mkdir(parents=True)
+            versioned_include.mkdir(parents=True)
+            legacy_include.mkdir(parents=True)
+            for path in (pack_include, versioned_include, legacy_include):
+                (path / "board.h").write_text(
+                    "#pragma once\n", encoding="utf-8"
+                )
+            parser = KeilProjectToCMake(str(project_dir / "sample.uvprojx"))
+
+            components = parser._pack_path_components(pack_include)
+            reference = parser._gcc_include_reference(
+                str(pack_include), str(output)
+            )
+
+            self.assertEqual(
+                components,
+                ("Acme", "SharedPack", "2.0.0", ("Include",)),
+            )
+            self.assertEqual(
+                reference,
+                "${CMAKE_CURRENT_LIST_DIR}/../../vendor/"
+                "Acme/SharedPack/2.0.0/Include",
+            )
+
+    def test_jlink_scripts_quote_artifact_paths_with_spaces(self):
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            parser = KeilProjectToCMake(str(output_dir / "sample.uvprojx"))
+            parser.target_name = "artifact name"
+            parser.device_name = "nRF52840_xxAA"
+            parser.cpu = "Cortex-M4"
+            options = GenerationOptions(
+                compiler="gcc",
+                build_dir="build output",
+                debug_probe="jlink",
+                debug_backend="jlink",
+            ).normalized()
+
+            parser._write_jlink_scripts(output_dir, options)
+
+            for script in (
+                "jlink_flash_elf.jlink",
+                "jlink_flash_hex.jlink",
+                "jlink_flash_bin.jlink",
+                "jlink_flash_elf_release.jlink",
+                "jlink_flash_hex_release.jlink",
+                "jlink_flash_bin_release.jlink",
+            ):
+                content = (
+                    output_dir / ".vscode" / script
+                ).read_text(encoding="utf-8")
+                self.assertRegex(content, r'loadfile "[^"]*artifact name\.')
+
+    def test_gcc_compat_header_declares_missing_namespace_functions(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            include_dir = root / "include"
+            include_dir.mkdir()
+            header = include_dir / "HAL.h"
+            header.write_text(
+                "#include <stdint.h>\n"
+                "namespace HAL {\n"
+                "void Display_SendPixels(const uint16_t*, uint32_t);\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            source = root / "display.cpp"
+            source.write_text(
+                '#include "HAL.h"\n'
+                "void HAL::Display_SendPixels(const uint16_t*, uint32_t) {}\n"
+                "void HAL::Display_WaitForSendFinish() {}\n"
+                "void HAL::Display_SendPixelsBlocking("
+                "const uint16_t* pixels, uint32_t len) {}\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+            parser._add_include_path(str(include_dir))
+
+            compat_path = parser._generate_gcc_cxx_compat_header(
+                str(root / "out"), source_files=parser.source_files
+            )
+            compat = Path(compat_path).read_text(encoding="utf-8")
+
+            self.assertIn(
+                "void Display_WaitForSendFinish();",
+                compat,
+            )
+            self.assertIn(
+                "void Display_SendPixelsBlocking("
+                "const uint16_t* pixels, uint32_t len);",
+                compat,
+            )
+            self.assertNotIn("void Display_SendPixels(", compat)
+            self.assertTrue(
+                any(
+                    "HAL::Display_WaitForSendFinish" in warning
+                    and "HAL::Display_SendPixelsBlocking" in warning
+                    for warning in parser.warnings
+                )
+            )
+
+    def test_gcc_compat_header_keeps_existing_namespace_declaration(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            header = root / "HAL.h"
+            header.write_text(
+                "namespace HAL { void Ready(); }\n",
+                encoding="utf-8",
+            )
+            source = root / "hal.cpp"
+            source.write_text(
+                '#include "HAL.h"\nvoid HAL::Ready() {}\n',
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+            parser._add_include_path(str(root))
+
+            compat_path = parser._generate_gcc_cxx_compat_header(
+                str(root / "out"), source_files=parser.source_files
+            )
+            compat = Path(compat_path).read_text(encoding="utf-8")
+
+            self.assertNotIn("void Ready();", compat)
+            self.assertFalse(
+                any("HAL::Ready" in warning for warning in parser.warnings)
+            )
+
+    def test_gcc_compat_header_distinguishes_namespace_overloads(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            header = root / "HAL.h"
+            header.write_text(
+                "#include <stdint.h>\n"
+                "namespace HAL { void Send(uint32_t value); "
+                "void Send(const uint16_t*); }\n",
+                encoding="utf-8",
+            )
+            source = root / "hal.cpp"
+            source.write_text(
+                '#include "HAL.h"\n'
+                "void HAL::Send(uint32_t input) {}\n"
+                "void HAL::Send(const uint16_t* pixels) {}\n"
+                "void HAL::Send(uint16_t first, uint16_t second) {}\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+            parser._add_include_path(str(root))
+
+            compat_path = parser._generate_gcc_cxx_compat_header(
+                str(root / "out"), source_files=parser.source_files
+            )
+            compat = Path(compat_path).read_text(encoding="utf-8")
+
+            self.assertNotIn("void Send(uint32_t input);", compat)
+            self.assertNotIn("void Send(const uint16_t* pixels);", compat)
+            self.assertIn(
+                "void Send(uint16_t first, uint16_t second);",
+                compat,
+            )
+
+    def test_gcc_compat_header_distinguishes_same_name_across_namespaces(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            header = root / "First.h"
+            header.write_text(
+                "namespace First { void Ready(); }\n",
+                encoding="utf-8",
+            )
+            source = root / "second.cpp"
+            source.write_text(
+                '#include "First.h"\nvoid Second::Ready() {}\n',
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+            parser._add_include_path(str(root))
+
+            compat_path = parser._generate_gcc_cxx_compat_header(
+                str(root / "out"), source_files=parser.source_files
+            )
+            compat = Path(compat_path).read_text(encoding="utf-8")
+
+            self.assertIn("namespace Second", compat)
+            self.assertIn("void Ready();", compat)
+
+    def test_gcc_compat_header_resolves_nested_namespace_using_directive(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            header = root / "TileSystem.h"
+            header.write_text(
+                "namespace Outer { namespace Inner { "
+                "uint32_t Size(int level); } }\n",
+                encoding="utf-8",
+            )
+            source = root / "tile.cpp"
+            source.write_text(
+                '#include "TileSystem.h"\n'
+                "using namespace Outer;\n"
+                "uint32_t Inner::Size(int level) { return level; }\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+            parser._add_include_path(str(root))
+
+            compat_path = parser._generate_gcc_cxx_compat_header(
+                str(root / "out"), source_files=parser.source_files
+            )
+            compat = Path(compat_path).read_text(encoding="utf-8")
+
+            self.assertNotIn("namespace Inner", compat)
+
+    def test_gcc_compat_header_skips_custom_parameter_types(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "hal.cpp"
+            source.write_text(
+                "void HAL::SetCallback(Display_CallbackFunc_t callback) {}\n",
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+
+            compat_path = parser._generate_gcc_cxx_compat_header(
+                str(root / "out"), source_files=parser.source_files
+            )
+            compat = Path(compat_path).read_text(encoding="utf-8")
+
+            self.assertNotIn("SetCallback", compat)
+
+    def test_gcc_compat_header_skips_class_member_definitions(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            header = root / "Device.h"
+            header.write_text(
+                "class Device { public: void Reset(); };\n",
+                encoding="utf-8",
+            )
+            source = root / "device.cpp"
+            source.write_text(
+                '#include "Device.h"\nvoid Device::Reset() {}\n',
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+            parser._add_include_path(str(root))
+
+            compat_path = parser._generate_gcc_cxx_compat_header(
+                str(root / "out"), source_files=parser.source_files
+            )
+            compat = Path(compat_path).read_text(encoding="utf-8")
+
+            self.assertNotIn("namespace Device", compat)
+
+    def test_gcc_compat_header_skips_nested_class_member_definitions(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            header = root / "Device.h"
+            header.write_text(
+                "namespace Board { class Device { public: void Reset(); }; }\n",
+                encoding="utf-8",
+            )
+            source = root / "device.cpp"
+            source.write_text(
+                '#include "Device.h"\nvoid Board::Device::Reset() {}\n',
+                encoding="utf-8",
+            )
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            parser.source_files = [str(source)]
+            parser._add_include_path(str(root))
+
+            compat_path = parser._generate_gcc_cxx_compat_header(
+                str(root / "out"), source_files=parser.source_files
+            )
+            compat = Path(compat_path).read_text(encoding="utf-8")
+
+            self.assertNotIn("namespace Device", compat)
+
+    def test_build_validator_classifies_windows_missing_executable(self):
+        validator = BuildValidator(timeout_seconds=10)
+        result = CommandResult(
+            command=["cmake"],
+            return_code=None,
+            stdout="",
+            stderr="",
+            duration_seconds=0.1,
+            error="[WinError 2] The system cannot find the file specified",
+        )
+
+        diagnostics = validator._classify("configure", result)
+
+        self.assertEqual([item.category for item in diagnostics], ["missing_tool"])
 
 
 if __name__ == "__main__":

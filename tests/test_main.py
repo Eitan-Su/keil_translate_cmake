@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from keil_to_cmake import GenerationOptions
-from main import APP_STYLE, ConversionWorker, MainWindow
+from main import APP_STYLE, CHECKBOX_CHECK_ICON, ConversionWorker, MainWindow
 
 
 class MainWindowPathTests(unittest.TestCase):
@@ -21,6 +21,19 @@ class MainWindowPathTests(unittest.TestCase):
             APP_STYLE,
             r"QWidget#pageSurface\s*\{[^}]*background\s*:\s*#edf2f7",
         )
+
+    def test_checked_checkbox_uses_checkmark_svg(self):
+        icon_path = Path(CHECKBOX_CHECK_ICON)
+
+        self.assertTrue(icon_path.is_file())
+        self.assertRegex(
+            APP_STYLE,
+            r'QCheckBox::indicator:checked\s*\{[^}]*'
+            r'image:\s*url\("[^"]*checkbox-check\.svg"\)',
+        )
+        svg = icon_path.read_text(encoding="utf-8")
+        self.assertIn('stroke="#ffffff"', svg)
+        self.assertIn("<path", svg)
 
     def test_history_popup_highlights_hovered_item(self):
         self.assertRegex(
@@ -51,6 +64,16 @@ class MainWindowPathTests(unittest.TestCase):
         self.assertEqual(MainWindow.MINIMUM_WINDOW_SIZE, (520, 440))
         self.assertTrue(MainWindow._is_compact_width(560))
         self.assertFalse(MainWindow._is_compact_width(800))
+
+    def test_validation_choice_updates_conversion_action_text(self):
+        self.assertEqual(
+            MainWindow._conversion_action_text(True),
+            "转换并验证",
+        )
+        self.assertEqual(
+            MainWindow._conversion_action_text(False),
+            "仅转换",
+        )
 
     def test_collapsed_inspector_width_is_not_persisted(self):
         self.assertEqual(MainWindow._normalized_inspector_width(0), 270)
@@ -135,6 +158,38 @@ class MainWindowPathTests(unittest.TestCase):
             "CMake 工程生成完成。\n\n验证耗时\n未执行",
         )
 
+    def test_completion_status_distinguishes_generation_from_validation(self):
+        self.assertEqual(
+            MainWindow._completion_status(True, -1.0),
+            ("转换完成", False),
+        )
+        self.assertEqual(
+            MainWindow._completion_status(True, 2.5),
+            ("构建通过", True),
+        )
+        self.assertEqual(
+            MainWindow._completion_status(False, 2.5),
+            ("构建失败", True),
+        )
+
+    def test_completion_status_distinguishes_conversion_from_validation(self):
+        self.assertEqual(
+            MainWindow._completion_status(True, -1.0),
+            ("转换完成", False),
+        )
+        self.assertEqual(
+            MainWindow._completion_status(False, -1.0),
+            ("转换失败", False),
+        )
+        self.assertEqual(
+            MainWindow._completion_status(True, 0.0),
+            ("构建通过", True),
+        )
+        self.assertEqual(
+            MainWindow._completion_status(False, 0.0),
+            ("构建失败", True),
+        )
+
     def test_parses_all_linker_memory_regions(self):
         output = (
             "Memory region         Used Size  Region Size  %age Used\n"
@@ -152,6 +207,27 @@ class MainWindowPathTests(unittest.TestCase):
                 ("RAM", 298472, 384 * 1024),
                 ("RW_IRAM2", 160 * 1024, 160 * 1024),
             ],
+        )
+
+    def test_parses_armclang_program_size(self):
+        output = "Program Size: Code=388 RO-data=16 RW-data=0 ZI-data=96\n"
+        parser = SimpleNamespace(
+            flash_length=1024 * 1024,
+            ram_length=128 * 1024,
+        )
+
+        regions = ConversionWorker._parse_memory_regions(output, parser)
+
+        self.assertEqual(
+            regions,
+            [
+                ("FLASH", 404, 1024 * 1024),
+                ("RAM", 96, 128 * 1024),
+            ],
+        )
+        self.assertEqual(
+            ConversionWorker._parse_memory_usage(output, parser),
+            (404, 1024 * 1024, 96, 128 * 1024),
         )
 
     def test_build_success_message_contains_firmware_memory_and_debug_info(self):
@@ -196,6 +272,29 @@ class MainWindowPathTests(unittest.TestCase):
                 "VS Code 配置: 生成",
             ):
                 self.assertIn(expected, message)
+
+    def test_armclang_build_success_message_reports_axf_firmware(self):
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            build_dir = output / "build"
+            build_dir.mkdir()
+            (build_dir / "firmware.axf").write_bytes(b"firmware")
+            options = GenerationOptions(
+                compiler="armclang", build_dir="build"
+            ).normalized()
+            worker = ConversionWorker(
+                "project.uvprojx", str(output), "", "", options, True
+            )
+            parser = SimpleNamespace(
+                _artifact_name=lambda: "firmware",
+                _selected_probes=lambda _options: [],
+                _selected_debug_backends=lambda _options: [],
+            )
+
+            message = worker._build_success_message(parser, [])
+
+            self.assertIn("firmware.axf", message)
+            self.assertNotIn("firmware.elf", message)
 
 
 if __name__ == "__main__":

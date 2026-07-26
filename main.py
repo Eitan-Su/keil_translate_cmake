@@ -70,6 +70,9 @@ def _resource_path(relative_path: str) -> Path:
     return base_path / relative_path
 
 
+CHECKBOX_CHECK_ICON = _resource_path("assets/checkbox-check.svg").as_posix()
+
+
 APP_STYLE = """
 QWidget {
     color: #17243a;
@@ -174,7 +177,13 @@ QCheckBox::indicator {
     width: 16px; height: 16px; background: #ffffff;
     border: 1px solid #7f93a7; border-radius: 3px;
 }
-QCheckBox::indicator:checked { background: #1387d4; border-color: #1387d4; }
+QCheckBox::indicator:checked {
+    background: #1387d4; border-color: #1387d4;
+    image: url("__CHECKBOX_CHECK_ICON__");
+}
+QCheckBox::indicator:checked:disabled {
+    background: #8bb8d6; border-color: #8bb8d6;
+}
 QFrame#console { background: #ffffff; border-top: 1px solid #aebdcb; }
 QLabel#consoleTitle { color: #22364d; font-family: "Bahnschrift"; font-size: 12px; font-weight: 700; min-height: 20px; }
 QPushButton#consoleButton { color: #63758a; background: transparent; border: none; min-height: 28px; padding: 0 8px; }
@@ -233,7 +242,266 @@ QSplitter::handle:vertical {
 QSplitter::handle:vertical:hover {
     border-top: 1px solid #1688d0;
 }
-"""
+
+/* Warm, editorial surfaces keep the workspace quiet while the action stays visible. */
+QMainWindow { background: #f7f5f0; }
+QWidget#pageSurface { background: #f7f5f0; }
+QFrame#navRail {
+    background: #fffdfa; border-right: 1px solid #e8e1da;
+}
+QFrame#topBar {
+    background: #fffdfa; border-bottom: 1px solid #e8e1da;
+}
+QFrame#statusBar {
+    background: #fffdfa; border-top: 1px solid #e8e1da;
+}
+QLabel#brand {
+    color: #211f1d; font-family: "Aptos Display", "Bahnschrift";
+    font-size: 18px; font-weight: 800; letter-spacing: 1px;
+}
+QLabel#topEyebrow {
+    color: #a58f86; font-family: "Aptos", "Segoe UI Variable";
+    font-size: 9px; font-weight: 700; letter-spacing: 2px;
+}
+QLabel#railCaption { color: #a58f86; }
+QLabel#muted { color: #847b75; }
+QLabel#eyebrow {
+    color: #bd4f6a; font-family: "Aptos", "Segoe UI Variable";
+    font-size: 10px; font-weight: 800; letter-spacing: 1.6px;
+}
+QLabel#section {
+    color: #211f1d; font-family: "Aptos Display", "Bahnschrift";
+    font-size: 16px; font-weight: 750;
+}
+QLabel#fieldLabel {
+    color: #9a8e86; font-family: "Aptos", "Segoe UI Variable";
+    font-size: 9px; font-weight: 800; letter-spacing: 1.1px;
+}
+QPushButton#navButton,
+QPushButton#navButtonActive {
+    min-height: 44px; max-height: 44px; border-radius: 12px;
+    padding: 0 13px; font-family: "Aptos", "Segoe UI Variable";
+    font-size: 11px; font-weight: 750;
+}
+QPushButton#navButton {
+    color: #746b66; background: transparent; border: 1px solid transparent;
+}
+QPushButton#navButton:hover {
+    color: #bd4f6a; background: #fbefef; border-color: #f3dfe0;
+}
+QPushButton#navButtonActive {
+    color: #ffffff; background: #d75874; border: 1px solid #d75874;
+}
+QPushButton#navButtonActive:hover { background: #c94c68; border-color: #c94c68; }
+QLabel#statusPill {
+    color: #3e7b68; background: #e9f4ee; border: 1px solid #cfe7da;
+    border-radius: 14px; padding: 3px 12px; font-size: 10px; font-weight: 800;
+}
+QLabel#statusPill[state="running"] {
+    color: #a66243; background: #fff0e7; border-color: #f4d7c6;
+}
+QLabel#statusPill[state="success"] {
+    color: #3e7b68; background: #e9f4ee; border-color: #cfe7da;
+}
+QLabel#statusPill[state="failed"] {
+    color: #a34d56; background: #fcebed; border-color: #f0cfd3;
+}
+QFrame#pipeline {
+    background: #fffdfa; border: 1px solid #e9e1da; border-radius: 16px;
+}
+QLabel#stageIndex {
+    color: #ffffff; background: #d75874; border-radius: 11px;
+    min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px;
+    font-family: "Aptos", "Segoe UI Variable"; font-size: 10px; font-weight: 800;
+}
+QLabel#stageIndex[state="pending"] { color: #a18f87; background: #eee8e2; }
+QLabel#stageIndex[state="running"] { color: #ffffff; background: #df8a67; }
+QLabel#stageIndex[state="complete"] { color: #ffffff; background: #d75874; }
+QLabel#stageIndex[state="failed"] { color: #ffffff; background: #b95757; }
+QLabel#stageName { color: #312c29; font-size: 11px; font-weight: 750; }
+QLabel#stageName[state="pending"] { color: #a18f87; }
+QLabel#stageName[state="running"] { color: #b9684e; }
+QLabel#stageName[state="complete"] { color: #312c29; }
+QLabel#stageName[state="failed"] { color: #a34d56; }
+QLabel#stageDetail { color: #958a82; font-size: 9px; }
+QFrame#inspector {
+    background: #fffdfa; border-left: 1px solid #e8e1da;
+}
+QScrollArea#inspectorScroll { background: #fffdfa; }
+QFrame#metric {
+    background: #fcfaf7; border: 1px solid #eee6de; border-radius: 12px;
+    min-height: 52px;
+}
+QLabel#metricValue {
+    color: #211f1d; font-family: "Aptos Display", "Bahnschrift";
+    font-size: 14px; font-weight: 800;
+}
+QLineEdit, QComboBox {
+    min-height: 38px; color: #302b28; background: #fffefa;
+    border: 1px solid #ded5cd; border-radius: 10px; padding: 0 12px;
+    selection-background-color: #f1cbd2;
+}
+QLineEdit:hover, QComboBox:hover { border-color: #cdbdb3; background: #ffffff; }
+QLineEdit:focus, QComboBox:focus {
+    border: 2px solid #d75874; padding: 0 11px; background: #ffffff;
+}
+QComboBox::drop-down { border: none; width: 28px; }
+QAbstractItemView {
+    color: #302b28; background: #fffefa; border: 1px solid #ded5cd;
+    selection-color: #ffffff; selection-background-color: #d75874;
+    outline: none; padding: 5px; border-radius: 8px;
+}
+QAbstractItemView::item { min-height: 30px; padding: 5px 9px; }
+QAbstractItemView::item:hover { color: #9d4058; background: #fbedef; }
+QAbstractItemView::item:selected { color: #ffffff; background: #d75874; }
+QPushButton {
+    min-height: 38px; color: #514742; background: #fffefa;
+    border: 1px solid #ded5cd; border-radius: 10px; padding: 0 15px;
+    font-family: "Aptos", "Segoe UI Variable"; font-weight: 700;
+}
+QPushButton:hover { color: #a83f5b; background: #fbedef; border-color: #e2b7c0; }
+QPushButton:pressed { background: #f6e2e5; }
+QPushButton#primary {
+    min-height: 42px; color: #ffffff;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #df6a80, stop:1 #c94e69);
+    border: 1px solid #c94e69; border-radius: 12px; padding: 0 22px;
+    font-family: "Aptos Display", "Bahnschrift"; font-size: 13px; font-weight: 800;
+}
+QPushButton#primary:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #d95c76, stop:1 #ba3f5c);
+    border-color: #ba3f5c;
+}
+QPushButton#primary:disabled { color: #f8e8eb; background: #dba3b0; border-color: #dba3b0; }
+QCheckBox { spacing: 8px; color: #665b56; font-weight: 650; }
+QCheckBox::indicator {
+    width: 17px; height: 17px; background: #fffefa;
+    border: 1px solid #d4c8c0; border-radius: 5px;
+}
+QCheckBox::indicator:checked { background: #d75874; border-color: #d75874; }
+QCheckBox::indicator:checked:disabled { background: #dba3b0; border-color: #dba3b0; }
+QFrame#console { background: #fffdfa; border-top: 1px solid #e8e1da; }
+QLabel#consoleTitle {
+    color: #312c29; font-family: "Aptos Display", "Bahnschrift";
+    font-size: 13px; font-weight: 750;
+}
+QPushButton#consoleButton {
+    color: #958a82; background: transparent; border: none; min-height: 30px;
+    padding: 0 9px; border-radius: 8px;
+}
+QPushButton#consoleButton:hover { color: #a83f5b; background: #fbedef; }
+QTextBrowser {
+    color: #3b3531; background: #fbfaf7; border: 1px solid #e8e0d8;
+    border-radius: 10px; padding: 9px 16px;
+    font-family: "Cascadia Mono", "Consolas"; font-size: 11px;
+}
+QProgressBar#mainProgress {
+    min-height: 12px; max-height: 12px; color: #8d716a; background: #f1e5e2;
+    border: none; text-align: center; font-size: 9px; font-weight: 700;
+}
+QProgressBar#mainProgress::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #df8a67, stop:1 #d75874);
+}
+QProgressBar#memoryBar {
+    min-height: 6px; max-height: 6px; background: #f0e8e3;
+    border: none; border-radius: 3px;
+}
+QProgressBar#memoryBar::chunk { background: #d88a72; border-radius: 3px; }
+QScrollArea, QStackedWidget { border: none; background: #f7f5f0; }
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: #d3c5bd; border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: #d75874; }
+QSplitter::handle { background: transparent; }
+QSplitter::handle:horizontal { width: 6px; border-left: 1px solid #eee6de; }
+QSplitter::handle:horizontal:hover { border-left: 1px solid #d75874; }
+QSplitter::handle:vertical { height: 6px; border-top: 1px solid #eee6de; }
+QSplitter::handle:vertical:hover { border-top: 1px solid #d75874; }
+QToolTip {
+    color: #fffefa; background: #312c29; border: 1px solid #312c29;
+    padding: 5px 8px; border-radius: 6px;
+}
+QWidget#topBrand, QSvgWidget#railMark { background: transparent; }
+QPushButton#secondaryButton {
+    min-height: 34px; color: #746b66; background: #fffefa;
+    border-color: #e2d8d0; border-radius: 10px; padding: 0 13px;
+}
+QPushButton#secondaryButton:hover {
+    color: #a83f5b; background: #fbedef; border-color: #e2b7c0;
+}
+QPushButton#fieldButton {
+    min-height: 38px; min-width: 72px; color: #746b66;
+    background: #fffefa; border-color: #ded5cd; border-radius: 10px;
+}
+QPushButton#fieldButton:hover {
+    color: #a83f5b; background: #fbedef; border-color: #e2b7c0;
+}
+/* Use installed system faces and point sizes so glyphs stay stable under DPI scaling. */
+QWidget {
+    color: #211f1d;
+    font-family: "Segoe UI", "Microsoft YaHei UI";
+    font-size: 10pt;
+}
+QLabel#brand {
+    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
+    font-size: 16pt; font-weight: 700; letter-spacing: 0px;
+}
+QLabel#topEyebrow {
+    font-family: "Segoe UI", "Microsoft YaHei UI";
+    font-size: 8pt; font-weight: 600; letter-spacing: 1px;
+}
+QLabel#railCaption {
+    font-family: "Segoe UI", "Microsoft YaHei UI";
+    font-size: 8pt; font-weight: 600;
+}
+QLabel#eyebrow {
+    font-family: "Segoe UI", "Microsoft YaHei UI";
+    font-size: 9pt; font-weight: 700; letter-spacing: 1px;
+}
+QLabel#section {
+    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
+    font-size: 14pt; font-weight: 600; letter-spacing: 0px;
+}
+QLabel#fieldLabel {
+    font-family: "Segoe UI", "Microsoft YaHei UI";
+    font-size: 9pt; font-weight: 600; letter-spacing: 0px;
+}
+QLabel#muted { font-size: 10pt; }
+QPushButton#navButton,
+QPushButton#navButtonActive {
+    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
+    font-size: 10pt; font-weight: 600;
+}
+QLabel#statusPill { font-size: 9pt; font-weight: 700; }
+QLabel#stageIndex {
+    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
+    font-size: 9pt; font-weight: 700;
+}
+QLabel#stageName { font-size: 10pt; font-weight: 600; }
+QLabel#stageDetail { font-size: 9pt; }
+QLabel#metricValue {
+    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
+    font-size: 11pt; font-weight: 700;
+}
+QLineEdit, QComboBox { font-size: 10pt; }
+QPushButton { font-size: 10pt; font-weight: 600; }
+QPushButton#primary {
+    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
+    font-size: 11pt; font-weight: 700;
+}
+QCheckBox { font-size: 10pt; font-weight: 600; }
+QLabel#consoleTitle {
+    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
+    font-size: 10pt; font-weight: 600;
+}
+QTextBrowser {
+    font-family: "Cascadia Mono", "Consolas", "Courier New";
+    font-size: 9pt;
+}
+QProgressBar#mainProgress { font-size: 9pt; }
+""".replace("__CHECKBOX_CHECK_ICON__", CHECKBOX_CHECK_ICON)
 
 
 class PathHistoryEdit(QLineEdit):
@@ -308,7 +576,7 @@ class ConversionWorker(QObject):
         return int(float(value) * factors.get(unit.upper(), 1))
 
     @classmethod
-    def _parse_memory_regions(cls, output):
+    def _parse_memory_regions(cls, output, parser=None):
         values = []
         pattern = re.compile(
             r"^\s*([A-Za-z_][A-Za-z0-9_.-]*):\s+([0-9.]+)\s+(B|KB|MB)\s+"
@@ -323,13 +591,35 @@ class ConversionWorker(QObject):
                     cls._memory_bytes(match.group(4), match.group(5)),
                 )
             )
+        if values:
+            return values
+
+        armclang_size = re.search(
+            r"Program\s+Size:\s*Code\s*=\s*(\d+)\s+"
+            r"RO-data\s*=\s*(\d+)\s+RW-data\s*=\s*(\d+)\s+"
+            r"ZI-data\s*=\s*(\d+)",
+            output or "",
+            re.IGNORECASE,
+        )
+        if armclang_size:
+            code, ro_data, rw_data, zi_data = map(
+                int, armclang_size.groups()
+            )
+            flash_total = int(getattr(parser, "flash_length", 0) or 0)
+            ram_total = int(getattr(parser, "ram_length", 0) or 0)
+            values.extend(
+                [
+                    ("FLASH", code + ro_data + rw_data, flash_total),
+                    ("RAM", rw_data + zi_data, ram_total),
+                ]
+            )
         return values
 
     @classmethod
     def _parse_memory_usage(cls, output, parser):
         values = {
             name.upper(): (used, total)
-            for name, used, total in cls._parse_memory_regions(output)
+            for name, used, total in cls._parse_memory_regions(output, parser)
         }
 
         flash_used, flash_total = values.get(
@@ -352,9 +642,14 @@ class ConversionWorker(QObject):
     def _build_success_message(self, parser, memory_regions):
         build_dir = Path(self.output_dir) / str(self.options.build_dir)
         artifact_name = parser._artifact_name()
+        artifact_suffixes = (
+            (".elf", ".hex", ".bin")
+            if self.options.compiler == "gcc"
+            else (".axf",)
+        )
         firmware_files = [
             build_dir / f"{artifact_name}{suffix}"
-            for suffix in (".elf", ".hex", ".bin")
+            for suffix in artifact_suffixes
         ]
         firmware_lines = [
             f"{path.name}: {self._format_size(path.stat().st_size)}"
@@ -485,12 +780,17 @@ class ConversionWorker(QObject):
                     for part in (report.build.stdout, report.build.stderr)
                     if part
                 )
-                memory_regions = self._parse_memory_regions(build_output)
+                memory_regions = self._parse_memory_regions(build_output, parser)
                 self.memory_usage.emit(*self._parse_memory_usage(build_output, parser))
                 success_message = self._build_success_message(
                     parser, memory_regions
                 )
-                self.log.emit("构建验证通过，ELF、HEX、BIN 产物生成完成。")
+                artifact_labels = (
+                    "ELF、HEX、BIN" if self.options.compiler == "gcc" else "AXF"
+                )
+                self.log.emit(
+                    f"构建验证通过，{artifact_labels} 产物生成完成。"
+                )
 
             self.progress.emit(100, "转换完成")
             validation_seconds = (
@@ -529,6 +829,7 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.stage_badges = []
         self.stage_names = []
+        self.stage_details = []
         self.current_stage = 0
         self.validation_started = None
         self.validation_timer = QTimer(self)
@@ -561,6 +862,7 @@ class MainWindow(QMainWindow):
         rail_layout.setSpacing(8)
 
         rail_mark = QSvgWidget(str(_resource_path("assets/keilforge-mark.svg")))
+        rail_mark.setObjectName("railMark")
         rail_mark.setFixedSize(48, 48)
         rail_layout.addWidget(rail_mark, 0, Qt.AlignmentFlag.AlignHCenter)
         rail_layout.addSpacing(18)
@@ -590,23 +892,38 @@ class MainWindow(QMainWindow):
         shell_layout.setSpacing(0)
 
         top_bar = QFrame(objectName="topBar")
-        top_bar.setFixedHeight(58)
+        top_bar.setFixedHeight(66)
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(18, 0, 18, 0)
         top_layout.setSpacing(12)
 
+        self.top_brand = QWidget(objectName="topBrand")
+        brand_layout = QVBoxLayout(self.top_brand)
+        brand_layout.setContentsMargins(0, 0, 0, 0)
+        brand_layout.setSpacing(0)
+        brand_layout.addWidget(QLabel("KEIL FORGE", objectName="brand"))
+        brand_layout.addWidget(QLabel("PROJECT CONVERTER", objectName="topEyebrow"))
+        top_layout.addWidget(self.top_brand)
         top_layout.addStretch(1)
         self.status_pill = QLabel("就绪", objectName="statusPill")
         self.status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_pill.setFixedHeight(37)
+        self.status_pill.setFixedHeight(34)
         self.status_pill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         top_layout.addWidget(self.status_pill)
-        self.open_output_button = QPushButton("打开输出目录")
-        self.open_output_button.setFixedHeight(37)
+        self.open_output_button = QPushButton("打开输出目录", objectName="secondaryButton")
+        self.open_output_button.setFixedHeight(38)
         self.open_output_button.setEnabled(False)
         top_layout.addWidget(self.open_output_button)
+        self.validate_check = QCheckBox(
+            "生成后执行编译验证", objectName="validationCheck"
+        )
+        self.validate_check.setChecked(True)
+        self.validate_check.setToolTip(
+            "勾选后将在 CMake 工程生成完成后执行配置、编译和固件产物检查。"
+        )
+        top_layout.addWidget(self.validate_check)
         self.convert_button = QPushButton("转换并验证", objectName="primary")
-        self.convert_button.setFixedWidth(132)
+        self.convert_button.setFixedWidth(136)
         top_layout.addWidget(self.convert_button)
         shell_layout.addWidget(top_bar)
 
@@ -628,13 +945,15 @@ class MainWindow(QMainWindow):
         self.workspace_splitter.setHandleWidth(6)
         content_scroll = QScrollArea()
         content_scroll.setWidgetResizable(True)
-        content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        content_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         content_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         content = QWidget(objectName="pageSurface")
         content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(20, 16, 20, 18)
-        content_layout.setSpacing(12)
+        content_layout.setContentsMargins(24, 20, 24, 22)
+        content_layout.setSpacing(14)
 
         heading = QHBoxLayout()
         heading_box = QVBoxLayout()
@@ -649,8 +968,8 @@ class MainWindow(QMainWindow):
 
         pipeline = QFrame(objectName="pipeline")
         pipeline_layout = QHBoxLayout(pipeline)
-        pipeline_layout.setContentsMargins(16, 12, 16, 12)
-        pipeline_layout.setSpacing(8)
+        pipeline_layout.setContentsMargins(18, 14, 18, 14)
+        pipeline_layout.setSpacing(9)
         stages = (
             ("1", "INPUT", "uVision 工程"),
             ("2", "RESOLVE", "启动与链接资产"),
@@ -669,13 +988,21 @@ class MainWindow(QMainWindow):
             copy.setSpacing(0)
             name_label = QLabel(name, objectName="stageName")
             name_label.setProperty("state", "complete" if index == 0 else "pending")
+            name_label.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
             copy.addWidget(name_label)
-            copy.addWidget(QLabel(detail, objectName="stageDetail"))
+            detail_label = QLabel(detail, objectName="stageDetail")
+            detail_label.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
+            copy.addWidget(detail_label)
             stage_layout.addWidget(badge)
             stage_layout.addLayout(copy)
             pipeline_layout.addWidget(stage, 1)
             self.stage_badges.append(badge)
             self.stage_names.append(name_label)
+            self.stage_details.append(detail_label)
             if index < len(stages) - 1:
                 arrow = QLabel("›", objectName="muted")
                 arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -687,6 +1014,8 @@ class MainWindow(QMainWindow):
         file_grid = QGridLayout()
         file_grid.setHorizontalSpacing(10)
         file_grid.setVerticalSpacing(7)
+        file_grid.setColumnStretch(0, 1)
+        file_grid.setColumnStretch(1, 0)
         self.project_edit, self.project_button = self._path_field(
             file_grid, 0, "KEIL PROJECT", "选择 .uvprojx 工程"
         )
@@ -714,12 +1043,15 @@ class MainWindow(QMainWindow):
         output_summary_layout.setContentsMargins(16, 12, 16, 12)
         output_summary_layout.setSpacing(4)
         output_summary_layout.addWidget(QLabel("生成内容", objectName="section"))
-        output_summary_layout.addWidget(
-            QLabel(
-                "CMakeLists.txt · GCC 工具链 · VS Code 调试任务 · ELF · HEX · BIN",
-                objectName="muted",
-            )
+        summary_detail = QLabel(
+            "CMakeLists.txt · GCC 工具链 · VS Code 调试任务 · ELF · HEX · BIN",
+            objectName="muted",
         )
+        summary_detail.setWordWrap(True)
+        summary_detail.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        output_summary_layout.addWidget(summary_detail)
         content_layout.addWidget(output_summary)
         content_layout.addStretch(1)
         content_scroll.setWidget(content)
@@ -786,8 +1118,8 @@ class MainWindow(QMainWindow):
         config_page.setWidgetResizable(True)
         config_content = QWidget(objectName="pageSurface")
         config_layout = QVBoxLayout(config_content)
-        config_layout.setContentsMargins(30, 26, 30, 30)
-        config_layout.setSpacing(18)
+        config_layout.setContentsMargins(32, 28, 32, 32)
+        config_layout.setSpacing(16)
         config_layout.addWidget(QLabel("构建配置", objectName="section"))
         config_layout.addWidget(
             QLabel("设置目标编译器、宿主平台和 CMake 构建方式。", objectName="muted")
@@ -815,11 +1147,7 @@ class MainWindow(QMainWindow):
         toggles = QHBoxLayout()
         self.vscode_check = QCheckBox("生成 VS Code 配置与调试任务")
         self.vscode_check.setChecked(True)
-        self.validate_check = QCheckBox("转换后自动编译验证")
-        self.validate_check.setChecked(True)
         toggles.addWidget(self.vscode_check)
-        toggles.addSpacing(20)
-        toggles.addWidget(self.validate_check)
         toggles.addStretch(1)
         config_layout.addLayout(toggles)
         config_layout.addStretch(1)
@@ -830,8 +1158,8 @@ class MainWindow(QMainWindow):
         debug_page.setWidgetResizable(True)
         debug_content = QWidget(objectName="pageSurface")
         debug_layout = QVBoxLayout(debug_content)
-        debug_layout.setContentsMargins(30, 26, 30, 30)
-        debug_layout.setSpacing(18)
+        debug_layout.setContentsMargins(32, 28, 32, 32)
+        debug_layout.setSpacing(16)
         debug_layout.addWidget(QLabel("调试与烧录", objectName="section"))
         debug_layout.addWidget(
             QLabel("生成 VS Code、OpenOCD、J-Link 和探针相关任务。", objectName="muted")
@@ -922,8 +1250,12 @@ class MainWindow(QMainWindow):
     def _path_field(self, grid, row, label, placeholder):
         label_widget = QLabel(label, objectName="fieldLabel")
         edit = PathHistoryEdit()
+        edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        edit.setMinimumWidth(0)
         edit.setPlaceholderText(placeholder)
-        button = QPushButton("浏览")
+        button = QPushButton("浏览", objectName="fieldButton")
         button.setFixedWidth(78)
         grid.addWidget(label_widget, row * 2, 0, 1, 2)
         grid.addWidget(edit, row * 2 + 1, 0)
@@ -947,6 +1279,7 @@ class MainWindow(QMainWindow):
         self.output_button.clicked.connect(self._browse_output)
         self.uv4_button.clicked.connect(self._browse_uv4)
         self.convert_button.clicked.connect(self._start_conversion)
+        self.validate_check.toggled.connect(self._sync_validation_action)
         self.open_output_button.clicked.connect(self._open_output)
         self.clear_log_button.clicked.connect(self.log_browser.clear)
         self.debug_open_output_button.clicked.connect(self._open_output)
@@ -990,10 +1323,34 @@ class MainWindow(QMainWindow):
             return cls.DEFAULT_NAV_WIDTH
         return max(cls.MINIMUM_NAV_WIDTH, min(cls.MAXIMUM_NAV_WIDTH, width))
 
+    @staticmethod
+    def _conversion_action_text(validate_build):
+        return "转换并验证" if validate_build else "仅转换"
+
+    def _sync_validation_action(self, validate_build):
+        self.convert_button.setText(
+            self._conversion_action_text(validate_build)
+        )
+        self.convert_button.setToolTip(
+            "生成 CMake 工程并执行编译验证。"
+            if validate_build
+            else "仅生成 CMake 工程。"
+        )
+
     def _update_compact_layout(self):
         if not hasattr(self, "inspector_scroll"):
             return
         compact = self._is_compact_width(self.width())
+        pipeline_compact = self.width() < 1020
+        self.top_brand.setVisible(not compact)
+        self.open_output_button.setVisible(True)
+        self.open_output_button.setText("目录" if compact else "打开输出目录")
+        self.validate_check.setText(
+            "编译验证" if compact else "生成后执行编译验证"
+        )
+        self.convert_button.setFixedWidth(108 if compact else 136)
+        for detail in self.stage_details:
+            detail.setVisible(not pipeline_compact)
         self.inspector_scroll.setVisible(not compact)
         if compact:
             self.nav_splitter.setSizes(
@@ -1256,6 +1613,7 @@ class MainWindow(QMainWindow):
         self._remember_path(self.output_edit, output_dir)
         self._save_config()
         self.convert_button.setEnabled(False)
+        self.validate_check.setEnabled(False)
         self.open_output_button.setEnabled(False)
         self._set_status("转换中", "running")
         self.inspector_status.setText("正在转换")
@@ -1301,6 +1659,15 @@ class MainWindow(QMainWindow):
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
 
+    @staticmethod
+    def _completion_status(success, validation_seconds):
+        validation_completed = validation_seconds >= 0
+        if success:
+            text = "构建通过" if validation_completed else "转换完成"
+        else:
+            text = "构建失败" if validation_completed else "转换失败"
+        return text, validation_completed
+
     @Slot(bool, str, str, float)
     def _conversion_finished(self, success, message, output_dir, validation_seconds):
         self._stop_validation_timer(validation_seconds)
@@ -1312,15 +1679,25 @@ class MainWindow(QMainWindow):
         else:
             self.progress.setFormat(f"{self.progress.value()}% · 转换失败")
         self.convert_button.setEnabled(True)
+        self.validate_check.setEnabled(True)
         self.open_output_button.setEnabled(bool(output_dir))
         self._set_status(
             "成功" if success else "失败",
             "success" if success else "failed",
         )
-        self.inspector_status.setText("构建通过" if success else "转换失败")
+        inspector_text, validation_completed = self._completion_status(
+            success, validation_seconds
+        )
+        self.inspector_status.setText(inspector_text)
         if success:
             for index in range(len(self.stage_badges)):
-                self._set_stage_state(index, "complete")
+                state = (
+                    "pending"
+                    if index == len(self.stage_badges) - 1
+                    and not validation_completed
+                    else "complete"
+                )
+                self._set_stage_state(index, state)
         else:
             self._set_stage_state(self.current_stage, "failed")
             if self.flash_usage_label.text() == "正在构建":
@@ -1494,7 +1871,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(str(_resource_path("assets/keilforge-app-icon.svg"))))
     app.setStyle("Fusion")
-    app.setFont(QFont("Segoe UI Variable", 10))
+    app.setFont(QFont("Segoe UI", 10))
     app.setStyleSheet(APP_STYLE)
     window = MainWindow()
     window.show()
