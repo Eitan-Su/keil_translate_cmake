@@ -1073,7 +1073,11 @@ class KeilProjectToCMake:
                     # 根据文件类型分类
                     file_ext = os.path.splitext(file_path)[1].lower()
 
-                    if file_ext in [
+                    if file_type == "3" and self._arm_linker_symdefs_content(
+                        Path(file_path)
+                    ) is not None:
+                        self.linker_inputs.append(file_path)
+                    elif file_ext in [
                         ".c",
                         ".cpp",
                         ".cc",
@@ -2215,6 +2219,9 @@ class KeilProjectToCMake:
         return f"{self._cmake_target_name()}_artifacts"
 
     def _map_source_for_gcc(self, source_path: str) -> str:
+        gcc_port = self._gcc_freertos_port(Path(source_path))
+        if gcc_port != Path(source_path):
+            return str(gcc_port)
         normalized = Path(source_path).as_posix()
         if "/startup/mdk/" in normalized:
             candidate = Path(
@@ -2223,6 +2230,31 @@ class KeilProjectToCMake:
             if candidate.exists():
                 return str(candidate)
         return source_path
+
+    def _gcc_freertos_port(self, path: Path) -> Path:
+        port_dir = (
+            path.parent if path.name.lower() in {"port.c", "portmacro.h"} else path
+        )
+        if (
+            port_dir.parent.name.lower() != "rvds"
+            or port_dir.parent.parent.name.lower() != "portable"
+        ):
+            return path
+        portable = port_dir.parent.parent
+        if not (portable.parent / "include" / "FreeRTOS.h").is_file():
+            return path
+        for compiler_dir in ("GCC", "gcc"):
+            candidate = portable / compiler_dir / port_dir.name
+            # 仅采用同一内核中源文件和头文件完整的 GCC 移植层。
+            if all((candidate / name).is_file() for name in ("port.c", "portmacro.h")):
+                self._append_warning_once(
+                    f"FreeRTOS GCC 移植层替换: {port_dir} -> {candidate}"
+                )
+                return candidate / path.name if port_dir != path else candidate
+        self._append_warning_once(
+            f"FreeRTOS GCC 移植层缺失或文件不完整，保留原输入: {port_dir}"
+        )
+        return path
 
     def _gcc_source_files(self) -> List[str]:
         mapped: List[str] = []
@@ -2837,6 +2869,35 @@ class KeilProjectToCMake:
             )
         return patched, replaced == len(replacements)
 
+    def _patch_freertos_port_includes(
+        self, content: str, source_path: Path, staged_dir: Path
+    ) -> str:
+        if "portable" not in content.lower() or "port.c" not in content.lower():
+            return content
+        include_pattern = re.compile(
+            r'(?m)^[ \t]*#[ \t]*include[ \t]+"(?P<path>[^"\r\n]+)"'
+        )
+        sanitized = self._mask_c_comments_and_literals(content)
+        patched = content
+        for match in reversed(list(include_pattern.finditer(content))):
+            if not sanitized[match.start() : match.end()].lstrip().startswith("#"):
+                continue
+            included = match.group("path").replace("\\", "/")
+            original = self._resolved_path(source_path.parent / included)
+            if original.name.lower() != "port.c":
+                continue
+            gcc_port = self._gcc_freertos_port(original)
+            if gcc_port == original:
+                continue
+            # 生成副本中的相对包含目录以副本所在目录为基准。
+            replacement = self._normalize_path(str(gcc_port), str(staged_dir))
+            patched = (
+                patched[: match.start("path")]
+                + replacement
+                + patched[match.end("path") :]
+            )
+        return patched
+
     def _stage_gcc_source_file(self, source_path: Path, dest: str) -> str:
         try:
             resolved_source = self._resolved_path(source_path)
@@ -2864,7 +2925,9 @@ class KeilProjectToCMake:
                 )
                 if self._generation_source_analysis is not None:
                     self._analyze_source_file(source_path, original_content)
-                content = original_content
+                content = self._patch_freertos_port_includes(
+                    original_content, source_path, staged_dir
+                )
                 normalized_source = source_path.as_posix().lower()
                 if (
                     source_path.name.lower() == "port.c"
@@ -3092,7 +3155,9 @@ class KeilProjectToCMake:
         self._missing_source_cache[cache_key] = None
         return source_path
 
-    def _prepared_gcc_source_files(self, dest: str) -> List[str]:
+    def _prepared_gcc_source_files(
+        self, dest: str, startup_replacements: Optional[Dict[str, Path]] = None
+    ) -> List[str]:
         prepared: List[str] = []
         self._prepared_source_origins = {}
         sources = self._gcc_source_files()
@@ -3127,6 +3192,8 @@ class KeilProjectToCMake:
                 ] = source_control_key
 
             source_path = self._resolve_missing_source(Path(source))
+            if startup_replacements and str(source_path) in startup_replacements:
+                source_path = startup_replacements[str(source_path)]
             if source_path.name.lower().endswith("_keil.c"):
                 gcc_name = source_path.name[:-7] + "_gcc.c"
                 gcc_alternative = source_path.with_name(gcc_name)
@@ -3427,6 +3494,10 @@ class KeilProjectToCMake:
                 "generated",
                 "exact",
                 f"Converted ARM Linker SYMDEFS: {input_path}",
+            )
+            self._append_warning_once(
+                f"SYMDEFS 固定地址符号来自 {input_path}；"
+                "需与提供这些符号的实际固件地址及 ABI 一致"
             )
         return fragments
 
@@ -3925,7 +3996,9 @@ class KeilProjectToCMake:
     def _prepared_gcc_include_paths(self, dest: str) -> List[str]:
         return self._dedupe_keep_order(
             [
-                self._stage_gcc_include_directory(Path(include_path), dest)
+                self._stage_gcc_include_directory(
+                    self._gcc_freertos_port(Path(include_path)), dest
+                )
                 for include_path in self._ordered_include_paths()
             ]
         )
@@ -5063,6 +5136,70 @@ SECTIONS
 """
         self._write_text_file(fallback_path, content)
         return str(fallback_path.resolve(strict=False))
+
+    def _read_slib_layout(self):
+        if not self.linker_script or not self._clean_device_name().upper().startswith("AT32F415"):
+            return None
+        scatter = Path(self.linker_script)
+        if not scatter.is_file() or scatter.suffix.lower() != ".sct":
+            return None
+        text = scatter.read_text(encoding="utf-8")
+        has_regions = re.search(
+            r"\b(?:LR|ER)_SLIB_", re.sub(r";[^\r\n]*", "", text), re.I
+        )
+        has_symbols = any(
+            self._arm_linker_symdefs_content(Path(path)) is not None
+            for path in self.linker_inputs
+        )
+        if not has_regions and not (has_symbols and re.search(r"\bSLIB\b", text, re.I)):
+            return None
+        from slib_layout import parse_layout, read_symdefs
+
+        export_flag = self._extract_first_flag(self.linker_flags, "--symdefs=")
+        if export_flag:
+            symbol_file = Path(export_flag.split("=", 1)[1].strip('"'))
+            if not symbol_file.is_absolute():
+                symbol_file = Path(self.project_dir) / symbol_file
+            symbols = read_symdefs(symbol_file.read_text(encoding="utf-8"))
+        else:
+            symbol_files = [Path(path) for path in self.linker_inputs
+                            if self._arm_linker_symdefs_content(Path(path)) is not None]
+            if len(symbol_files) != 1:
+                raise ValueError("SLIB 调用工程需要唯一的函数符号表")
+            symbols = read_symdefs(symbol_files[0].read_text(encoding="utf-8"))
+        if None in (self.flash_origin, self.flash_length, self.ram_origin, self.ram_length):
+            raise ValueError("SLIB 转换需要完整的器件 Flash 与 RAM 容量")
+        return parse_layout(text, symbols, (self.flash_origin, self.flash_length),
+                            (self.ram_origin, self.ram_length))
+
+    def _prepare_slib_sources(self, layout, source_files: List[str], dest: str,
+                              linker_script: str) -> List[str]:
+        from slib_layout import render_linker, runtime_source
+
+        objects: Dict[str, str] = {}
+        protected: List[str] = []
+        selected = set(layout.code_objects + layout.data_objects + layout.ram_objects)
+        for source in source_files:
+            origin = self._prepared_source_origins.get(self._source_control_key(source), source)
+            name = Path(origin).stem.lower()
+            if name not in selected:
+                continue
+            if name in objects:
+                raise ValueError(f"SLIB SCT 对象对应多个源文件: {name}")
+            objects[name] = Path(source).name
+            if name in layout.code_objects:
+                protected.append(source)
+        if set(objects) != selected:
+            raise ValueError(f"SLIB SCT 对象缺少源文件: {sorted(selected - set(objects))}")
+        linker = Path(linker_script)
+        self._write_text_file(linker, render_linker(layout, linker.read_text(encoding="utf-8"), objects))
+        runtime = Path(dest) / "cmake" / "sources" / "slib_ram_init.c"
+        self._write_text_file(runtime, runtime_source(layout))
+        source_files.append(str(runtime.resolve()))
+        self._record_asset("slib_layout", linker, "generated", "review_required",
+                           f"Converted static SLIB regions and fixed entry contract from {self.linker_script}")
+        self._append_warning_once("SLIB 分区与专用 RAM 按 SCT 生成，函数入口由链接器校验")
+        return protected
 
     def _extract_first_flag(self, flags: List[str], prefix: str) -> Optional[str]:
         for flag in self._flatten_flags(flags):
@@ -6847,7 +6984,7 @@ SECTIONS
                 prepared_include = include_path
                 if compiler == "gcc":
                     prepared_include = self._stage_gcc_include_directory(
-                        Path(include_path), dest
+                        self._gcc_freertos_port(Path(include_path)), dest
                     )
                 if compiler == "gcc":
                     include_reference = self._portable_cmake_reference(
@@ -6971,6 +7108,14 @@ SECTIONS
             f.write(f'    "{self._normalize_path(source_file, dest)}"\n')
         f.write(")\n\n")
 
+        for linker_input in self._dedupe_keep_order(self.linker_inputs):
+            reference = self._cmake_escape_argument(
+                self._normalize_path(linker_input, dest)
+            )
+            f.write(
+                f'set_source_files_properties("{reference}" PROPERTIES '
+                'EXTERNAL_OBJECT TRUE)\n'
+            )
         f.write(f"add_executable({cmake_target} ${{SOURCES}})\n")
         f.write(
             f'set_target_properties({cmake_target} PROPERTIES\n'
@@ -7026,7 +7171,29 @@ SECTIONS
         cmake_target = self._cmake_target_name()
         artifacts_target = self._cmake_artifacts_target_name()
         self._add_gcc_device_assets()
-        linker_script = self._guess_gcc_linker_script(dest)
+        slib_layout = self._read_slib_layout()
+        startup_replacements: Dict[str, Path] = {}
+        gd32_assets = None
+        if self._clean_device_name().upper().startswith("GD32"):
+            from gd32_assets import select_assets
+
+            sources = [self._resolve_missing_source(Path(s)) for s in self._gcc_source_files()]
+            startups = [s for s in sources if s.stem.lower().startswith("startup_gd32")]
+            if len(startups) != 1:
+                raise ValueError("GD32: exactly one SDK startup source is required")
+            original = startups[0]
+            gd32_assets = select_assets(
+                self._clean_device_name(), self.uvprojx_path, self.target_name, sources,
+                original, self._parse_armasm_vector_entries(original), self._gcc_stack_heap_sizes(),
+            )
+            startup_replacements[str(original)] = gd32_assets.startup
+            linker_script = str(gd32_assets.linker)
+            self.warnings.extend(gd32_assets.notes)
+        else:
+            linker_script = (
+                self._generate_fallback_gcc_linker_script(dest)
+                if slib_layout else self._guess_gcc_linker_script(dest)
+            )
         if linker_script is None:
             linker_script = self._generate_fallback_gcc_linker_script(dest)
         if linker_script is None:
@@ -7036,7 +7203,13 @@ SECTIONS
 
         linker_path = Path(linker_script)
         linker_source = self._asset_source(linker_path, Path(dest))
-        if linker_source == "generated":
+        if gd32_assets:
+            linker_support = "review_required"
+            linker_reason = "Matched GD32 SDK startup and device linker; preserved Keil target memory and fixed sections"
+        elif slib_layout:
+            linker_support = "review_required"
+            linker_reason = "Generated from the original AT32 SLIB scatter layout and symbol contract"
+        elif linker_source == "generated":
             linker_support = "review_required"
             linker_reason = "Generated from the first uvprojx FLASH and RAM regions"
         else:
@@ -7050,6 +7223,8 @@ SECTIONS
             linker_reason,
         )
         linker_script = self._prepare_gcc_linker_script(linker_script, dest)
+        if gd32_assets:
+            self._write_text_file(Path(linker_script), gd32_assets.content)
 
         languages = self._project_languages()
         self._write_cmake_header(
@@ -7064,9 +7239,12 @@ SECTIONS
             "链接脚本",
         )
         artifact_name = self._artifact_name()
-        source_files = self._prepared_gcc_source_files(dest)
+        source_files = self._prepared_gcc_source_files(dest, startup_replacements)
         source_files.extend(self._gcc_linker_object_inputs())
         source_files = self._dedupe_keep_order(source_files)
+        slib_sources = self._prepare_slib_sources(
+            slib_layout, source_files, dest, linker_script
+        ) if slib_layout else []
         self._emit_generation_progress(62, "生成运行时兼容文件")
         runtime_compat_source = self._generate_gcc_runtime_compat_source(
             dest, linker_script
@@ -7315,6 +7493,30 @@ endif()
         if uses_scanf_float:
             f.write("    -u _scanf_float\n")
         f.write(")\n\n")
+
+        for source in slib_sources:
+            reference = self._portable_cmake_reference(source, dest, "SLIB 源文件")
+            f.write(f'set_property(SOURCE "{reference}" APPEND PROPERTY COMPILE_OPTIONS\n'
+                    '    -mpure-code -fno-jump-tables -fno-lto)\n')
+        if slib_layout:
+            f.write(f'set_property(TARGET {cmake_target} APPEND PROPERTY LINK_DEPENDS "${{LINKER_SCRIPT}}"\n')
+            for fragment in symbol_fragments:
+                reference = self._portable_cmake_reference(fragment, dest, "SLIB 符号表")
+                f.write(f'    "{reference}"\n')
+            f.write(")\n")
+        if slib_layout and slib_layout.producer:
+            from slib_layout import export_check_script
+
+            script = Path(dest) / "cmake" / "linker" / "check_slib_exports.cmake"
+            self._write_text_file(script, export_check_script(slib_layout.symbols))
+            f.write(f'''add_custom_command(TARGET {cmake_target} POST_BUILD
+    COMMAND "${{CMAKE_COMMAND}}" "-DNM=${{CMAKE_NM}}"
+        "-DELF=$<TARGET_FILE:{cmake_target}>" "-DOUTPUT_DIR=${{CMAKE_CURRENT_BINARY_DIR}}"
+        -P "${{CMAKE_CURRENT_LIST_DIR}}/cmake/linker/check_slib_exports.cmake"
+    BYPRODUCTS "${{CMAKE_CURRENT_BINARY_DIR}}/slib_exports.symdefs"
+        "${{CMAKE_CURRENT_BINARY_DIR}}/slib_exports.ld"
+    VERBATIM)
+''')
 
         libraries = self._dedupe_keep_order(gcc_libraries + ["m"])
         f.write(f"target_link_libraries({cmake_target} PRIVATE\n")

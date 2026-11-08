@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "sdks": [
+    {
+      "id": "gd32f30x",
+      "version": "3.0.3",
+      "source": {
+        "type": "archive",
+        "url": "https://www.gd32mcu.com/data/documents/toolSoftware/GD32F30x_Firmware_Library_V3.0.3.7z",
+        "sha256": "1cd66b58fc182ee6e2d2d98d78660bb0b822d642489997e9848d5ecb1f6657e1",
+        "format": "7z",
+        "layers": [
+          {
+            "member": "GD32F30x_Firmware_Library_V3.0.3/GD32F30x_Firmware_Library_V3.0.3.7z",
+            "sha256": "6b51dd89352d49b8401ba53808d2cba5a8a9684c728946058150f75ed1934754",
+            "format": "7z"
+          }
+        ],
+        "root": "GD32F30x_Firmware_Library_V3.0.3"
+      },
+      "include": ["**/*.uvprojx", "Template/Keil4_project/Project.uvproj"]
+    },
+    {
+      "id": "gd32e23x",
+      "version": "2.5.0",
+      "source": {
+        "type": "archive",
+        "url": "https://www.gd32mcu.com/data/documents/toolSoftware/GD32E23x_Firmware_Library_V2.5.0.7z",
+        "sha256": "d8357fa1faa9d7ce5115c132f02b5d9fd2dbf5c43809611ab38f98bb736ef0ab",
+        "format": "7z",
+        "layers": [
+          {
+            "member": "GD32E23x_Firmware_Library_V2.5.0/GD32E23x_Firmware_Library_V2.5.0.7z",
+            "sha256": "00f5957965e607b388406013fe3eb86235453e23c0313813f636eca27ef72804",
+            "format": "7z"
+          }
+        ],
+        "root": "GD32E23x_Firmware_Library_V2.5.0"
+      }
+    },
+    {
+      "id": "at32f415",
+      "version": "2.1.8",
+      "source": {"type": "local", "root_env": "AT32F415_SDK"}
+    }
+  ]
+}

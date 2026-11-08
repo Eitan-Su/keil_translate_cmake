@@ -3164,6 +3164,172 @@ class KeilToCMakeTests(unittest.TestCase):
                 user_cmake.read_text(encoding="utf-8"), "user content\n"
             )
 
+    @staticmethod
+    def _write_freertos_ports(root: Path) -> tuple[Path, Path]:
+        kernel = root / "FreeRTOS" / "Source"
+        (kernel / "include").mkdir(parents=True)
+        (kernel / "include" / "FreeRTOS.h").write_text("/* FreeRTOS */\n")
+        ports = [kernel / "portable" / name / "ARM_CM3" for name in ("RVDS", "GCC")]
+        for port in ports:
+            port.mkdir(parents=True)
+            (port / "port.c").write_text('#include "portmacro.h"\n')
+            (port / "portmacro.h").write_text("#define portSTACK_TYPE unsigned long\n")
+        return ports[0], ports[1]
+
+    def test_freertos_wrapper_uses_gcc_port_without_changing_original(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            rvds, gcc = self._write_freertos_ports(root)
+            wrapper = root / "Src" / "include_port.c"
+            original = (
+                "#if (__ARMCC_VERSION > 6000000)\n"
+                '#include "../FreeRTOS/Source/portable/GCC/ARM_CM3/port.c"\n'
+                "#else\n"
+                '#include "..\\FreeRTOS\\Source\\portable\\RVDS\\ARM_CM3\\port.c"\n'
+                "#endif\n"
+                "int wrapper_value = 7;\n"
+            )
+            wrapper.write_text(original, encoding="utf-8")
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            parser.source_files.append(str(wrapper))
+            parser._add_include_path(str(rvds))
+            for iteration in range(2):
+                output = root / f"gcc-{iteration}"
+                self.assertTrue(parser.generate_cmake(
+                    str(output), False, GenerationOptions(compiler="gcc")
+                ), parser.last_error)
+                staged = next((output / "cmake" / "sources").glob("include_port_*.c"))
+                content = staged.read_text(encoding="utf-8")
+                included = content.split("#else\n", 1)[1].split('"')[1]
+                self.assertEqual((staged.parent / included).resolve(), gcc / "port.c")
+                self.assertIn("int wrapper_value = 7;", content)
+                self.assertNotIn("#define __ARMCC_VERSION", content)
+                cmake = (output / "CMakeLists.txt").read_text(encoding="utf-8")
+                self.assertIn("portable/GCC/ARM_CM3", cmake)
+                self.assertNotIn("portable/RVDS/ARM_CM3", cmake)
+                self.assertNotIn("-D__ARMCC_VERSION", cmake)
+                self.assertIn(str(rvds), parser.include_paths)
+            self.assertEqual(wrapper.read_text(encoding="utf-8"), original)
+            armclang = io.StringIO()
+            parser._write_armclang_cmake_content(
+                armclang, str(root / "armclang"), GenerationOptions(compiler="armclang")
+            )
+            self.assertIn("portable/RVDS/ARM_CM3", armclang.getvalue())
+            self.assertIn("include_port.c", armclang.getvalue())
+
+    def test_freertos_source_and_file_local_includes_use_matching_gcc_port(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rvds, gcc = self._write_freertos_ports(root)
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            source = str(rvds / "port.c")
+            parser.source_files = [source]
+            parser.source_compile_settings[parser._source_control_key(source)] = (
+                SourceCompileSettings(
+                    macro_actions={"PORT_CONFIG": "PORT_CONFIG=3"},
+                    include_paths=[str(rvds)],
+                )
+            )
+            output = root / "out"
+            prepared = parser._prepared_gcc_source_files(str(output))
+            self.assertEqual(prepared, [str(gcc / "port.c")])
+            settings = io.StringIO()
+            parser._write_source_compile_settings(settings, prepared, str(output), "gcc")
+            self.assertIn("-DPORT_CONFIG=3", settings.getvalue())
+            self.assertIn("portable/GCC/ARM_CM3", settings.getvalue())
+            self.assertNotIn("portable/RVDS/ARM_CM3", settings.getvalue())
+            self.assertEqual(parser.source_files, [source])
+
+    def test_freertos_mapping_requires_complete_port_in_same_kernel(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for missing in ("port.c", "portmacro.h", "FreeRTOS.h"):
+                with self.subTest(missing=missing):
+                    rvds, gcc = self._write_freertos_ports(root / missing)
+                    if missing == "FreeRTOS.h":
+                        (gcc.parents[2] / "include" / missing).unlink()
+                    else:
+                        (gcc / missing).unlink()
+                    parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+                    self.assertEqual(parser._map_source_for_gcc(str(rvds / "port.c")),
+                                     str(rvds / "port.c"))
+                    parser._add_include_path(str(rvds))
+                    self.assertEqual(parser._prepared_gcc_include_paths(str(root / "out")),
+                                     [str(rvds)])
+
+    def test_freertos_port_includes_ignore_comments_and_unrelated_includes(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_freertos_ports(root)
+            parser = KeilProjectToCMake(str(root / "sample.uvprojx"))
+            content = (
+                "/*\n"
+                '#include "FreeRTOS/Source/portable/RVDS/ARM_CM3/port.c"\n'
+                "*/\n"
+                '#include "unrelated/port.c"\n'
+            )
+            self.assertEqual(parser._patch_freertos_port_includes(
+                content, root / "wrapper.c", root / "out"
+            ), content)
+
+    def test_file_type_three_symdefs_are_linked_for_gcc_and_armclang(self):
+        with TemporaryDirectory() as temp_dir, patch(
+            "keil_to_cmake.find_keil_mdk_root", return_value=None
+        ), patch("keil_to_cmake.get_keil_mdk_info", return_value=None):
+            root = Path(temp_dir)
+            uvprojx = self._write_minimal_project(root)
+            symbols = uvprojx.parent / "fir_filter_symbol.txt"
+            original = (
+                "#<SYMDEFS># ARM Linker\n\n"
+                "0x0803e001 T FIR_lowpass_filter\n"
+                "0x20000000 D shared_data\n"
+            )
+            symbols.write_text(original, encoding="utf-8")
+            tree = ET.parse(uvprojx)
+            files = tree.find(".//Target[TargetName='Second']/Groups/Group/Files")
+            for name, included in ((symbols.name, True), ("disabled.txt", False)):
+                node = ET.SubElement(files, "File")
+                ET.SubElement(node, "FileName").text = name
+                ET.SubElement(node, "FileType").text = "3"
+                ET.SubElement(node, "FilePath").text = name
+                if not included:
+                    (uvprojx.parent / name).write_text(
+                        "#<SYMDEFS>#\n0x08000201 T excluded_symbol\n"
+                    )
+                    option = ET.SubElement(node, "FileOption")
+                    common = ET.SubElement(option, "CommonProperty")
+                    ET.SubElement(common, "IncludeInBuild").text = "0"
+            tree.write(uvprojx, encoding="utf-8", xml_declaration=True)
+            parser = KeilProjectToCMake(str(uvprojx), target_name="Second")
+            self.assertTrue(parser.parse(), parser.last_error)
+            self.assertEqual(parser.linker_inputs, [str(symbols)])
+            output = root / "gcc"
+            self.assertTrue(parser.generate_cmake(
+                str(output), False, GenerationOptions(compiler="gcc")
+            ), parser.last_error)
+            fragments = list((output / "cmake" / "linker" / "symbols").glob("*.ld"))
+            self.assertEqual(len(fragments), 1)
+            self.assertIn("PROVIDE(FIR_lowpass_filter = 0x0803e001);",
+                          fragments[0].read_text(encoding="utf-8"))
+            self.assertIn("PROVIDE(shared_data = 0x20000000);",
+                          fragments[0].read_text(encoding="utf-8"))
+            cmake = (output / "CMakeLists.txt").read_text(encoding="utf-8")
+            self.assertIn(f'/symbols/{fragments[0].name}', cmake)
+            self.assertEqual(parser._gcc_linker_object_inputs(), [])
+            self.assertNotIn("excluded_symbol", cmake)
+            self.assertTrue(any("SYMDEFS" in warning for warning in parser.warnings))
+            armclang = io.StringIO()
+            parser._write_armclang_cmake_content(
+                armclang, str(root / "armclang"), GenerationOptions(compiler="armclang")
+            )
+            self.assertIn("fir_filter_symbol.txt", armclang.getvalue())
+            self.assertIn('PROPERTIES EXTERNAL_OBJECT TRUE)', armclang.getvalue())
+            self.assertEqual(symbols.read_text(encoding="utf-8"), original)
+
     def test_symbol_fragments_use_managed_linker_directory(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
