@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Keil Forge">
   <defs>
     <linearGradient id="forge" x1="10" y1="8" x2="54" y2="56" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#1a8cff"/>
-      <stop offset="1" stop-color="#0757d5"/>
+      <stop offset="0" stop-color="#7f926b"/>
+      <stop offset="1" stop-color="#586f47"/>
     </linearGradient>
   </defs>
   <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#forge)"/>
   <path d="M19 17v30h7V35l11 12h9L32 31l13-14h-9L26 29V17z" fill="#fff"/>
-  <path d="M46 13l1.7 3.3L51 18l-3.3 1.7L46 23l-1.7-3.3L41 18l3.3-1.7z" fill="#9fe7ff"/>
+  <path d="M46 13l1.7 3.3L51 18l-3.3 1.7L46 23l-1.7-3.3L41 18l3.3-1.7z" fill="#dce5cd"/>
 </svg>

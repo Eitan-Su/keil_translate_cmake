@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QObject,
     QPropertyAnimation,
     QSettings,
+    QSize,
     QStringListModel,
     Qt,
     QThread,
@@ -19,10 +20,11 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QDesktopServices, QFont, QIcon
-from PySide6.QtSvgWidgets import QSvgWidget
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QCompleter,
@@ -39,9 +41,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSplitter,
     QStackedWidget,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -73,435 +75,38 @@ def _resource_path(relative_path: str) -> Path:
 CHECKBOX_CHECK_ICON = _resource_path("assets/checkbox-check.svg").as_posix()
 
 
-APP_STYLE = """
-QWidget {
-    color: #17243a;
-    font-family: "Segoe UI Variable", "Microsoft YaHei UI";
-    font-size: 12px;
-}
-QMainWindow { background: #edf2f7; }
-QWidget#pageSurface { background: #edf2f7; }
-QLabel, QCheckBox, QSvgWidget { background: transparent; border: none; }
-QFrame#navRail { background: #ffffff; border-right: 1px solid #b9c6d3; }
-QLabel#railMark {
-    color: #ffffff; background: #126fe8; border-radius: 12px;
-    font-family: "Bahnschrift"; font-size: 21px; font-weight: 800;
-}
-QLabel#railCaption { color: #60748a; font-size: 9px; font-weight: 700; min-height: 14px; }
-QPushButton#navButton {
-    min-height: 46px; max-height: 46px;
-    color: #50657b; background: transparent; border: none; border-radius: 9px;
-    padding: 0 12px; text-align: left; font-size: 11px; font-weight: 700;
-}
-QPushButton#navButton:hover { color: #126fe8; background: #edf5ff; }
-QPushButton#navButtonActive {
-    min-height: 46px; max-height: 46px;
-    color: #ffffff; background: #126fe8; border: none; border-radius: 9px;
-    padding: 0 12px; text-align: left; font-size: 11px; font-weight: 800;
-}
-QFrame#topBar { background: #ffffff; border-bottom: 1px solid #b8c5d2; }
-QFrame#statusBar { background: #ffffff; border-top: 1px solid #b8c5d2; }
-QLabel#brand { color: #10233c; font-family: "Bahnschrift"; font-size: 22px; font-weight: 800; }
-QLabel#eyebrow { color: #1688d0; font-family: "Bahnschrift"; font-size: 10px; font-weight: 800; }
-QLabel#muted { color: #52677d; min-height: 18px; }
-QLabel#section { color: #142842; font-family: "Bahnschrift"; font-size: 15px; font-weight: 700; min-height: 22px; }
-QLabel#fieldLabel { color: #4f6378; font-size: 10px; font-weight: 700; min-height: 16px; }
-QLabel#statusPill {
-    color: #08785f; background: #e5f7f1; border: 1px solid #b9e6d9;
-    border-radius: 10px; padding: 3px 10px; font-size: 10px; font-weight: 800;
-}
-QLabel#statusPill[state="running"] {
-    color: #0b6c91; background: #e4f5fb; border-color: #b6deec;
-}
-QLabel#statusPill[state="success"] {
-    color: #08785f; background: #e5f7f1; border-color: #b9e6d9;
-}
-QLabel#statusPill[state="failed"] {
-    color: #9b3b3b; background: #fff0ef; border-color: #efc7c3;
-}
-QFrame#pipeline {
-    background: #f8fbfe; border: 1px solid #aebfd0; border-radius: 10px;
-}
-QFrame#stage { background: transparent; border: none; }
-QLabel#stageIndex {
-    color: #ffffff; background: #1688d0; border-radius: 10px;
-    min-width: 20px; max-width: 20px; min-height: 20px; max-height: 20px;
-    font-family: "Bahnschrift"; font-size: 10px; font-weight: 800;
-}
-QLabel#stageIndex[state="pending"] { color: #668096; background: #dbe7f0; }
-QLabel#stageIndex[state="running"] { color: #ffffff; background: #18a8c9; }
-QLabel#stageIndex[state="complete"] { color: #ffffff; background: #1688d0; }
-QLabel#stageIndex[state="failed"] { color: #ffffff; background: #c94b4b; }
-QLabel#stageName { color: #203954; font-size: 11px; font-weight: 700; }
-QLabel#stageName[state="pending"] { color: #71879a; }
-QLabel#stageName[state="running"] { color: #087da8; }
-QLabel#stageName[state="complete"] { color: #203954; }
-QLabel#stageName[state="failed"] { color: #a63f3f; }
-QLabel#stageName { min-height: 18px; }
-QLabel#stageDetail { color: #5d7389; font-size: 9px; min-height: 14px; }
-QFrame#inspector { background: #ffffff; border-left: 1px solid #aebdcb; }
-QScrollArea#inspectorScroll { background: #ffffff; border: none; }
-QFrame#metric { background: #f8fafc; border: 1px solid #aebdcb; border-radius: 8px; min-height: 52px; }
-QLabel#metricValue { color: #142b48; font-family: "Bahnschrift"; font-size: 14px; font-weight: 800; min-height: 20px; }
-QLineEdit, QComboBox {
-    min-height: 35px; color: #1d3048; background: #ffffff;
-    border: 1px solid #8296aa; border-radius: 6px; padding: 0 10px;
-    selection-background-color: #b9def5;
-}
-QLineEdit:hover, QComboBox:hover { border-color: #587a99; background: #fbfdff; }
-QLineEdit:focus, QComboBox:focus { border: 2px solid #0878c9; padding: 0 9px; }
-QComboBox::drop-down { border: none; width: 26px; }
-QAbstractItemView {
-    color: #1d3048; background: #ffffff; border: 1px solid #8296aa;
-    selection-color: #075f9d; selection-background-color: #dceefa;
-    outline: none; padding: 4px;
-}
-QAbstractItemView::item { min-height: 28px; padding: 4px 8px; }
-QAbstractItemView::item:hover { color: #075f9d; background: #dceefa; }
-QAbstractItemView::item:selected { color: #ffffff; background: #1387d4; }
-QPushButton {
-    min-height: 35px; color: #294158; background: #ffffff;
-    border: 1px solid #8fa2b5; border-radius: 6px; padding: 0 14px; font-weight: 650;
-}
-QPushButton:hover { color: #075f9d; background: #eaf5fc; border-color: #4f87ad; }
-QPushButton:pressed { background: #e6f1f8; }
-QPushButton#primary {
-    min-height: 40px; color: #ffffff; background: #1387d4;
-    border: 1px solid #0f79bf; border-radius: 7px; padding: 0 22px;
-    font-family: "Bahnschrift"; font-size: 13px; font-weight: 800;
-}
-QPushButton#primary:hover { background: #0879c3; }
-QPushButton#primary:disabled { color: #dceaf5; background: #8bb8d6; border-color: #8bb8d6; }
-QCheckBox { spacing: 8px; color: #425a72; }
-QCheckBox::indicator {
-    width: 16px; height: 16px; background: #ffffff;
-    border: 1px solid #7f93a7; border-radius: 3px;
-}
-QCheckBox::indicator:checked {
-    background: #1387d4; border-color: #1387d4;
-    image: url("__CHECKBOX_CHECK_ICON__");
-}
-QCheckBox::indicator:checked:disabled {
-    background: #8bb8d6; border-color: #8bb8d6;
-}
-QFrame#console { background: #ffffff; border-top: 1px solid #aebdcb; }
-QLabel#consoleTitle { color: #22364d; font-family: "Bahnschrift"; font-size: 12px; font-weight: 700; min-height: 20px; }
-QPushButton#consoleButton { color: #63758a; background: transparent; border: none; min-height: 28px; padding: 0 8px; }
-QPushButton#consoleButton:hover { color: #126fe8; background: #edf5ff; }
-QTextBrowser {
-    color: #293f56; background: #f7fafc; border: 1px solid #aebdcb; border-radius: 4px;
-    padding: 8px 16px; font-family: "Cascadia Mono", "Consolas"; font-size: 11px;
-}
-QProgressBar#mainProgress {
-    min-height: 18px; max-height: 18px; color: #27445d; background: #dfe9f2;
-    border: none; text-align: center; font-family: "Bahnschrift"; font-size: 10px;
-}
-QProgressBar#mainProgress::chunk { background: #19a6d8; }
-QProgressBar#memoryBar {
-    min-height: 7px; max-height: 7px; background: #e4edf4; border: none; border-radius: 3px;
-}
-QProgressBar#memoryBar::chunk { background: #18a8c9; border-radius: 3px; }
-QScrollArea { border: none; background: #edf2f7; }
-QScrollBar:vertical {
-    width: 10px; margin: 2px; background: transparent; border: none;
-}
-QScrollBar::handle:vertical {
-    min-height: 30px; background: #a8bac9; border-radius: 4px;
-}
-QScrollBar::handle:vertical:hover { background: #1688d0; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-    height: 0; background: transparent; border: none;
-}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-    background: transparent;
-}
-QScrollBar:horizontal {
-    height: 10px; margin: 2px; background: transparent; border: none;
-}
-QScrollBar::handle:horizontal {
-    min-width: 30px; background: #a8bac9; border-radius: 4px;
-}
-QScrollBar::handle:horizontal:hover { background: #1688d0; }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-    width: 0; background: transparent; border: none;
-}
-QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-    background: transparent;
-}
-QStackedWidget { background: #edf2f7; }
-QSplitter::handle { background: transparent; }
-QSplitter::handle:horizontal {
-    width: 6px; border-left: 1px solid #c5d2dd;
-}
-QSplitter::handle:horizontal:hover {
-    border-left: 1px solid #1688d0;
-}
-QSplitter::handle:vertical {
-    height: 6px; border-top: 1px solid #c5d2dd;
-}
-QSplitter::handle:vertical:hover {
-    border-top: 1px solid #1688d0;
-}
+APP_STYLE = (
+    _resource_path("assets/keilforge.qss").read_text(encoding="utf-8")
+    .replace("__CHECKBOX_CHECK_ICON__", CHECKBOX_CHECK_ICON)
+    .replace("__CHEVRON_ICON__", _resource_path("assets/chevron-down.svg").as_posix())
+)
 
-/* Warm, editorial surfaces keep the workspace quiet while the action stays visible. */
-QMainWindow { background: #f7f5f0; }
-QWidget#pageSurface { background: #f7f5f0; }
-QFrame#navRail {
-    background: #fffdfa; border-right: 1px solid #e8e1da;
-}
-QFrame#topBar {
-    background: #fffdfa; border-bottom: 1px solid #e8e1da;
-}
-QFrame#statusBar {
-    background: #fffdfa; border-top: 1px solid #e8e1da;
-}
-QLabel#brand {
-    color: #211f1d; font-family: "Aptos Display", "Bahnschrift";
-    font-size: 18px; font-weight: 800; letter-spacing: 1px;
-}
-QLabel#topEyebrow {
-    color: #a58f86; font-family: "Aptos", "Segoe UI Variable";
-    font-size: 9px; font-weight: 700; letter-spacing: 2px;
-}
-QLabel#railCaption { color: #a58f86; }
-QLabel#muted { color: #847b75; }
-QLabel#eyebrow {
-    color: #bd4f6a; font-family: "Aptos", "Segoe UI Variable";
-    font-size: 10px; font-weight: 800; letter-spacing: 1.6px;
-}
-QLabel#section {
-    color: #211f1d; font-family: "Aptos Display", "Bahnschrift";
-    font-size: 16px; font-weight: 750;
-}
-QLabel#fieldLabel {
-    color: #9a8e86; font-family: "Aptos", "Segoe UI Variable";
-    font-size: 9px; font-weight: 800; letter-spacing: 1.1px;
-}
-QPushButton#navButton,
-QPushButton#navButtonActive {
-    min-height: 44px; max-height: 44px; border-radius: 12px;
-    padding: 0 13px; font-family: "Aptos", "Segoe UI Variable";
-    font-size: 11px; font-weight: 750;
-}
-QPushButton#navButton {
-    color: #746b66; background: transparent; border: 1px solid transparent;
-}
-QPushButton#navButton:hover {
-    color: #bd4f6a; background: #fbefef; border-color: #f3dfe0;
-}
-QPushButton#navButtonActive {
-    color: #ffffff; background: #d75874; border: 1px solid #d75874;
-}
-QPushButton#navButtonActive:hover { background: #c94c68; border-color: #c94c68; }
-QLabel#statusPill {
-    color: #3e7b68; background: #e9f4ee; border: 1px solid #cfe7da;
-    border-radius: 14px; padding: 3px 12px; font-size: 10px; font-weight: 800;
-}
-QLabel#statusPill[state="running"] {
-    color: #a66243; background: #fff0e7; border-color: #f4d7c6;
-}
-QLabel#statusPill[state="success"] {
-    color: #3e7b68; background: #e9f4ee; border-color: #cfe7da;
-}
-QLabel#statusPill[state="failed"] {
-    color: #a34d56; background: #fcebed; border-color: #f0cfd3;
-}
-QFrame#pipeline {
-    background: #fffdfa; border: 1px solid #e9e1da; border-radius: 16px;
-}
-QLabel#stageIndex {
-    color: #ffffff; background: #d75874; border-radius: 11px;
-    min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px;
-    font-family: "Aptos", "Segoe UI Variable"; font-size: 10px; font-weight: 800;
-}
-QLabel#stageIndex[state="pending"] { color: #a18f87; background: #eee8e2; }
-QLabel#stageIndex[state="running"] { color: #ffffff; background: #df8a67; }
-QLabel#stageIndex[state="complete"] { color: #ffffff; background: #d75874; }
-QLabel#stageIndex[state="failed"] { color: #ffffff; background: #b95757; }
-QLabel#stageName { color: #312c29; font-size: 11px; font-weight: 750; }
-QLabel#stageName[state="pending"] { color: #a18f87; }
-QLabel#stageName[state="running"] { color: #b9684e; }
-QLabel#stageName[state="complete"] { color: #312c29; }
-QLabel#stageName[state="failed"] { color: #a34d56; }
-QLabel#stageDetail { color: #958a82; font-size: 9px; }
-QFrame#inspector {
-    background: #fffdfa; border-left: 1px solid #e8e1da;
-}
-QScrollArea#inspectorScroll { background: #fffdfa; }
-QFrame#metric {
-    background: #fcfaf7; border: 1px solid #eee6de; border-radius: 12px;
-    min-height: 52px;
-}
-QLabel#metricValue {
-    color: #211f1d; font-family: "Aptos Display", "Bahnschrift";
-    font-size: 14px; font-weight: 800;
-}
-QLineEdit, QComboBox {
-    min-height: 38px; color: #302b28; background: #fffefa;
-    border: 1px solid #ded5cd; border-radius: 10px; padding: 0 12px;
-    selection-background-color: #f1cbd2;
-}
-QLineEdit:hover, QComboBox:hover { border-color: #cdbdb3; background: #ffffff; }
-QLineEdit:focus, QComboBox:focus {
-    border: 2px solid #d75874; padding: 0 11px; background: #ffffff;
-}
-QComboBox::drop-down { border: none; width: 28px; }
-QAbstractItemView {
-    color: #302b28; background: #fffefa; border: 1px solid #ded5cd;
-    selection-color: #ffffff; selection-background-color: #d75874;
-    outline: none; padding: 5px; border-radius: 8px;
-}
-QAbstractItemView::item { min-height: 30px; padding: 5px 9px; }
-QAbstractItemView::item:hover { color: #9d4058; background: #fbedef; }
-QAbstractItemView::item:selected { color: #ffffff; background: #d75874; }
-QPushButton {
-    min-height: 38px; color: #514742; background: #fffefa;
-    border: 1px solid #ded5cd; border-radius: 10px; padding: 0 15px;
-    font-family: "Aptos", "Segoe UI Variable"; font-weight: 700;
-}
-QPushButton:hover { color: #a83f5b; background: #fbedef; border-color: #e2b7c0; }
-QPushButton:pressed { background: #f6e2e5; }
-QPushButton#primary {
-    min-height: 42px; color: #ffffff;
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #df6a80, stop:1 #c94e69);
-    border: 1px solid #c94e69; border-radius: 12px; padding: 0 22px;
-    font-family: "Aptos Display", "Bahnschrift"; font-size: 13px; font-weight: 800;
-}
-QPushButton#primary:hover {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-        stop:0 #d95c76, stop:1 #ba3f5c);
-    border-color: #ba3f5c;
-}
-QPushButton#primary:disabled { color: #f8e8eb; background: #dba3b0; border-color: #dba3b0; }
-QCheckBox { spacing: 8px; color: #665b56; font-weight: 650; }
-QCheckBox::indicator {
-    width: 17px; height: 17px; background: #fffefa;
-    border: 1px solid #d4c8c0; border-radius: 5px;
-}
-QCheckBox::indicator:checked { background: #d75874; border-color: #d75874; }
-QCheckBox::indicator:checked:disabled { background: #dba3b0; border-color: #dba3b0; }
-QFrame#console { background: #fffdfa; border-top: 1px solid #e8e1da; }
-QLabel#consoleTitle {
-    color: #312c29; font-family: "Aptos Display", "Bahnschrift";
-    font-size: 13px; font-weight: 750;
-}
-QPushButton#consoleButton {
-    color: #958a82; background: transparent; border: none; min-height: 30px;
-    padding: 0 9px; border-radius: 8px;
-}
-QPushButton#consoleButton:hover { color: #a83f5b; background: #fbedef; }
-QTextBrowser {
-    color: #3b3531; background: #fbfaf7; border: 1px solid #e8e0d8;
-    border-radius: 10px; padding: 9px 16px;
-    font-family: "Cascadia Mono", "Consolas"; font-size: 11px;
-}
-QProgressBar#mainProgress {
-    min-height: 12px; max-height: 12px; color: #8d716a; background: #f1e5e2;
-    border: none; text-align: center; font-size: 9px; font-weight: 700;
-}
-QProgressBar#mainProgress::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 #df8a67, stop:1 #d75874);
-}
-QProgressBar#memoryBar {
-    min-height: 6px; max-height: 6px; background: #f0e8e3;
-    border: none; border-radius: 3px;
-}
-QProgressBar#memoryBar::chunk { background: #d88a72; border-radius: 3px; }
-QScrollArea, QStackedWidget { border: none; background: #f7f5f0; }
-QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-    background: #d3c5bd; border-radius: 5px;
-}
-QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: #d75874; }
-QSplitter::handle { background: transparent; }
-QSplitter::handle:horizontal { width: 6px; border-left: 1px solid #eee6de; }
-QSplitter::handle:horizontal:hover { border-left: 1px solid #d75874; }
-QSplitter::handle:vertical { height: 6px; border-top: 1px solid #eee6de; }
-QSplitter::handle:vertical:hover { border-top: 1px solid #d75874; }
-QToolTip {
-    color: #fffefa; background: #312c29; border: 1px solid #312c29;
-    padding: 5px 8px; border-radius: 6px;
-}
-QWidget#topBrand, QSvgWidget#railMark { background: transparent; }
-QPushButton#secondaryButton {
-    min-height: 34px; color: #746b66; background: #fffefa;
-    border-color: #e2d8d0; border-radius: 10px; padding: 0 13px;
-}
-QPushButton#secondaryButton:hover {
-    color: #a83f5b; background: #fbedef; border-color: #e2b7c0;
-}
-QPushButton#fieldButton {
-    min-height: 38px; min-width: 72px; color: #746b66;
-    background: #fffefa; border-color: #ded5cd; border-radius: 10px;
-}
-QPushButton#fieldButton:hover {
-    color: #a83f5b; background: #fbedef; border-color: #e2b7c0;
-}
-/* Use installed system faces and point sizes so glyphs stay stable under DPI scaling. */
-QWidget {
-    color: #211f1d;
-    font-family: "Segoe UI", "Microsoft YaHei UI";
-    font-size: 10pt;
-}
-QLabel#brand {
-    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
-    font-size: 16pt; font-weight: 700; letter-spacing: 0px;
-}
-QLabel#topEyebrow {
-    font-family: "Segoe UI", "Microsoft YaHei UI";
-    font-size: 8pt; font-weight: 600; letter-spacing: 1px;
-}
-QLabel#railCaption {
-    font-family: "Segoe UI", "Microsoft YaHei UI";
-    font-size: 8pt; font-weight: 600;
-}
-QLabel#eyebrow {
-    font-family: "Segoe UI", "Microsoft YaHei UI";
-    font-size: 9pt; font-weight: 700; letter-spacing: 1px;
-}
-QLabel#section {
-    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
-    font-size: 14pt; font-weight: 600; letter-spacing: 0px;
-}
-QLabel#fieldLabel {
-    font-family: "Segoe UI", "Microsoft YaHei UI";
-    font-size: 9pt; font-weight: 600; letter-spacing: 0px;
-}
-QLabel#muted { font-size: 10pt; }
-QPushButton#navButton,
-QPushButton#navButtonActive {
-    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
-    font-size: 10pt; font-weight: 600;
-}
-QLabel#statusPill { font-size: 9pt; font-weight: 700; }
-QLabel#stageIndex {
-    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
-    font-size: 9pt; font-weight: 700;
-}
-QLabel#stageName { font-size: 10pt; font-weight: 600; }
-QLabel#stageDetail { font-size: 9pt; }
-QLabel#metricValue {
-    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
-    font-size: 11pt; font-weight: 700;
-}
-QLineEdit, QComboBox { font-size: 10pt; }
-QPushButton { font-size: 10pt; font-weight: 600; }
-QPushButton#primary {
-    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
-    font-size: 11pt; font-weight: 700;
-}
-QCheckBox { font-size: 10pt; font-weight: 600; }
-QLabel#consoleTitle {
-    font-family: "Segoe UI Semibold", "Segoe UI", "Microsoft YaHei UI";
-    font-size: 10pt; font-weight: 600;
-}
-QTextBrowser {
-    font-family: "Cascadia Mono", "Consolas", "Courier New";
-    font-size: 9pt;
-}
-QProgressBar#mainProgress { font-size: 9pt; }
-""".replace("__CHECKBOX_CHECK_ICON__", CHECKBOX_CHECK_ICON)
+
+def _ui_icon(name: str, color: str = "#647557", size: int = 24) -> QIcon:
+    paths = {
+        "project": '<rect x="4" y="3" width="16" height="18" rx="3"/><path d="M8 8h8M8 12h5M8 16h7"/>',
+        "build": '<path d="M4 6h16M4 12h16M4 18h16"/><path d="M9 3v6M15 9v6M9 15v6"/>',
+        "debug": '<rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/>',
+        "log": '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+        "folder": '<path d="M3 7V6a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>',
+        "arrow": '<path d="M4 12h15m-6-6 6 6-6 6"/>',
+    }
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+        f'fill="none" stroke="{color}" stroke-width="1.5" '
+        'stroke-linecap="round" stroke-linejoin="round">' + paths[name] + '</svg>'
+    )
+    renderer = QSvgRenderer(svg.encode("utf-8"))
+    icon = QIcon()
+    for scale in (1, 2):
+        pixmap = QPixmap(size * scale, size * scale)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        pixmap.setDevicePixelRatio(scale)
+        icon.addPixmap(pixmap)
+    return icon
 
 
 class PathHistoryEdit(QLineEdit):
@@ -533,6 +138,53 @@ class PathHistoryEdit(QLineEdit):
             return
         self._history_completer.setCompletionPrefix("")
         self._history_completer.complete()
+
+
+class ProjectDropArea(QFrame):
+    project_dropped = Signal(str)
+
+    def __init__(self):
+        super().__init__(objectName="projectDrop")
+        self.setAcceptDrops(True)
+
+    @staticmethod
+    def project_from_mime(mime):
+        urls = mime.urls()
+        if len(urls) != 1 or not urls[0].isLocalFile():
+            return ""
+        path = Path(urls[0].toLocalFile())
+        if path.suffix.lower() not in {".uvprojx", ".uvproj"} or not path.is_file():
+            return ""
+        return str(path)
+
+    def _highlight(self, active):
+        self.setProperty("dragging", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def dragEnterEvent(self, event):
+        if self.isEnabled() and self.project_from_mime(event.mimeData()):
+            self._highlight(True)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dragLeaveEvent(self, event):
+        self._highlight(False)
+        event.accept()
+
+    def dropEvent(self, event):
+        self._highlight(False)
+        project = self.project_from_mime(event.mimeData())
+        if self.isEnabled() and project:
+            self.project_dropped.emit(project)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
 
 class ConversionWorker(QObject):
@@ -813,15 +465,9 @@ class ConversionWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    DEFAULT_WINDOW_SIZE = (929, 480)
-    MINIMUM_WINDOW_SIZE = (520, 440)
-    COMPACT_LAYOUT_WIDTH = 800
-    DEFAULT_NAV_WIDTH = 84
-    MINIMUM_NAV_WIDTH = 72
-    MAXIMUM_NAV_WIDTH = 180
-    DEFAULT_INSPECTOR_WIDTH = 270
-    MINIMUM_INSPECTOR_WIDTH = 240
-    MAXIMUM_INSPECTOR_WIDTH = 340
+    DEFAULT_WINDOW_SIZE = (1120, 760)
+    MINIMUM_WINDOW_SIZE = (560, 520)
+    COMPACT_LAYOUT_WIDTH = 940
 
     def __init__(self):
         super().__init__()
@@ -836,7 +482,7 @@ class MainWindow(QMainWindow):
         self.validation_timer.setInterval(100)
         self.validation_timer.timeout.connect(self._refresh_validation_elapsed)
         self._entrance_animation = None
-        self.setWindowTitle("Keil Forge · CMake Converter")
+        self.setWindowTitle("KeilForge")
         self.setMinimumSize(*self.MINIMUM_WINDOW_SIZE)
         self.resize(*self.DEFAULT_WINDOW_SIZE)
         self._build_ui()
@@ -846,74 +492,64 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         root = QWidget()
         root.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        root_layout = QHBoxLayout(root)
+        root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        self.nav_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.nav_splitter.setChildrenCollapsible(False)
-        self.nav_splitter.setHandleWidth(6)
-
-        rail = QFrame(objectName="navRail")
-        rail.setMinimumWidth(72)
-        rail.setMaximumWidth(180)
-        rail_layout = QVBoxLayout(rail)
-        rail_layout.setContentsMargins(14, 18, 14, 14)
-        rail_layout.setSpacing(8)
-
-        rail_mark = QSvgWidget(str(_resource_path("assets/keilforge-mark.svg")))
-        rail_mark.setObjectName("railMark")
-        rail_mark.setFixedSize(48, 48)
-        rail_layout.addWidget(rail_mark, 0, Qt.AlignmentFlag.AlignHCenter)
-        rail_layout.addSpacing(18)
-
+        self.nav_frame = QFrame(objectName="topNav")
+        nav_layout = QHBoxLayout(self.nav_frame)
+        nav_layout.setContentsMargins(4, 4, 4, 4)
+        nav_layout.setSpacing(4)
         self.nav_buttons = []
         self.nav_labels = (
-            ("工程", "工程转换", "工程转换"),
-            ("构建", "构建配置", "构建配置"),
-            ("调试", "调试烧录", "调试与烧录"),
+            ("工作台", "工作台", "工程转换"),
+            ("构建", "构建设置", "构建配置"),
+            ("调试", "调试设置", "调试与烧录"),
             ("日志", "运行日志", "运行日志"),
         )
         for index, (_, text, tooltip) in enumerate(self.nav_labels):
-            button = QPushButton(
-                text,
-                objectName="navButtonActive" if index == 0 else "navButton",
-            )
+            button = QToolButton(objectName="navButtonActive" if index == 0 else "navButton")
+            button.setText(text)
+            button.setIcon(_ui_icon(("project", "build", "debug", "log")[index]))
+            button.setIconSize(QSize(17, 17))
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setAccessibleName(tooltip)
             button.setToolTip(tooltip)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            rail_layout.addWidget(button)
+            nav_layout.addWidget(button)
             self.nav_buttons.append(button)
-        rail_layout.addStretch(1)
-        rail_layout.addWidget(QLabel("v2.0", objectName="railCaption"), 0, Qt.AlignmentFlag.AlignHCenter)
 
         shell = QWidget()
         shell_layout = QVBoxLayout(shell)
         shell_layout.setContentsMargins(0, 0, 0, 0)
         shell_layout.setSpacing(0)
 
-        top_bar = QFrame(objectName="topBar")
-        top_bar.setFixedHeight(66)
-        top_layout = QHBoxLayout(top_bar)
-        top_layout.setContentsMargins(18, 0, 18, 0)
-        top_layout.setSpacing(12)
+        self.top_bar = QFrame(objectName="topBar")
+        self.top_layout = QGridLayout(self.top_bar)
+        self.top_layout.setContentsMargins(32, 14, 32, 14)
+        self.top_layout.setHorizontalSpacing(24)
+        self.top_layout.setVerticalSpacing(12)
 
         self.top_brand = QWidget(objectName="topBrand")
         brand_layout = QVBoxLayout(self.top_brand)
         brand_layout.setContentsMargins(0, 0, 0, 0)
         brand_layout.setSpacing(0)
-        brand_layout.addWidget(QLabel("KEIL FORGE", objectName="brand"))
-        brand_layout.addWidget(QLabel("PROJECT CONVERTER", objectName="topEyebrow"))
-        top_layout.addWidget(self.top_brand)
-        top_layout.addStretch(1)
+        brand_layout.addWidget(QLabel("KeilForge", objectName="brand"))
+        brand_layout.addWidget(QLabel("KEIL TO CMAKE", objectName="topEyebrow"))
+        self.top_layout.addWidget(self.top_brand, 0, 0)
+        self.top_layout.addWidget(self.nav_frame, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        self.top_layout.setColumnStretch(1, 1)
         self.status_pill = QLabel("就绪", objectName="statusPill")
         self.status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_pill.setFixedHeight(34)
+        self.status_pill.setFixedHeight(28)
         self.status_pill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        top_layout.addWidget(self.status_pill)
-        self.open_output_button = QPushButton("打开输出目录", objectName="secondaryButton")
+        self.top_layout.addWidget(self.status_pill, 0, 2, Qt.AlignmentFlag.AlignRight)
+        self.open_output_button = QPushButton("输出目录", objectName="secondaryButton")
+        self.open_output_button.setIcon(_ui_icon("folder"))
+        self.open_output_button.setToolTip("打开生成工程的文件夹")
         self.open_output_button.setFixedHeight(38)
         self.open_output_button.setEnabled(False)
-        top_layout.addWidget(self.open_output_button)
         self.validate_check = QCheckBox(
             "生成后执行编译验证", objectName="validationCheck"
         )
@@ -921,65 +557,61 @@ class MainWindow(QMainWindow):
         self.validate_check.setToolTip(
             "勾选后将在 CMake 工程生成完成后执行配置、编译和固件产物检查。"
         )
-        top_layout.addWidget(self.validate_check)
         self.convert_button = QPushButton("转换并验证", objectName="primary")
-        self.convert_button.setFixedWidth(136)
-        top_layout.addWidget(self.convert_button)
-        shell_layout.addWidget(top_bar)
+        self.convert_button.setFixedWidth(174)
+        self.convert_button.setIcon(_ui_icon("arrow", "#ffffff"))
+        self.convert_button.setIconSize(QSize(18, 18))
+        self.convert_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.convert_button.setShortcut("Ctrl+Return")
+        shell_layout.addWidget(self.top_bar)
 
         self.progress = QProgressBar(objectName="mainProgress")
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setTextVisible(True)
+        self.progress.setTextVisible(False)
         self.progress.setFormat("0% · 就绪")
-        shell_layout.addWidget(self.progress)
 
         self.page_stack = QStackedWidget()
 
-        project_page = QWidget(objectName="pageSurface")
-        project_page_layout = QVBoxLayout(project_page)
-        project_page_layout.setContentsMargins(0, 0, 0, 0)
-        project_page_layout.setSpacing(0)
-        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.workspace_splitter.setChildrenCollapsible(True)
-        self.workspace_splitter.setHandleWidth(6)
-        content_scroll = QScrollArea()
-        content_scroll.setWidgetResizable(True)
-        content_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        content_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        project_page = QScrollArea()
+        project_page.setWidgetResizable(True)
+        project_page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        project_surface = QWidget(objectName="pageSurface")
+        self.project_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, project_surface)
+        self.project_layout.setContentsMargins(36, 30, 36, 30)
+        self.project_layout.setSpacing(36)
         content = QWidget(objectName="pageSurface")
         content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(24, 20, 24, 22)
-        content_layout.setSpacing(14)
+        self.content_layout = content_layout
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(20)
 
         heading = QHBoxLayout()
         heading_box = QVBoxLayout()
-        heading_box.setSpacing(2)
-        heading_box.addWidget(QLabel("转换流程", objectName="section"))
-        heading_box.addWidget(
-            QLabel("选择 Keil 工程并生成可验证的跨平台构建资产。", objectName="muted")
-        )
-        heading.addLayout(heading_box)
-        heading.addStretch(1)
+        heading_box.setSpacing(9)
+        heading_box.addWidget(QLabel("工程转换", objectName="pageTitle"))
+        self.project_description = QLabel("从 Keil 工程开始，生成完整的 CMake 工程。", objectName="muted")
+        self.project_description.setWordWrap(True)
+        heading_box.addWidget(self.project_description)
+        heading.addLayout(heading_box, 1)
         content_layout.addLayout(heading)
 
         pipeline = QFrame(objectName="pipeline")
+        self.pipeline = pipeline
         pipeline_layout = QHBoxLayout(pipeline)
-        pipeline_layout.setContentsMargins(18, 14, 18, 14)
+        pipeline_layout.setContentsMargins(0, 0, 0, 4)
         pipeline_layout.setSpacing(9)
         stages = (
-            ("1", "INPUT", "uVision 工程"),
-            ("2", "RESOLVE", "启动与链接资产"),
-            ("3", "GENERATE", "CMake 与工具链"),
-            ("4", "VALIDATE", "GCC 编译验证"),
+            ("1", "选择工程", "Keil uVision"),
+            ("2", "解析配置", "源文件与器件"),
+            ("3", "生成工程", "CMake 工具链"),
+            ("4", "编译验证", "检查生成固件"),
         )
         for index, (number, name, detail) in enumerate(stages):
             stage = QFrame(objectName="stage")
             stage_layout = QHBoxLayout(stage)
-            stage_layout.setContentsMargins(2, 0, 2, 0)
+            stage_layout.setContentsMargins(0, 0, 0, 0)
             stage_layout.setSpacing(8)
             badge = QLabel(number, objectName="stageIndex")
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1009,21 +641,49 @@ class MainWindow(QMainWindow):
                 pipeline_layout.addWidget(arrow)
         content_layout.addWidget(pipeline)
 
-        content_layout.addWidget(QLabel("工程资产", objectName="section"))
+        self.project_drop = ProjectDropArea()
+        drop_layout = QVBoxLayout(self.project_drop)
+        drop_layout.setContentsMargins(22, 22, 22, 22)
+        drop_layout.setSpacing(20)
+        drop_header = QHBoxLayout()
+        drop_header.setSpacing(16)
+        document_icon = QLabel(objectName="documentIcon")
+        document_icon.setPixmap(
+            _ui_icon("project", size=40).pixmap(QSize(40, 40), self.devicePixelRatioF())
+        )
+        document_icon.setFixedSize(60, 60)
+        document_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        drop_header.addWidget(document_icon)
+        drop_copy = QVBoxLayout()
+        drop_copy.setSpacing(5)
+        self.inspector_project = QLabel("拖入 Keil 工程", objectName="projectName")
+        self.inspector_project.setMinimumWidth(0)
+        self.inspector_project.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        drop_copy.addWidget(self.inspector_project)
+        drop_copy.addWidget(QLabel("支持 .uvprojx 与 .uvproj 文件", objectName="muted"))
+        drop_header.addLayout(drop_copy, 1)
+        drop_layout.addLayout(drop_header)
+        project_row = QHBoxLayout()
+        project_row.setSpacing(10)
+        self.project_edit = PathHistoryEdit()
+        self.project_edit.setAcceptDrops(False)
+        self.project_edit.setPlaceholderText("选择文件，或输入工程文件位置")
+        self.project_edit.setAccessibleName("Keil 工程")
+        self.project_edit.setMinimumWidth(0)
+        self.project_button = QPushButton("选择文件", objectName="importButton")
+        self.project_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        project_row.addWidget(self.project_edit, 1)
+        project_row.addWidget(self.project_button)
+        drop_layout.addLayout(project_row)
+        content_layout.addWidget(self.project_drop)
 
         file_grid = QGridLayout()
         file_grid.setHorizontalSpacing(10)
-        file_grid.setVerticalSpacing(7)
+        file_grid.setVerticalSpacing(9)
         file_grid.setColumnStretch(0, 1)
         file_grid.setColumnStretch(1, 0)
-        self.project_edit, self.project_button = self._path_field(
-            file_grid, 0, "KEIL PROJECT", "选择 .uvprojx 工程"
-        )
         self.output_edit, self.output_button = self._path_field(
-            file_grid, 1, "OUTPUT DIRECTORY", "生成文件保存目录"
-        )
-        self.uv4_edit, self.uv4_button = self._path_field(
-            file_grid, 2, "KEIL MDK", "用于 CMSIS-Pack 与 RTE 解析，可留空自动检测"
+            file_grid, 0, "保存到", "选择工程后自动填写输出目录"
         )
         content_layout.addLayout(file_grid)
 
@@ -1038,45 +698,58 @@ class MainWindow(QMainWindow):
         self.build_dir_edit = QLineEdit()
         self.build_dir_edit.setPlaceholderText("build-gcc")
 
-        output_summary = QFrame(objectName="pipeline")
-        output_summary_layout = QVBoxLayout(output_summary)
-        output_summary_layout.setContentsMargins(16, 12, 16, 12)
-        output_summary_layout.setSpacing(4)
-        output_summary_layout.addWidget(QLabel("生成内容", objectName="section"))
-        summary_detail = QLabel(
-            "CMakeLists.txt · GCC 工具链 · VS Code 调试任务 · ELF · HEX · BIN",
-            objectName="muted",
-        )
-        summary_detail.setWordWrap(True)
-        summary_detail.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
-        output_summary_layout.addWidget(summary_detail)
-        content_layout.addWidget(output_summary)
+        context = QFrame(objectName="outputSummary")
+        context_layout = QHBoxLayout(context)
+        context_layout.setContentsMargins(0, 18, 0, 0)
+        context_layout.setSpacing(24)
+        target_box = QVBoxLayout()
+        self.inspector_target = self._metric("工程目标", "自动识别", target_box)
+        context_layout.addLayout(target_box, 1)
+        probe_box = QVBoxLayout()
+        self.inspector_probe = self._metric("调试探针", "全部", probe_box)
+        context_layout.addLayout(probe_box, 1)
+        self.settings_button = QPushButton("调整设置", objectName="secondaryButton")
+        self.settings_button.setIcon(_ui_icon("build"))
+        context_layout.addWidget(self.settings_button)
+        content_layout.addWidget(context)
         content_layout.addStretch(1)
-        content_scroll.setWidget(content)
 
         inspector = QFrame(objectName="inspector")
+        self.inspector_panel = inspector
+        inspector.setMinimumWidth(0)
         inspector_layout = QVBoxLayout(inspector)
-        inspector_layout.setContentsMargins(16, 16, 16, 16)
-        inspector_layout.setSpacing(10)
-        inspector_layout.addWidget(QLabel("工程检查", objectName="eyebrow"))
-        inspector_layout.addWidget(QLabel("转换上下文", objectName="section"))
-        self.inspector_project = self._metric("工程", "未选择", inspector_layout)
-        self.inspector_compiler = self._metric("编译器", "GNU Arm GCC", inspector_layout)
-        self.inspector_target = self._metric("目标", "自动识别", inspector_layout)
-        self.inspector_probe = self._metric("调试探针", "全部", inspector_layout)
-        self.inspector_status = self._metric("构建状态", "等待转换", inspector_layout)
-        self.inspector_validation_time = self._metric(
-            "验证耗时", "等待验证", inspector_layout
-        )
-
+        inspector_layout.setContentsMargins(26, 24, 26, 24)
+        inspector_layout.setSpacing(9)
+        inspector_layout.addWidget(QLabel("OUTPUT", objectName="eyebrow"))
+        inspector_layout.addWidget(QLabel("生成预览", objectName="previewTitle"))
+        self.inspector_compiler = QLabel(objectName="muted")
+        self.inspector_compiler.setWordWrap(True)
+        inspector_layout.addWidget(self.inspector_compiler)
         inspector_layout.addSpacing(4)
-        inspector_layout.addWidget(QLabel("内存估算", objectName="fieldLabel"))
+        self._preview_file("CMakeLists.txt", "构建入口", inspector_layout)
+        self._preview_file("cmake/", "工具链配置", inspector_layout)
+        self.vscode_preview, _ = self._preview_file(".vscode/", "调试与任务", inspector_layout)
+        self.firmware_preview, self.firmware_preview_name = self._preview_file(
+            "ELF · HEX · BIN", "编译产物", inspector_layout
+        )
+        self.summary_detail = QLabel(objectName="muted")
+        self.summary_detail.setWordWrap(True)
+        inspector_layout.addWidget(self.summary_detail)
+        inspector_layout.addSpacing(4)
+        result_row = QHBoxLayout()
+        status_box = QVBoxLayout()
+        self.inspector_status = self._metric("运行状态", "等待转换", status_box)
+        result_row.addLayout(status_box, 1)
+        time_box = QVBoxLayout()
+        self.inspector_validation_time = self._metric("验证耗时", "待验证", time_box)
+        result_row.addLayout(time_box, 1)
+        inspector_layout.addLayout(result_row)
+        inspector_layout.addWidget(QLabel("固件占用", objectName="fieldLabel"))
         flash_row = QHBoxLayout()
         flash_row.addWidget(QLabel("FLASH", objectName="stageName"))
         flash_row.addStretch(1)
-        self.flash_usage_label = QLabel("等待构建", objectName="muted")
+        self.flash_usage_label = QLabel("构建后显示", objectName="muted")
+        self.flash_usage_label.setWordWrap(True)
         flash_row.addWidget(self.flash_usage_label)
         inspector_layout.addLayout(flash_row)
         self.flash_bar = QProgressBar(objectName="memoryBar")
@@ -1087,7 +760,8 @@ class MainWindow(QMainWindow):
         ram_row = QHBoxLayout()
         ram_row.addWidget(QLabel("RAM", objectName="stageName"))
         ram_row.addStretch(1)
-        self.ram_usage_label = QLabel("等待构建", objectName="muted")
+        self.ram_usage_label = QLabel("构建后显示", objectName="muted")
+        self.ram_usage_label.setWordWrap(True)
         ram_row.addWidget(self.ram_usage_label)
         inspector_layout.addLayout(ram_row)
         self.ram_bar = QProgressBar(objectName="memoryBar")
@@ -1097,51 +771,50 @@ class MainWindow(QMainWindow):
         inspector_layout.addWidget(self.ram_bar)
         inspector_layout.addStretch(1)
 
-        self.inspector_scroll = QScrollArea(objectName="inspectorScroll")
-        self.inspector_scroll.setWidgetResizable(True)
-        self.inspector_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.inspector_scroll.setMinimumWidth(240)
-        self.inspector_scroll.setMaximumWidth(340)
-        self.inspector_scroll.setWidget(inspector)
-
-        self.workspace_splitter.addWidget(content_scroll)
-        self.workspace_splitter.addWidget(self.inspector_scroll)
-        self.workspace_splitter.setStretchFactor(0, 1)
-        self.workspace_splitter.setStretchFactor(1, 0)
-        self.workspace_splitter.setSizes([800, 270])
-        project_page_layout.addWidget(self.workspace_splitter)
+        self.project_layout.addWidget(content, 3)
+        self.project_layout.addWidget(inspector, 2)
+        project_page.setWidget(project_surface)
         self.page_stack.addWidget(project_page)
 
         config_page = QScrollArea()
         config_page.setWidgetResizable(True)
         config_content = QWidget(objectName="pageSurface")
         config_layout = QVBoxLayout(config_content)
-        config_layout.setContentsMargins(32, 28, 32, 32)
-        config_layout.setSpacing(16)
-        config_layout.addWidget(QLabel("构建配置", objectName="section"))
-        config_layout.addWidget(
-            QLabel("设置目标编译器、宿主平台和 CMake 构建方式。", objectName="muted")
-        )
+        self.config_layout = config_layout
+        config_layout.setContentsMargins(36, 30, 36, 32)
+        config_layout.setSpacing(18)
+        config_layout.addWidget(QLabel("构建配置", objectName="pageTitle"))
+        config_description = QLabel("选择编译器与构建方式，配置工程目标。", objectName="muted")
+        config_description.setWordWrap(True)
+        config_layout.addWidget(config_description)
         profile_grid = QGridLayout()
         profile_grid.setHorizontalSpacing(16)
-        profile_grid.setVerticalSpacing(14)
+        profile_grid.setVerticalSpacing(12)
 
         fields = [
-            ("COMPILER", self.compiler_combo),
-            ("HOST", self.host_combo),
-            ("CMAKE GENERATOR", self.generator_combo),
-            ("TARGET NAME", self.target_edit),
-            ("BUILD DIRECTORY", self.build_dir_edit),
+            ("编译器", self.compiler_combo),
+            ("宿主系统", self.host_combo),
+            ("CMake 生成器", self.generator_combo),
+            ("Keil 目标名称", self.target_edit),
+            ("构建目录名称", self.build_dir_edit),
         ]
+        self.profile_grid = profile_grid
+        self.profile_fields = []
         for index, (label, widget) in enumerate(fields):
             row, column = divmod(index, 2)
-            box = QVBoxLayout()
-            box.setSpacing(4)
+            field = QWidget()
+            field.setMinimumWidth(0)
+            box = QVBoxLayout(field)
+            box.setContentsMargins(0, 0, 0, 6)
+            box.setSpacing(9)
             box.addWidget(QLabel(label, objectName="fieldLabel"))
             box.addWidget(widget)
-            profile_grid.addLayout(box, row, column)
+            widget.setMinimumWidth(0)
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            profile_grid.addWidget(field, row, column)
+            self.profile_fields.append(field)
+        profile_grid.setColumnStretch(0, 1)
+        profile_grid.setColumnStretch(1, 1)
         config_layout.addLayout(profile_grid)
 
         toggles = QHBoxLayout()
@@ -1150,6 +823,15 @@ class MainWindow(QMainWindow):
         toggles.addWidget(self.vscode_check)
         toggles.addStretch(1)
         config_layout.addLayout(toggles)
+        config_layout.addWidget(QFrame(objectName="sectionRule"))
+        mdk_grid = QGridLayout()
+        mdk_grid.setHorizontalSpacing(10)
+        mdk_grid.setVerticalSpacing(9)
+        mdk_grid.setColumnStretch(0, 1)
+        self.uv4_edit, self.uv4_button = self._path_field(
+            mdk_grid, 0, "Keil MDK 安装目录 · 可选", "自动检测安装目录"
+        )
+        config_layout.addLayout(mdk_grid)
         config_layout.addStretch(1)
         config_page.setWidget(config_content)
         self.page_stack.addWidget(config_page)
@@ -1158,29 +840,31 @@ class MainWindow(QMainWindow):
         debug_page.setWidgetResizable(True)
         debug_content = QWidget(objectName="pageSurface")
         debug_layout = QVBoxLayout(debug_content)
-        debug_layout.setContentsMargins(32, 28, 32, 32)
-        debug_layout.setSpacing(16)
-        debug_layout.addWidget(QLabel("调试与烧录", objectName="section"))
-        debug_layout.addWidget(
-            QLabel("生成 VS Code、OpenOCD、J-Link 和探针相关任务。", objectName="muted")
-        )
+        self.debug_layout = debug_layout
+        debug_layout.setContentsMargins(36, 30, 36, 32)
+        debug_layout.setSpacing(22)
+        debug_layout.addWidget(QLabel("调试与烧录", objectName="pageTitle"))
+        debug_description = QLabel("为选定探针生成调试与固件烧录任务。", objectName="muted")
+        debug_description.setWordWrap(True)
+        debug_layout.addWidget(debug_description)
+        debug_layout.addSpacing(8)
         debug_grid = QGridLayout()
         debug_grid.setHorizontalSpacing(16)
         debug_grid.setVerticalSpacing(14)
         for column, (label, widget) in enumerate(
-            (("DEBUG PROBE", self.probe_combo), ("DEBUG BACKEND", self.backend_combo))
+            (("调试探针", self.probe_combo), ("调试后端", self.backend_combo))
         ):
             box = QVBoxLayout()
-            box.setSpacing(4)
+            box.setSpacing(9)
             box.addWidget(QLabel(label, objectName="fieldLabel"))
             box.addWidget(widget)
             debug_grid.addLayout(box, 0, column)
         debug_layout.addLayout(debug_grid)
-        debug_assets = QFrame(objectName="pipeline")
+        debug_assets = QFrame(objectName="outputSummary")
         debug_assets_layout = QVBoxLayout(debug_assets)
-        debug_assets_layout.setContentsMargins(18, 16, 18, 16)
-        debug_assets_layout.setSpacing(7)
-        debug_assets_layout.addWidget(QLabel("生成的调试资产", objectName="section"))
+        debug_assets_layout.setContentsMargins(0, 22, 0, 12)
+        debug_assets_layout.setSpacing(12)
+        debug_assets_layout.addWidget(QLabel("调试配置文件", objectName="section"))
         debug_assets_layout.addWidget(QLabel(".vscode/launch.json", objectName="muted"))
         debug_assets_layout.addWidget(QLabel(".vscode/tasks.json", objectName="muted"))
         debug_assets_layout.addWidget(QLabel("OpenOCD · J-Link · ST-Link 烧录任务", objectName="muted"))
@@ -1198,50 +882,77 @@ class MainWindow(QMainWindow):
 
         console = QFrame(objectName="console")
         console_layout = QVBoxLayout(console)
-        console_layout.setContentsMargins(0, 0, 0, 0)
-        console_layout.setSpacing(0)
+        console_layout.setContentsMargins(28, 26, 28, 28)
+        console_layout.setSpacing(18)
         console_header = QHBoxLayout()
-        console_header.setContentsMargins(18, 8, 12, 6)
-        console_header.addWidget(QLabel("构建控制台", objectName="consoleTitle"))
-        console_header.addSpacing(12)
-        console_header.addWidget(QLabel("输出", objectName="railCaption"))
+        console_header.setContentsMargins(0, 0, 0, 0)
+        console_header.addWidget(QLabel("运行日志", objectName="consoleTitle"))
         console_header.addStretch(1)
         self.clear_log_button = QPushButton("清空", objectName="consoleButton")
         console_header.addWidget(self.clear_log_button)
         console_layout.addLayout(console_header)
         self.log_browser = QTextBrowser()
+        self.log_browser.setPlaceholderText("转换与构建过程将显示在这里。")
         self.log_browser.setMinimumHeight(180)
         console_layout.addWidget(self.log_browser, 1)
         self.page_stack.addWidget(console)
         shell_layout.addWidget(self.page_stack, 1)
 
+        action_bar = QFrame(objectName="actionBar")
+        self.action_layout = QHBoxLayout(action_bar)
+        self.action_layout.setContentsMargins(32, 16, 28, 16)
+        self.action_layout.setSpacing(16)
+        self.action_layout.addWidget(self.open_output_button)
+        self.action_layout.addStretch(1)
+        self.action_layout.addWidget(self.validate_check)
+        self.action_layout.addWidget(self.convert_button)
+        shell_layout.addWidget(action_bar)
+        shell_layout.addWidget(self.progress)
+
         status_bar = QFrame(objectName="statusBar")
         status_layout = QHBoxLayout(status_bar)
-        status_layout.setContentsMargins(18, 5, 18, 5)
-        status_layout.addWidget(QLabel("就绪", objectName="railCaption"))
+        status_layout.setContentsMargins(32, 7, 28, 7)
+        self.progress_label = QLabel("选择工程后即可开始", objectName="railCaption")
+        self.progress_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        status_layout.addWidget(self.progress_label, 1)
         status_layout.addStretch(1)
-        status_layout.addWidget(QLabel("Keil → CMake → GCC", objectName="railCaption"))
+        self.shortcut_label = QLabel("Ctrl + Enter  开始转换", objectName="railCaption")
+        status_layout.addWidget(self.shortcut_label)
         shell_layout.addWidget(status_bar)
 
-        self.nav_splitter.addWidget(rail)
-        self.nav_splitter.addWidget(shell)
-        self.nav_splitter.setStretchFactor(0, 0)
-        self.nav_splitter.setStretchFactor(1, 1)
-        self.nav_splitter.setSizes([84, 476])
-        root_layout.addWidget(self.nav_splitter)
+        root_layout.addWidget(shell)
         self.setCentralWidget(root)
         self._fade_effect = QGraphicsOpacityEffect(root)
         root.setGraphicsEffect(self._fade_effect)
         self._fade_effect.setOpacity(0.0)
 
     @staticmethod
+    def _preview_file(name, description, layout):
+        frame = QFrame(objectName="previewFile")
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(0, 8, 0, 8)
+        row.setSpacing(10)
+        icon = QLabel()
+        icon.setPixmap(_ui_icon("folder" if name.endswith("/") else "project").pixmap(18, 18))
+        row.addWidget(icon)
+        title = QLabel(name, objectName="fileName")
+        title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.addWidget(title, 1)
+        row.addWidget(QLabel(description, objectName="fileDescription"))
+        layout.addWidget(frame)
+        return frame, title
+
+    @staticmethod
     def _metric(label, value, layout):
         frame = QFrame(objectName="metric")
         frame_layout = QVBoxLayout(frame)
-        frame_layout.setContentsMargins(12, 9, 12, 9)
-        frame_layout.setSpacing(2)
+        frame_layout.setContentsMargins(0, 2, 0, 5)
+        frame_layout.setSpacing(4)
         frame_layout.addWidget(QLabel(label.upper(), objectName="fieldLabel"))
         value_label = QLabel(value, objectName="metricValue")
+        value_label.setWordWrap(True)
+        value_label.setMinimumWidth(0)
+        value_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         frame_layout.addWidget(value_label)
         layout.addWidget(frame)
@@ -1255,27 +966,35 @@ class MainWindow(QMainWindow):
         )
         edit.setMinimumWidth(0)
         edit.setPlaceholderText(placeholder)
+        edit.setAccessibleName(label)
+        label_widget.setBuddy(edit)
         button = QPushButton("浏览", objectName="fieldButton")
-        button.setFixedWidth(78)
-        grid.addWidget(label_widget, row * 2, 0, 1, 2)
-        grid.addWidget(edit, row * 2 + 1, 0)
-        grid.addWidget(button, row * 2 + 1, 1)
+        button.setFixedWidth(88)
+        button.setIcon(_ui_icon("folder"))
+        button.setIconSize(QSize(16, 16))
+        button.setAccessibleName("选择" + label)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        grid.addWidget(label_widget, row * 3, 0, 1, 2)
+        grid.addWidget(edit, row * 3 + 1, 0)
+        grid.addWidget(button, row * 3 + 1, 1)
+        grid.setRowMinimumHeight(row * 3 + 2, 10)
         return edit, button
 
     @staticmethod
     def _combo(values):
         combo = QComboBox()
         for key, label in values.items():
-            combo.addItem(label, key)
+            combo.addItem({"all": "全部", "default": "自动选择"}.get(key, label), key)
         return combo
 
     def _connect_signals(self):
-        self.nav_splitter.splitterMoved.connect(self._update_nav_labels)
         for index, button in enumerate(self.nav_buttons):
             button.clicked.connect(
                 lambda checked=False, page_index=index: self._show_page(page_index)
             )
         self.project_button.clicked.connect(self._browse_project)
+        self.project_drop.project_dropped.connect(self._select_project)
+        self.settings_button.clicked.connect(lambda: self._show_page(1))
         self.output_button.clicked.connect(self._browse_output)
         self.uv4_button.clicked.connect(self._browse_uv4)
         self.convert_button.clicked.connect(self._start_conversion)
@@ -1290,38 +1009,18 @@ class MainWindow(QMainWindow):
         self.project_edit.textChanged.connect(self._project_path_changed)
         self.compiler_combo.currentIndexChanged.connect(self._refresh_inspector)
         self.compiler_combo.currentIndexChanged.connect(self._sync_backends)
+        self.vscode_check.toggled.connect(self._refresh_inspector)
         self.target_edit.textChanged.connect(self._refresh_inspector)
         self.probe_combo.currentIndexChanged.connect(self._refresh_inspector)
 
     def _update_nav_labels(self, *args):
-        expanded = self.nav_splitter.sizes()[0] >= 130
+        expanded = self.width() >= 760
         for button, (compact, full, _) in zip(self.nav_buttons, self.nav_labels):
             button.setText(full if expanded else compact)
 
     @classmethod
     def _is_compact_width(cls, width):
         return int(width) < cls.COMPACT_LAYOUT_WIDTH
-
-    @classmethod
-    def _normalized_inspector_width(cls, width):
-        try:
-            width = int(width)
-        except (TypeError, ValueError):
-            return cls.DEFAULT_INSPECTOR_WIDTH
-        if width <= 0:
-            return cls.DEFAULT_INSPECTOR_WIDTH
-        return max(
-            cls.MINIMUM_INSPECTOR_WIDTH,
-            min(cls.MAXIMUM_INSPECTOR_WIDTH, width),
-        )
-
-    @classmethod
-    def _normalized_nav_width(cls, width):
-        try:
-            width = int(width)
-        except (TypeError, ValueError):
-            return cls.DEFAULT_NAV_WIDTH
-        return max(cls.MINIMUM_NAV_WIDTH, min(cls.MAXIMUM_NAV_WIDTH, width))
 
     @staticmethod
     def _conversion_action_text(validate_build):
@@ -1336,40 +1035,70 @@ class MainWindow(QMainWindow):
             if validate_build
             else "仅生成 CMake 工程。"
         )
+        if hasattr(self, "summary_detail"):
+            self._refresh_output_summary()
 
     def _update_compact_layout(self):
-        if not hasattr(self, "inspector_scroll"):
+        if not hasattr(self, "shortcut_label"):
             return
         compact = self._is_compact_width(self.width())
-        pipeline_compact = self.width() < 1020
-        self.top_brand.setVisible(not compact)
-        self.open_output_button.setVisible(True)
-        self.open_output_button.setText("目录" if compact else "打开输出目录")
+        narrow = self.width() < 760
+        self.open_output_button.setText("目录" if narrow else "输出目录")
         self.validate_check.setText(
-            "编译验证" if compact else "生成后执行编译验证"
+            "编译验证" if narrow else "生成后编译验证"
         )
-        self.convert_button.setFixedWidth(108 if compact else 136)
+        self.convert_button.setFixedWidth(152 if narrow else 174)
+        self.shortcut_label.setVisible(not narrow)
+        self.pipeline.setVisible(self.height() >= 600)
         for detail in self.stage_details:
-            detail.setVisible(not pipeline_compact)
-        self.inspector_scroll.setVisible(not compact)
-        if compact:
-            self.nav_splitter.setSizes(
-                [
-                    self.DEFAULT_NAV_WIDTH,
-                    max(1, self.width() - self.DEFAULT_NAV_WIDTH),
-                ]
-            )
+            detail.setVisible(False)
+        for name in self.stage_names:
+            name.setVisible(True)
+        self.project_layout.setDirection(
+            QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight
+        )
+        self.project_layout.setStretch(0, 0 if compact else 3)
+        self.project_layout.setStretch(1, 0 if compact else 2)
+        margin = 22 if narrow else 36
+        for layout in (self.project_layout, self.config_layout, self.debug_layout):
+            layout.setContentsMargins(margin, 26 if narrow else 30, margin, 24)
+        self.action_layout.setContentsMargins(22 if narrow else 32, 14, 22 if narrow else 28, 14)
+        if getattr(self, "_narrow_fields", None) != narrow:
+            self._narrow_fields = narrow
+            self.top_layout.removeWidget(self.nav_frame)
+            if narrow:
+                self.top_layout.addWidget(self.nav_frame, 1, 0, 1, 3)
+            else:
+                self.top_layout.addWidget(self.nav_frame, 0, 1, Qt.AlignmentFlag.AlignCenter)
+            for field in self.profile_fields:
+                self.profile_grid.removeWidget(field)
+            for index, field in enumerate(self.profile_fields):
+                row, column = (index, 0) if narrow else divmod(index, 2)
+                self.profile_grid.addWidget(field, row, column)
+            self.profile_grid.setColumnStretch(1, 0 if narrow else 1)
         self._update_nav_labels()
 
     def _show_page(self, index):
         if not 0 <= index < self.page_stack.count():
             return
+        changed = self.page_stack.currentIndex() != index
         self.page_stack.setCurrentIndex(index)
         for button_index, button in enumerate(self.nav_buttons):
             button.setObjectName(
                 "navButtonActive" if button_index == index else "navButton"
             )
             self._refresh_dynamic_style(button)
+        if changed:
+            if not hasattr(self, "_page_effect"):
+                self._page_effect = QGraphicsOpacityEffect(self.page_stack)
+                self.page_stack.setGraphicsEffect(self._page_effect)
+                self._page_animation = QPropertyAnimation(self._page_effect, b"opacity", self)
+                self._page_animation.setDuration(160)
+                self._page_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._page_animation.stop()
+            self._page_animation.setStartValue(0.55)
+            self._page_animation.setEndValue(1.0)
+            self._page_animation.start()
 
     def _browse_project(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1380,6 +1109,9 @@ class MainWindow(QMainWindow):
         )
         if not file_path:
             return
+        self._select_project(file_path)
+
+    def _select_project(self, file_path):
         self.project_edit.setText(QDir.toNativeSeparators(file_path))
         self._remember_path(self.project_edit, file_path)
 
@@ -1453,17 +1185,31 @@ class MainWindow(QMainWindow):
                 continue
             if (host != "windows" or compiler != "armclang") and key == "keil":
                 continue
-            self.backend_combo.addItem(label, key)
+            self.backend_combo.addItem({"all": "全部", "default": "自动选择"}.get(key, label), key)
         self._set_combo(self.backend_combo, current)
         self.backend_combo.blockSignals(False)
 
     def _refresh_inspector(self):
         project_path = self.project_edit.text().strip()
-        self.inspector_project.setText(Path(project_path).name if project_path else "未选择")
+        self.inspector_project.setText(Path(project_path).name if project_path else "拖入 Keil 工程")
+        self.inspector_project.setWordWrap(False)
         self.inspector_project.setToolTip(project_path)
         self.inspector_compiler.setText(self.compiler_combo.currentText() or "未选择")
         self.inspector_target.setText(self.target_edit.text().strip() or "自动识别")
-        self.inspector_probe.setText(self.probe_combo.currentText() or "未选择")
+        self.inspector_probe.setText(
+            "全部探针" if self.probe_combo.currentData() == "all" else self.probe_combo.currentText() or "未选择"
+        )
+        self._refresh_output_summary()
+
+    def _refresh_output_summary(self):
+        self.vscode_preview.setVisible(self.vscode_check.isChecked())
+        self.firmware_preview.setVisible(self.validate_check.isChecked())
+        self.firmware_preview_name.setText(
+            "ELF · HEX · BIN" if self.compiler_combo.currentData() == "gcc" else "AXF 固件"
+        )
+        self.summary_detail.setText(
+            "生成工程后执行编译验证" if self.validate_check.isChecked() else "生成工程配置，跳过编译"
+        )
 
     @staticmethod
     def _format_memory_size(value):
@@ -1477,10 +1223,7 @@ class MainWindow(QMainWindow):
     def _update_memory_usage(self, flash_used, flash_total, ram_used, ram_total):
         def update(label, bar, used, total):
             percent = round(used * 100 / total, 1) if total else 0.0
-            label.setText(
-                f"{self._format_memory_size(used)} / "
-                f"{self._format_memory_size(total)} · {percent:.1f}%"
-            )
+            label.setText(f"{self._format_memory_size(used)} / {self._format_memory_size(total)} · {percent:.1f}%")
             bar.setValue(max(0, min(100, round(percent))))
 
         update(self.flash_usage_label, self.flash_bar, flash_used, flash_total)
@@ -1580,6 +1323,8 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(value)
         self.progress.setFormat(f"{value}% · {message}")
+        self.progress_label.setText(f"{message} · {value}%")
+        self.progress_label.setToolTip(message)
 
     def _options(self):
         return GenerationOptions(
@@ -1613,6 +1358,7 @@ class MainWindow(QMainWindow):
         self._remember_path(self.output_edit, output_dir)
         self._save_config()
         self.convert_button.setEnabled(False)
+        self.project_drop.setEnabled(False)
         self.validate_check.setEnabled(False)
         self.open_output_button.setEnabled(False)
         self._set_status("转换中", "running")
@@ -1631,6 +1377,7 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setFormat("0% · 准备转换")
+        self.progress_label.setText("准备转换 · 0%")
         self.log_browser.clear()
         self._log(f"输入: {project_file}")
         self._log(f"输出: {output_dir}")
@@ -1656,8 +1403,15 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._conversion_finished)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self._release_worker)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
+
+    @Slot()
+    def _release_worker(self):
+        if self.sender() is self.worker_thread:
+            self.worker_thread = None
+            self.worker = None
 
     @staticmethod
     def _completion_status(success, validation_seconds):
@@ -1679,6 +1433,7 @@ class MainWindow(QMainWindow):
         else:
             self.progress.setFormat(f"{self.progress.value()}% · 转换失败")
         self.convert_button.setEnabled(True)
+        self.project_drop.setEnabled(True)
         self.validate_check.setEnabled(True)
         self.open_output_button.setEnabled(bool(output_dir))
         self._set_status(
@@ -1689,6 +1444,7 @@ class MainWindow(QMainWindow):
             success, validation_seconds
         )
         self.inspector_status.setText(inspector_text)
+        self.progress_label.setText(inspector_text)
         if success:
             for index in range(len(self.stage_badges)):
                 state = (
@@ -1797,18 +1553,6 @@ class MainWindow(QMainWindow):
             str(settings.value("validate_build", "true")).lower()
             in {"1", "true", "yes"}
         )
-        nav_width = self._normalized_nav_width(
-            settings.value("nav_width", self.DEFAULT_NAV_WIDTH)
-        )
-        inspector_width = self._normalized_inspector_width(
-            settings.value("inspector_width", self.DEFAULT_INSPECTOR_WIDTH)
-        )
-        if self._is_compact_width(self.width()):
-            nav_width = min(nav_width, self.DEFAULT_NAV_WIDTH)
-        self.nav_splitter.setSizes([nav_width, max(1, self.width() - nav_width)])
-        self.workspace_splitter.setSizes(
-            [max(1, self.width() - nav_width - inspector_width), inspector_width]
-        )
         self._update_nav_labels()
         self._update_compact_layout()
         self._refresh_inspector()
@@ -1824,7 +1568,11 @@ class MainWindow(QMainWindow):
         self._entrance_animation.setStartValue(0.0)
         self._entrance_animation.setEndValue(1.0)
         self._entrance_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._entrance_animation.finished.connect(self._finish_entrance)
         self._entrance_animation.start()
+
+    def _finish_entrance(self):
+        self.centralWidget().setGraphicsEffect(None)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1847,12 +1595,6 @@ class MainWindow(QMainWindow):
             "debug_backend": self.backend_combo.currentData(),
             "export_vsc_settings": "true" if self.vscode_check.isChecked() else "false",
             "validate_build": "true" if self.validate_check.isChecked() else "false",
-            "nav_width": self._normalized_nav_width(
-                self.nav_splitter.sizes()[0]
-            ),
-            "inspector_width": self._normalized_inspector_width(
-                self.workspace_splitter.sizes()[1]
-            ),
         }
         for key, value in values.items():
             settings.setValue(key, value)
@@ -1871,7 +1613,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(str(_resource_path("assets/keilforge-app-icon.svg"))))
     app.setStyle("Fusion")
-    app.setFont(QFont("Segoe UI", 10))
+    app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(APP_STYLE)
     window = MainWindow()
     window.show()
