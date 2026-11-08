@@ -1,6 +1,7 @@
 # Keil 工程转换验证清单
 
-本文档记录经过实际转换和 GCC 构建验证的 Keil 工程。统计日期为 2026 年 7 月 16 日。
+本文档记录经过实际转换和 GCC 构建验证的 Keil 工程。统计日期为 2026 年 11 月 8 日。
+本次对清单中的两个工程进行了算法优化后的重复验证，独立工程和器件数量保持原值。
 
 ## 验证标准
 
@@ -112,6 +113,38 @@ utilities/at32f415_usb_iap_demo/source_code/app_led4_toggle/mdk_v5/app_led4_togg
 | `STM32F401VCTx` | `SPI_test_stm32f407/spi_receiver/MDK-ARM/spi_receiver.uvprojx` |
 | `STM32F401VE` | `Home_Environment_Detection/工程/Keil工程/project.uvprojx` |
 | `STM32F407VGTx` | `SPI_test_stm32f407/spi_transmitter/MDK-ARM/spi_transmitter.uvprojx` |
+
+## 2026-11-08 算法优化后的重复验证
+
+以下两个既有工程使用优化后的 `keil_to_cmake.py` 从原始 Keil 工程重新生成 CMake，
+完成配置、全部源文件编译、最终链接以及 ELF、HEX、BIN 导出。
+原始工程与生成后的工程源码均未经过手工修改。
+
+验证环境：Windows、Python 3.13.12、CMake 4.3.1、MinGW Makefiles、
+GNU Arm Embedded Toolchain 13.3.1。
+
+| 器件 | 工程来源 | TargetName | ELF 文件 |
+| --- | --- | --- | --- |
+| `N32WB031` | `N32WB_HID/MDK-ARM/touch_screen.uvprojx` | `N32WB03x` | `beacon.elf` |
+| `AT32F435RGT7` | `AT32F435RGT7_SDIO/MDK-ARM_F435/proj.uvprojx` | `X-Track` | `X-Track.elf` |
+
+本次重复验证计入原有记录，独立工程仍为 143 项，器件规格仍为 21 项，
+AT32F415 官方 examples 仍为 118 项，其他代表工程和 utility 工程仍为 25 项。
+器件表中的工程数量和例程分类统计保持原值。
+
+本机证据保存在 `.cache/perf-20261108/`。两个工程分别使用
+`n32-optimized/output/build-mingw` 和 `f435-optimized/output/build-mingw`。
+AT32F435 首次完整构建生成全部产物，但验证器记录了超时；随后再次构建返回 0，
+并通过 `arm-none-eabi-size` 检查。首次日志与再次检查日志均保留。
+
+同日第二轮源码摘要与文件解析缓存优化后，两个工程再次从原始 Keil 输入生成 CMake，
+并使用全新目录完成全部编译、链接和 ELF、HEX、BIN 导出，配置及构建命令均返回 0。
+第二轮目录分别为 `n32-round2-1/output/build-mingw` 和
+`f435-round2-1/output/build-mingw`，详细结果为 `round2-builds.json`。
+构建前后的 82 个和 386 个输入及生成文件 SHA-256 校验值分别保持一致。
+本轮仍属于上述两个工程的重复验证，工程总数、器件总数及分类数量保持原值。
+
+转换耗时和生成内容一致性结果见 [转换性能记录](conversion_performance.md)。
 
 ## 维护规则
 

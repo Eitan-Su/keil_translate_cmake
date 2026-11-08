@@ -204,6 +204,26 @@ class SourceCompileSettings:
 
 
 @dataclass
+class SourceAnalysis:
+    uses_heap: bool
+    defines_sbrk: bool
+    declares_sbrk: bool
+    needs_irq: bool
+    printf_float: bool
+    scanf_float: bool
+    has_text: bool
+    has_libc_init: bool
+    migration_checks: Tuple[bool, ...]
+    static_functions: Set[str]
+    uint32_functions: Set[str]
+    assembly_symbols: List[str]
+    quoted_includes: List[str] = field(default_factory=list)
+    class_names: Set[str] = field(default_factory=set)
+    using_namespaces: Set[str] = field(default_factory=set)
+    namespace_functions: List[Tuple[str, str, str, str, str]] = field(default_factory=list)
+
+
+@dataclass
 class ConvertedTarget:
     project_file: str
     target_name: str
@@ -601,6 +621,31 @@ class KeilProjectToCMake:
 
     CPU_INFO = re.compile(r"^(\S+)\((\S+)\)$")  # 用于解析CPU信息
 
+    GCC_MIGRATION_CHECKS = (
+        (
+            re.compile(r"\$(?:Sub|Super)\$\$[A-Za-z_]\w*"),
+            "迁移检查: 检测到 Arm linker $Sub$$/$Super$$ 符号包装，"
+            "GNU ld 需要 --wrap 或源码适配",
+        ),
+        (
+            re.compile(r"\b(?:__rt_entry|__rt_lib_init|__user_initial_stackheap)\b"),
+            "迁移检查: 检测到 Arm C Library 私有入口，newlib 不提供等价符号",
+        ),
+        (
+            re.compile(
+                r"\b__asm\s+(?:void|int|unsigned|long|short|char)\s+"
+                r"[A-Za-z_]\w*\s*\("
+            ),
+            "迁移检查: 转换后仍存在 ARMASM 函数语法，"
+            "需要人工转换为 GNU 扩展汇编",
+        ),
+        (
+            re.compile(r"__attribute__\s*\(\(\s*at\s*\("),
+            "迁移检查: 检测到绝对地址放置属性 at(...)，"
+            "需要在 GNU 链接脚本中定义专用 section",
+        ),
+    )
+
     MAP_WARING = {
         "2": "-Wall -Wextra -Wno-packed -Wno-reserved-id-macro -Wno-unused-macros -Wno-documentation-unknown-command -Wno-documentation -Wno-license-management -Wno-parentheses-equality -Wno-reserved-identifier",
         "3": "-Wno-packed -Wno-missing-variable-declarations -Wno-missing-prototypes -Wno-missing-noreturn -Wno-sign-conversion -Wno-nonportable-include-path -Wno-reserved-id-macro -Wno-unused-macros -Wno-documentation-unknown-command -Wno-documentation -Wno-license-management -Wno-parentheses-equality -Wno-reserved-identifier",
@@ -688,6 +733,8 @@ class KeilProjectToCMake:
         self._copy_staged_source_mappings: List[tuple[Path, Path]] = []
         self._lvgl_lazy_new_allocator_cache: Optional[bool] = None
         self._repository_root_cache: Optional[Path] = None
+        self._generation_resolved_paths: Optional[Dict[str, Path]] = None
+        self._generation_source_analysis: Optional[Dict[str, SourceAnalysis]] = None
 
         # 项目信息
         self.output_directory = ""
@@ -1131,9 +1178,21 @@ class KeilProjectToCMake:
         self.include_paths.add(normalized)
         self.include_path_order.append(normalized)
 
-    @staticmethod
-    def _source_control_key(path: str | Path) -> str:
-        return os.path.normcase(str(Path(path).resolve(strict=False)))
+    def _resolved_path(self, path: str | Path) -> Path:
+        value = Path(path)
+        cache = self._generation_resolved_paths
+        if cache is None:
+            return value.resolve(strict=False)
+        # 保留 .. 的符号链接语义；相对输入使用当前目录区分缓存项。
+        key = str(value if value.is_absolute() else Path.cwd() / value)
+        if key not in cache:
+            resolved = value.resolve(strict=False)
+            cache[key] = resolved
+            cache[str(resolved)] = resolved
+        return cache[key]
+
+    def _source_control_key(self, path: str | Path) -> str:
+        return os.path.normcase(str(self._resolved_path(path)))
 
     @staticmethod
     def _macro_name(value: str) -> str:
@@ -1847,21 +1906,21 @@ class KeilProjectToCMake:
         return result
 
     def _asset_source(self, path: Path, output_dir: Optional[Path] = None) -> str:
-        resolved = path.resolve(strict=False)
+        resolved = self._resolved_path(path)
         if output_dir is not None:
             try:
-                resolved.relative_to(output_dir.resolve(strict=False))
+                resolved.relative_to(self._resolved_path(output_dir))
                 return "generated"
             except ValueError:
                 pass
         try:
-            resolved.relative_to(self.project_dir.resolve(strict=False))
+            resolved.relative_to(self._resolved_path(self.project_dir))
             return "project"
         except ValueError:
             return "external"
 
     def _project_content_root(self) -> Path:
-        project_dir = self.project_dir.resolve(strict=False)
+        project_dir = self._resolved_path(self.project_dir)
         paths = [project_dir]
 
         def add_project_path(path: Path) -> None:
@@ -1874,31 +1933,31 @@ class KeilProjectToCMake:
             paths.append(path)
 
         for value in [*self.source_files, *self.header_files]:
-            path = Path(value).resolve(strict=False)
+            path = self._resolved_path(value)
             if path.is_file():
                 add_project_path(path.parent)
         for value in [
             *self._ordered_include_paths(),
             *self._source_local_include_paths(),
         ]:
-            path = Path(value).resolve(strict=False)
+            path = self._resolved_path(value)
             if path.is_dir():
                 add_project_path(path)
         if self.linker_script:
-            linker_path = Path(self.linker_script).resolve(strict=False)
+            linker_path = self._resolved_path(self.linker_script)
             if linker_path.is_file():
                 add_project_path(linker_path.parent)
 
         try:
             return Path(os.path.commonpath([str(path) for path in paths]))
         except ValueError:
-            return self.project_dir.resolve(strict=False)
+            return self._resolved_path(self.project_dir)
 
     def _project_repository_root(self) -> Path:
         if self._repository_root_cache is not None:
             return self._repository_root_cache
 
-        project_dir = self.project_dir.resolve(strict=False)
+        project_dir = self._resolved_path(self.project_dir)
         for candidate in (project_dir, *project_dir.parents):
             if (candidate / ".git").exists():
                 self._repository_root_cache = candidate
@@ -1906,11 +1965,10 @@ class KeilProjectToCMake:
         self._repository_root_cache = self._project_content_root()
         return self._repository_root_cache
 
-    @staticmethod
     def _pack_path_components(
-        path: Path,
+        self, path: Path,
     ) -> Optional[Tuple[str, str, str, Tuple[str, ...]]]:
-        parts = path.resolve(strict=False).parts
+        parts = self._resolved_path(path).parts
         for index in range(len(parts) - 1, -1, -1):
             if parts[index].lower() != "pack" or len(parts) < index + 4:
                 continue
@@ -1922,8 +1980,8 @@ class KeilProjectToCMake:
         return None
 
     def _pack_directories_match(self, source: Path, mapped: Path) -> bool:
-        source = source.resolve(strict=False)
-        mapped = mapped.resolve(strict=False)
+        source = self._resolved_path(source)
+        mapped = self._resolved_path(mapped)
         try:
             source_files = {
                 candidate.relative_to(source).as_posix(): candidate
@@ -1977,17 +2035,17 @@ class KeilProjectToCMake:
             versioned = repository_root / "vendor" / vendor / package / version
             versioned = versioned.joinpath(*mapped_tail)
             if versioned.is_dir():
-                return versioned.resolve(strict=False)
+                return self._resolved_path(versioned)
 
             legacy = repository_root / "vendor" / package
             legacy = legacy.joinpath(*mapped_tail)
             if not legacy.is_dir():
                 continue
             if self._pack_directories_match(path, legacy):
-                return legacy.resolve(strict=False)
+                return self._resolved_path(legacy)
             self._append_portability_warning(
                 "PACK 目录与仓库旧式 vendor 映射内容不同，跳过映射: "
-                f"{path.resolve(strict=False)} -> {legacy.resolve(strict=False)}"
+                f"{self._resolved_path(path)} -> {self._resolved_path(legacy)}"
             )
         return None
 
@@ -1998,7 +2056,7 @@ class KeilProjectToCMake:
         role: str,
         map_pack_include: bool = False,
     ) -> str:
-        resolved = Path(path).resolve(strict=False)
+        resolved = self._resolved_path(path)
         pack_components = (
             self._pack_path_components(resolved) if map_pack_include else None
         )
@@ -2013,7 +2071,7 @@ class KeilProjectToCMake:
                 return self._cmake_escape_argument(resolved.as_posix())
 
         repository_root = self._project_repository_root()
-        output_root = Path(dest).resolve(strict=False)
+        output_root = self._resolved_path(dest)
         is_portable = False
         for root in (repository_root, output_root):
             try:
@@ -2054,7 +2112,7 @@ class KeilProjectToCMake:
         support_level: str,
         reason: str,
     ) -> None:
-        normalized = str(path.resolve(strict=False))
+        normalized = str(self._resolved_path(path))
         for record in self.asset_records:
             if record.kind == kind and record.path == normalized:
                 return
@@ -2066,7 +2124,7 @@ class KeilProjectToCMake:
         self, output_path: Path, options: GenerationOptions
     ) -> ConvertedTarget:
         return ConvertedTarget(
-            project_file=str(self.uvprojx_path.resolve(strict=False)),
+            project_file=str(self._resolved_path(self.uvprojx_path)),
             target_name=self.target_name,
             output_name=self._artifact_name(),
             device=self.device_name,
@@ -2077,7 +2135,7 @@ class KeilProjectToCMake:
             include_paths=self._ordered_include_paths(),
             defines=sorted(self.defines),
             libraries=list(self.libraries),
-            output_directory=str(output_path.resolve(strict=False)),
+            output_directory=str(self._resolved_path(output_path)),
             assets=list(self.asset_records),
             warnings=list(self.warnings),
         )
@@ -2642,6 +2700,8 @@ class KeilProjectToCMake:
 
     @staticmethod
     def _patch_armcc_embedded_assembly(content: str) -> tuple[str, List[str]]:
+        if re.search(r"__ASM", content, re.IGNORECASE) is None:
+            return content, []
         delay_pattern = re.compile(
             r"__ASM(?:\s+volatile)?\s+void\s+(?P<name>[A-Za-z_]\w*)\s*"
             r"\(\s*uint32_t\s+(?P<arg>[A-Za-z_]\w*)\s*\)\s*"
@@ -2779,8 +2839,8 @@ class KeilProjectToCMake:
 
     def _stage_gcc_source_file(self, source_path: Path, dest: str) -> str:
         try:
-            resolved_source = source_path.resolve(strict=False)
-            output_path = Path(dest).resolve(strict=False)
+            resolved_source = self._resolved_path(source_path)
+            output_path = self._resolved_path(dest)
             resolved_source.relative_to(output_path)
             return str(resolved_source)
         except ValueError:
@@ -2789,25 +2849,21 @@ class KeilProjectToCMake:
         if not source_path.is_file():
             return str(source_path)
 
-        resolved_source = source_path.resolve(strict=False)
         copy_only_staging = self._path_contains_non_ascii(resolved_source)
         digest = hashlib.sha1(
             str(resolved_source).encode("utf-8")
         ).hexdigest()[:12]
         safe_stem = self._safe_ascii_file_stem(source_path.stem)
         staged_dir = Path(dest) / "cmake" / "sources"
-        staged_dir.mkdir(parents=True, exist_ok=True)
         staged_path = staged_dir / f"{safe_stem}_{digest}{source_path.suffix}"
-        if staged_path.exists():
-            staged_path.chmod(staged_path.stat().st_mode | 0o200)
-        shutil.copy2(source_path, staged_path)
-        staged_path.chmod(staged_path.stat().st_mode | 0o200)
-        content_changed = False
+        prepared_content: Optional[str] = None
         if source_path.suffix.lower() == ".c":
             try:
-                original_content = staged_path.read_text(
+                original_content = source_path.read_text(
                     encoding="utf-8", errors="ignore"
                 )
+                if self._generation_source_analysis is not None:
+                    self._analyze_source_file(source_path, original_content)
                 content = original_content
                 normalized_source = source_path.as_posix().lower()
                 if (
@@ -2829,8 +2885,7 @@ class KeilProjectToCMake:
                     patched
                 )
                 if patched != original_content:
-                    self._write_text_file(staged_path, patched)
-                    content_changed = True
+                    prepared_content = patched
                 if patched_functions:
                     self.warnings.append(
                         "GCC ARMCC 内嵌汇编转换: "
@@ -2844,7 +2899,9 @@ class KeilProjectToCMake:
                 pass
         if source_path.suffix.lower() in {".cpp", ".cc", ".cxx"}:
             try:
-                content = staged_path.read_text(encoding="utf-8", errors="ignore")
+                content = source_path.read_text(encoding="utf-8", errors="ignore")
+                if self._generation_source_analysis is not None:
+                    self._analyze_source_file(source_path, content)
                 patched = content.replace(
                     'extern "C" uint32_t system_core_clock;',
                     'extern "C" unsigned int system_core_clock;',
@@ -2899,33 +2956,41 @@ class KeilProjectToCMake:
                     lambda _match: hardfault_replacement, patched
                 )
                 if patched != content:
-                    self._write_text_file(staged_path, patched)
-                    content_changed = True
+                    prepared_content = patched
                     self.warnings.append(
                         f"GCC 类型兼容修正: {source_path.name}: system_core_clock"
                     )
             except OSError:
                 pass
 
-        if not content_changed and not copy_only_staging:
+        if prepared_content is None and not copy_only_staging:
             staged_path.unlink(missing_ok=True)
             return str(resolved_source)
 
+        staged_dir.mkdir(parents=True, exist_ok=True)
+        if staged_path.exists():
+            staged_path.chmod(staged_path.stat().st_mode | 0o200)
+        if prepared_content is None:
+            shutil.copy2(source_path, staged_path)
+            staged_path.chmod(staged_path.stat().st_mode | 0o200)
+        else:
+            self._write_text_file(staged_path, prepared_content)
+
         # A staged source loses GCC's implicit search of its original directory.
         # Add that directory only for staged files instead of every source file.
-        source_dir = str(source_path.parent.resolve(strict=False))
+        source_dir = str(self._resolved_path(source_path.parent))
         if source_dir:
             self._add_include_path(source_dir)
         if source_path.parent.name.lower() == "src":
             sibling_include = source_path.parent.parent / "inc"
             if sibling_include.is_dir():
-                self._add_include_path(str(sibling_include.resolve(strict=False)))
+                self._add_include_path(str(self._resolved_path(sibling_include)))
 
-        if not content_changed:
+        if prepared_content is None:
             self._copy_staged_source_mappings.append(
-                (resolved_source, staged_path.resolve(strict=False))
+                (resolved_source, self._resolved_path(staged_path))
             )
-        return str(staged_path.resolve(strict=False))
+        return str(self._resolved_path(staged_path))
 
     def _has_lvgl_lazy_new_allocator(self) -> bool:
         if self._lvgl_lazy_new_allocator_cache is not None:
@@ -3031,25 +3096,34 @@ class KeilProjectToCMake:
         prepared: List[str] = []
         self._prepared_source_origins = {}
         sources = self._gcc_source_files()
+        source_keys: Dict[str, str] = {}
+
+        def source_key(path: str | Path) -> str:
+            text = str(path)
+            if text not in source_keys:
+                source_keys[text] = self._source_control_key(path)
+            return source_keys[text]
+
+        # 保留首个原始文件的设置，避免对每个 GCC 文件重复遍历全部输入。
+        origins: Dict[str, str] = {}
+        for original in self.source_files:
+            mapped_key = source_key(self._map_source_for_gcc(original))
+            origins.setdefault(mapped_key, source_key(original))
+
         total = len(sources)
         for index, source in enumerate(sources, start=1):
             self._emit_generation_progress(
                 5 + round(55 * index / max(total, 1)),
                 f"处理源文件 {index}/{total}",
             )
-            source_control_key = self._source_control_key(source)
+            source_control_key = source_key(source)
             if source_control_key not in self.source_compile_settings:
-                for original in self.source_files:
-                    if self._source_control_key(
-                        self._map_source_for_gcc(original)
-                    ) == self._source_control_key(source):
-                        source_control_key = self._source_control_key(original)
-                        break
+                source_control_key = origins.get(source_control_key, source_control_key)
 
             def append_prepared(path: str) -> None:
                 prepared.append(path)
                 self._prepared_source_origins[
-                    self._source_control_key(path)
+                    source_key(path)
                 ] = source_control_key
 
             source_path = self._resolve_missing_source(Path(source))
@@ -3356,24 +3430,99 @@ class KeilProjectToCMake:
             )
         return fragments
 
+    def _analyze_source_file(
+        self, path: Path, content: Optional[str] = None
+    ) -> SourceAnalysis:
+        cache = self._generation_source_analysis
+        key = self._source_control_key(path) if cache is not None else ""
+        if cache is not None and key in cache:
+            return cache[key]
+        if content is None:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        is_cxx = path.suffix.lower() in {".cpp", ".cc", ".cxx"}
+        sanitized = (
+            self._mask_c_comments_and_literals(content)
+            if is_cxx or "static" in content
+            else ""
+        )
+        float_format = re.compile(
+            r"%(?:[-+ #0']*)(?:\d+|\*)?(?:\.(?:\d+|\*))?"
+            r"(?:hh|h|ll|l|j|z|t|L)?[aAeEfFgG]"
+        )
+
+        def uses_float_io(names: str, token: str) -> bool:
+            if token not in content or "%" not in content:
+                return False
+            calls = re.compile(
+                rf"\b(?:{names})\s*\((?P<args>.{{0,2048}}?)\)\s*;",
+                re.DOTALL,
+            )
+            return any(
+                float_format.search(match.group("args"))
+                for match in calls.finditer(content)
+            )
+
+        summary = SourceAnalysis(
+            uses_heap=bool(re.search(r"\b(?:malloc|calloc|realloc)\s*\(", content)),
+            defines_sbrk=bool(re.search(
+                r"\b_?sbrk\s*\([^;{}]*\)\s*\{", content, re.MULTILINE
+            )),
+            declares_sbrk=bool(re.search(
+                r"\b_?sbrk\s*\([^;{}]*\)\s*(?:\{|$)", content, re.MULTILINE
+            )),
+            needs_irq="__disable_irq()" in content or "__enable_irq()" in content,
+            printf_float=uses_float_io(
+                "printf|fprintf|sprintf|snprintf|vprintf|vfprintf|vsprintf|vsnprintf",
+                "printf",
+            ),
+            scanf_float=uses_float_io("scanf|fscanf|sscanf|vscanf|vfscanf|vsscanf", "scanf"),
+            has_text=bool(content),
+            has_libc_init="__libc_init_array" in content,
+            migration_checks=tuple(
+                bool(pattern.search(content))
+                for pattern, _ in self.GCC_MIGRATION_CHECKS
+            ),
+            static_functions=self._find_static_function_names(
+                content, sanitized=sanitized
+            ),
+            uint32_functions=set(re.findall(
+                r"(?m)^\s*(?:static\s+)?(?:[A-Za-z_]\w*\s+)*?"
+                r"([A-Za-z_]\w*)\s*\(\s*(?:__IO\s+)?uint32_t\b", content
+            )) if "uint32_t" in content else set(),
+            assembly_symbols=re.findall(
+                r"(?i)\bblx?\s+([A-Za-z_][A-Za-z0-9_]*)\b", content
+            ),
+        )
+        if is_cxx:
+            summary.quoted_includes = re.findall(
+                r'^\s*#\s*include\s*"([^"]+)"', content, re.MULTILINE
+            )
+            summary.class_names = set(re.findall(
+                r"\b(?:class|struct|union)\s+([A-Za-z_]\w*)", sanitized
+            ))
+            summary.using_namespaces = set(re.findall(
+                r"\busing\s+namespace\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*;", content
+            ))
+            summary.namespace_functions = self._cxx_namespace_function_names(
+                content, sanitized=sanitized
+            )
+        if cache is not None:
+            cache[key] = summary
+        return summary
+
     def _gcc_newlib_heap_usage(self) -> tuple[bool, bool]:
         uses_heap = False
         defines_sbrk = False
-        definition_pattern = re.compile(
-            r"\b_?sbrk\s*\([^;{}]*\)\s*\{", re.MULTILINE
-        )
         for source in self._gcc_source_files():
             source_path = Path(source)
             if source_path.suffix.lower() not in {".c", ".cpp", ".cc", ".cxx"}:
                 continue
             try:
-                content = source_path.read_text(encoding="utf-8", errors="ignore")
+                summary = self._analyze_source_file(source_path)
             except OSError:
                 continue
-            uses_heap = uses_heap or bool(
-                re.search(r"\b(?:malloc|calloc|realloc)\s*\(", content)
-            )
-            defines_sbrk = defines_sbrk or bool(definition_pattern.search(content))
+            uses_heap = uses_heap or summary.uses_heap
+            defines_sbrk = defines_sbrk or summary.defines_sbrk
             if uses_heap and defines_sbrk:
                 break
         return uses_heap, defines_sbrk
@@ -3426,12 +3575,10 @@ class KeilProjectToCMake:
             if source_path.suffix.lower() not in {".c", ".cpp", ".cc", ".cxx"}:
                 continue
             try:
-                content = source_path.read_text(
-                    encoding="utf-8", errors="ignore"
-                )
+                summary = self._analyze_source_file(source_path)
             except OSError:
                 continue
-            if "__disable_irq()" in content or "__enable_irq()" in content:
+            if summary.needs_irq:
                 needs_irq_functions = True
         uses_heap, defines_sbrk = self._gcc_newlib_heap_usage()
         sbrk_bounds = (
@@ -3639,101 +3786,72 @@ class KeilProjectToCMake:
 
     @staticmethod
     def _mask_c_comments_and_literals(content: str) -> str:
-        masked = list(content)
-        raw_literal = re.compile(
-            r'(?:u8|u|U|L)?R"(?P<delimiter>[^ ()\\\t\v\f\r\n]{0,16})\('
+        marker = re.compile(
+            r'(?<!\w)(?:u8|u|U|L)?R"(?P<delimiter>[^ ()\\\t\v\f\r\n]{0,16})\('
+            r'|//|/\*|["\']'
         )
+        line_end = re.compile(r"(?<!\\)\r|(?<![\\\r])\n")
+        non_newline = re.compile(r"[^\r\n]+")
+        fragments: List[str] = []
         index = 0
-        state = "code"
-        quote = ""
-        while index < len(masked):
-            char = content[index]
-            next_char = content[index + 1] if index + 1 < len(content) else ""
-            if state == "code":
-                raw_match = raw_literal.match(content, index)
-                if raw_match and (
-                    index == 0
-                    or not (content[index - 1].isalnum() or content[index - 1] == "_")
-                ):
-                    terminator = f'){raw_match.group("delimiter")}"'
-                    closing = content.find(terminator, raw_match.end())
-                    literal_end = (
-                        len(content)
-                        if closing < 0
-                        else closing + len(terminator)
-                    )
-                    for position in range(index, literal_end):
-                        if content[position] not in "\r\n":
-                            masked[position] = " "
-                    index = literal_end
-                    continue
-                if char == "/" and next_char == "/":
-                    masked[index] = masked[index + 1] = " "
-                    index += 2
-                    state = "line_comment"
-                    continue
-                if char == "/" and next_char == "*":
-                    masked[index] = masked[index + 1] = " "
-                    index += 2
-                    state = "block_comment"
-                    continue
-                if char in {'"', "'"}:
-                    quote = char
-                    masked[index] = " "
-                    index += 1
-                    state = "string"
-                    continue
-            elif state == "line_comment":
-                if char == "\\" and next_char in "\r\n":
-                    masked[index] = " "
-                    if next_char == "\r" and content[index + 2 : index + 3] == "\n":
-                        index += 3
-                    else:
-                        index += 2
-                    continue
-                if char in "\r\n":
-                    state = "code"
-                else:
-                    masked[index] = " "
-                index += 1
-                continue
-            elif state == "block_comment":
-                if char == "*" and next_char == "/":
-                    masked[index] = masked[index + 1] = " "
-                    index += 2
-                    state = "code"
-                    continue
-                if char not in "\r\n":
-                    masked[index] = " "
-                index += 1
-                continue
+        # 按片段跳过普通代码，仅定位注释和字面量边界；保留字符位置与换行。
+        while match := marker.search(content, index):
+            delimiter = match.group("delimiter")
+            token = match.group(0)
+            if delimiter is not None:
+                terminator = f'){delimiter}"'
+                closing = content.find(terminator, match.end())
+                end = len(content) if closing < 0 else closing + len(terminator)
+            elif token == "//":
+                closing_line = line_end.search(content, match.end())
+                end = closing_line.start() if closing_line else len(content)
+            elif token == "/*":
+                closing = content.find("*/", match.end())
+                end = len(content) if closing < 0 else closing + 2
             else:
-                if char == "\\" and next_char:
-                    masked[index] = " "
-                    if next_char not in "\r\n":
-                        masked[index + 1] = " "
-                    index += 2
-                    continue
-                if char == quote:
-                    state = "code"
-                if char not in "\r\n":
-                    masked[index] = " "
-                index += 1
-                continue
-            index += 1
-        return "".join(masked)
+                closing = content.find(token, match.end())
+                while closing >= 0:
+                    escape_start = closing
+                    while (
+                        escape_start > match.end()
+                        and content[escape_start - 1] == "\\"
+                    ):
+                        escape_start -= 1
+                    if (closing - escape_start) % 2 == 0:
+                        break
+                    closing = content.find(token, closing + 1)
+                end = len(content) if closing < 0 else closing + 1
+            fragments.append(content[index : match.start()])
+            fragments.append(
+                non_newline.sub(
+                    lambda span: " " * (span.end() - span.start()),
+                    content[match.start() : end],
+                )
+            )
+            index = end
+        if not fragments:
+            return content
+        fragments.append(content[index:])
+        return "".join(fragments)
 
     @staticmethod
-    def _find_static_function_names(content: str) -> Set[str]:
+    def _find_static_function_names(
+        content: str, *, sanitized: Optional[str] = None
+    ) -> Set[str]:
+        if "static" not in content:
+            return set()
         pattern = re.compile(
             r"(?m)^\s*static\b[^\n;{}=]*?\b([A-Za-z_]\w*)\s*"
             r"\([^;\n{}]*\)[ \t]*(?:\r?\n[ \t]*)?\{"
         )
-        sanitized = KeilProjectToCMake._mask_c_comments_and_literals(content)
+        if sanitized is None:
+            sanitized = KeilProjectToCMake._mask_c_comments_and_literals(content)
         return {match.group(1) for match in pattern.finditer(sanitized)}
 
     @staticmethod
     def _patch_missing_uart_handle_alias(content: str) -> tuple[str, int]:
+        if "UART_HandleTypeDef" not in content:
+            return content, 0
         sanitized = KeilProjectToCMake._mask_c_comments_and_literals(content)
         if re.search(r"(?m)^[ \t]*#[ \t]*include\b", sanitized):
             return content, 0
@@ -3830,32 +3948,27 @@ class KeilProjectToCMake:
         inline_forced_names: Set[str] = set()
         uint32_function_names: Set[str] = set()
         static_function_names: Set[str] = set()
-        function_pattern = re.compile(
-            r"(?m)^\s*(?:static\s+)?(?:[A-Za-z_]\w*\s+)*?"
-            r"(?P<name>[A-Za-z_]\w*)\s*\(\s*(?:__IO\s+)?uint32_t\b"
-        )
         for source in self.source_files:
             try:
-                source_content = Path(source).read_text(
-                    encoding="utf-8", errors="ignore"
-                )
+                summary = self._analyze_source_file(Path(source))
             except OSError:
                 continue
-            uint32_function_names.update(
-                match.group("name") for match in function_pattern.finditer(source_content)
-            )
-            static_function_names.update(
-                self._find_static_function_names(source_content)
-            )
-        for header in self._dedupe_keep_order(
-            [str(path.resolve(strict=False)) for path in candidates]
-        ):
+            uint32_function_names.update(summary.uint32_functions)
+            static_function_names.update(summary.static_functions)
+        include_pattern = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MULTILINE)
+        header_references: Dict[str, List[str]] = {}
+        canonical_candidates = [str(self._resolved_path(path)) for path in candidates]
+        for header in self._dedupe_keep_order(canonical_candidates):
             header_path = Path(header)
-            if header_path.name.lower() in generated_names:
-                continue
             try:
                 content = header_path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
+                continue
+            header_references[header] = [
+                Path(included.replace("\\", "/")).name.lower()
+                for included in include_pattern.findall(content)
+            ]
+            if header_path.name.lower() in generated_names:
                 continue
 
             patched, replacement_count = self._patch_legacy_stdint_header(content)
@@ -3891,16 +4004,9 @@ class KeilProjectToCMake:
             self.include_path_order.remove(compat_dir_text)
             self.include_path_order.insert(0, compat_dir_text)
         reference_counts = {name: 0 for name in forced_names}
-        include_pattern = re.compile(
-            r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.MULTILINE
-        )
-        for header in candidates:
-            try:
-                header_content = header.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for included in include_pattern.findall(header_content):
-                included_name = Path(included.replace("\\", "/")).name.lower()
+        # 保留原候选列表的重复计数，避免改变强制包含头文件的排序。
+        for header in canonical_candidates:
+            for included_name in header_references.get(header, []):
                 if included_name in reference_counts:
                     reference_counts[included_name] += 1
 
@@ -3915,10 +4021,11 @@ class KeilProjectToCMake:
 
     @staticmethod
     def _cxx_namespace_function_names(
-        content: str,
+        content: str, *, sanitized: Optional[str] = None,
     ) -> List[Tuple[str, str, str, str, str]]:
         """Find namespace-qualified function definitions in C++ source text."""
-        sanitized = KeilProjectToCMake._mask_c_comments_and_literals(content)
+        if sanitized is None:
+            sanitized = KeilProjectToCMake._mask_c_comments_and_literals(content)
         pattern = re.compile(
             r"(?ms)^[ \t]*(?P<prefix>[^{}\n;]*?)"
             r"\b(?P<qualified>(?:[A-Za-z_]\w*::)+"
@@ -4121,7 +4228,7 @@ class KeilProjectToCMake:
 
     @staticmethod
     def _gcc_declared_namespace_functions(
-        contents: List[str],
+        contents: List[str], *, already_sanitized: bool = False,
     ) -> Set[Tuple[str, str, Tuple[str, ...]]]:
         declared: Set[Tuple[str, str, Tuple[str, ...]]] = set()
         namespace_start_pattern = re.compile(
@@ -4209,7 +4316,10 @@ class KeilProjectToCMake:
                     declared.add(key)
 
         for content in contents:
-            sanitized = KeilProjectToCMake._mask_c_comments_and_literals(content)
+            sanitized = (
+                content if already_sanitized
+                else KeilProjectToCMake._mask_c_comments_and_literals(content)
+            )
             for match in qualified_pattern.finditer(sanitized):
                 namespace, name = match.group("qualified").rsplit("::", 1)
                 key = KeilProjectToCMake._standard_namespace_function_key(
@@ -4243,12 +4353,10 @@ class KeilProjectToCMake:
             for path in (source_files or self.source_files)
             if Path(path).suffix.lower() in {".cpp", ".cc", ".cxx"}
         ]
-        source_contents: List[str] = []
+        source_summaries: List[Tuple[Path, SourceAnalysis]] = []
         for path in source_paths:
             try:
-                source_contents.append(
-                    path.read_text(encoding="utf-8", errors="ignore")
-                )
+                source_summaries.append((path, self._analyze_source_file(path)))
             except OSError:
                 continue
 
@@ -4261,42 +4369,45 @@ class KeilProjectToCMake:
             r"^\s*#\s*include\s*\"([^\"]+)\"", re.MULTILINE
         )
         header_suffixes = {".h", ".hh", ".hpp", ".hxx", ".inc"}
+        include_cache: Dict[Tuple[Path, str], Optional[Path]] = {}
 
         def resolve_include(owner: Path, included: str) -> Optional[Path]:
+            key = (owner.parent, included)
+            if key in include_cache:
+                return include_cache[key]
             relative = Path(included.replace("\\", "/"))
             candidates = [owner.parent / relative]
             candidates.extend(directory / relative for directory in include_dirs)
-            return next(
+            selected = next(
                 (
-                    candidate.resolve(strict=False)
+                    self._resolved_path(candidate)
                     for candidate in candidates
                     if candidate.is_file()
                 ),
                 None,
             )
+            include_cache[key] = selected
+            return selected
 
         pending: List[Tuple[Path, int]] = [
             (Path(path), 0)
             for path in self.header_files
             if Path(path).is_file()
         ]
-        for source_path in source_paths:
-            try:
-                source_content = source_path.read_text(
-                    encoding="utf-8", errors="ignore"
-                )
-            except OSError:
-                continue
-            for included in include_pattern.findall(source_content):
+        for source_path, summary in source_summaries:
+            for included in summary.quoted_includes:
                 selected = resolve_include(source_path, included)
                 if selected is not None and selected.suffix.lower() in header_suffixes:
                     pending.append((selected, 1))
 
         seen: Set[str] = set()
-        header_contents: List[str] = []
+        declared: Set[Tuple[str, str, Tuple[str, ...]]] = set()
+        class_names: Set[str] = set()
+        for _, summary in source_summaries:
+            class_names.update(summary.class_names)
         while pending:
             path, depth = pending.pop()
-            path = path.resolve(strict=False)
+            path = self._resolved_path(path)
             key = self._source_control_key(path)
             if key in seen:
                 continue
@@ -4306,7 +4417,13 @@ class KeilProjectToCMake:
             except OSError:
                 continue
             if path.suffix.lower() in header_suffixes:
-                header_contents.append(content)
+                sanitized = self._mask_c_comments_and_literals(content)
+                declared.update(self._gcc_declared_namespace_functions(
+                    [sanitized], already_sanitized=True
+                ))
+                class_names.update(re.findall(
+                    r"\b(?:class|struct|union)\s+([A-Za-z_]\w*)", sanitized
+                ))
             if depth >= 2:
                 continue
             for included in include_pattern.findall(content):
@@ -4314,16 +4431,11 @@ class KeilProjectToCMake:
                 if selected is not None and selected.suffix.lower() in header_suffixes:
                     pending.append((selected, depth + 1))
 
-        declared = self._gcc_declared_namespace_functions(header_contents)
         declared_aliases = set(declared)
-        using_namespace_pattern = re.compile(
-            r"\busing\s+namespace\s+"
-            r"(?P<namespace>[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*;"
-        )
         using_namespaces = {
             namespace
-            for content in source_contents
-            for namespace in using_namespace_pattern.findall(content)
+            for _, summary in source_summaries
+            for namespace in summary.using_namespaces
         }
         for declared_namespace, name, parameters in declared:
             for using_namespace in using_namespaces:
@@ -4334,21 +4446,11 @@ class KeilProjectToCMake:
                         declared_aliases.add(
                             (alias_namespace, name, parameters)
                         )
-        class_names: Set[str] = set()
-        for content in [*source_contents, *header_contents]:
-            sanitized = self._mask_c_comments_and_literals(content)
-            class_names.update(
-                re.findall(
-                    r"\b(?:class|struct|union)\s+([A-Za-z_]\w*)",
-                    sanitized,
-                )
-            )
-
         missing: List[Tuple[str, str, str]] = []
         seen_functions: Set[Tuple[str, str, Tuple[str, ...]]] = set()
-        for content in source_contents:
+        for _, summary in source_summaries:
             for namespace, name, return_type, parameters, suffix in (
-                self._cxx_namespace_function_names(content)
+                summary.namespace_functions
             ):
                 if namespace.rsplit("::", 1)[-1] in class_names:
                     continue
@@ -5134,16 +5236,15 @@ SECTIONS
 
     def _gcc_inline_assembly_symbols(self) -> List[str]:
         symbols: List[str] = []
-        pattern = re.compile(r"(?i)\bblx?\s+([A-Za-z_][A-Za-z0-9_]*)\b")
         for source in self._gcc_source_files():
             source_path = Path(source)
             if source_path.suffix.lower() not in {".c", ".cpp", ".cc", ".cxx"}:
                 continue
             try:
-                content = source_path.read_text(encoding="utf-8", errors="ignore")
+                summary = self._analyze_source_file(source_path)
             except OSError:
                 continue
-            symbols.extend(match.group(1) for match in pattern.finditer(content))
+            symbols.extend(summary.assembly_symbols)
         return sorted(self._dedupe_keep_order(symbols))
 
     def _gcc_uses_printf_float(self) -> bool:
@@ -5155,20 +5256,6 @@ SECTIONS
         return scanf_float
 
     def _gcc_formatted_io_float_requirements(self) -> tuple[bool, bool]:
-        float_format = re.compile(
-            r"%(?:[-+ #0']*)(?:\d+|\*)?(?:\.(?:\d+|\*))?"
-            r"(?:hh|h|ll|l|j|z|t|L)?[aAeEfFgG]"
-        )
-        printf_call = re.compile(
-            r"\b(?:printf|fprintf|sprintf|snprintf|vprintf|vfprintf|vsprintf|vsnprintf)"
-            r"\s*\((?P<args>.{0,2048}?)\)\s*;",
-            re.DOTALL,
-        )
-        scanf_call = re.compile(
-            r"\b(?:scanf|fscanf|sscanf|vscanf|vfscanf|vsscanf)"
-            r"\s*\((?P<args>.{0,2048}?)\)\s*;",
-            re.DOTALL,
-        )
         uses_printf_float = False
         uses_scanf_float = False
         for source in self._gcc_source_files():
@@ -5176,19 +5263,11 @@ SECTIONS
             if source_path.suffix.lower() not in {".c", ".cpp", ".cc", ".cxx"}:
                 continue
             try:
-                content = source_path.read_text(encoding="utf-8", errors="ignore")
+                summary = self._analyze_source_file(source_path)
             except OSError:
                 continue
-            if not uses_printf_float:
-                uses_printf_float = any(
-                    float_format.search(match.group("args"))
-                    for match in printf_call.finditer(content)
-                )
-            if not uses_scanf_float:
-                uses_scanf_float = any(
-                    float_format.search(match.group("args"))
-                    for match in scanf_call.finditer(content)
-                )
+            uses_printf_float = uses_printf_float or summary.printf_float
+            uses_scanf_float = uses_scanf_float or summary.scanf_float
             if uses_printf_float and uses_scanf_float:
                 break
         return uses_printf_float, uses_scanf_float
@@ -5208,7 +5287,7 @@ SECTIONS
     def _analyze_gcc_migration_issues(
         self, prepared_sources: List[str], linker_script: str
     ) -> None:
-        source_texts: List[tuple[Path, str]] = []
+        source_summaries: List[tuple[Path, SourceAnalysis]] = []
         for source in prepared_sources:
             path = Path(source)
             if path.suffix.lower() not in {
@@ -5221,20 +5300,21 @@ SECTIONS
             }:
                 continue
             try:
-                source_texts.append(
-                    (path, path.read_text(encoding="utf-8", errors="ignore"))
-                )
+                source_summaries.append((path, self._analyze_source_file(path)))
             except OSError:
                 continue
 
-        combined = "\n".join(content for _, content in source_texts)
         cxx_project = "CXX" in self._project_languages()
-        startup_text = "\n".join(
-            content
-            for path, content in source_texts
+        startup_summaries = [
+            summary
+            for path, summary in source_summaries
             if path.name.lower().startswith("startup_")
-        )
-        if cxx_project and startup_text and "__libc_init_array" not in startup_text:
+        ]
+        if (
+            cxx_project
+            and any(summary.has_text for summary in startup_summaries)
+            and not any(summary.has_libc_init for summary in startup_summaries)
+        ):
             self._append_warning_once(
                 "迁移检查: C++ 工程启动文件未引用 __libc_init_array，"
                 "全局对象构造函数可能不会执行"
@@ -5263,43 +5343,12 @@ SECTIONS
                     "异常展开或回溯功能可能不完整"
                 )
 
-        checks = [
-            (
-                re.compile(r"\$(?:Sub|Super)\$\$[A-Za-z_]\w*"),
-                "迁移检查: 检测到 Arm linker $Sub$$/$Super$$ 符号包装，"
-                "GNU ld 需要 --wrap 或源码适配",
-            ),
-            (
-                re.compile(
-                    r"\b(?:__rt_entry|__rt_lib_init|__user_initial_stackheap)\b"
-                ),
-                "迁移检查: 检测到 Arm C Library 私有入口，"
-                "newlib 不提供等价符号",
-            ),
-            (
-                re.compile(
-                    r"\b__asm\s+(?:void|int|unsigned|long|short|char)\s+"
-                    r"[A-Za-z_]\w*\s*\("
-                ),
-                "迁移检查: 转换后仍存在 ARMASM 函数语法，"
-                "需要人工转换为 GNU 扩展汇编",
-            ),
-            (
-                re.compile(r"__attribute__\s*\(\(\s*at\s*\("),
-                "迁移检查: 检测到绝对地址放置属性 at(...)，"
-                "需要在 GNU 链接脚本中定义专用 section",
-            ),
-        ]
-        for pattern, warning in checks:
-            if pattern.search(combined):
+        for index, (_, warning) in enumerate(self.GCC_MIGRATION_CHECKS):
+            if any(summary.migration_checks[index] for _, summary in source_summaries):
                 self._append_warning_once(warning)
 
-        uses_heap = re.search(r"\b(?:malloc|calloc|realloc)\s*\(", combined)
-        defines_sbrk = re.search(
-            r"\b_?sbrk\s*\([^;{}]*\)\s*(?:\{|$)",
-            combined,
-            re.MULTILINE,
-        )
+        uses_heap = any(summary.uses_heap for _, summary in source_summaries)
+        defines_sbrk = any(summary.declares_sbrk for _, summary in source_summaries)
         if uses_heap and not defines_sbrk:
             self._append_warning_once(
                 "迁移检查: 工程调用 newlib 动态内存函数但未发现 _sbrk 实现，"
@@ -5600,6 +5649,8 @@ SECTIONS
         return self._dedupe_keep_order(debuggers)
 
     def _write_text_file(self, path: Path, content: str) -> None:
+        if self._generation_source_analysis is not None:
+            self._generation_source_analysis.pop(self._source_control_key(path), None)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(content)
@@ -5868,8 +5919,8 @@ SECTIONS
     def _vscode_workspace_reference(
         self, path: str | Path, output_path: Path, role: str
     ) -> str:
-        resolved = Path(path).resolve(strict=False)
-        output_root = output_path.resolve(strict=False)
+        resolved = self._resolved_path(path)
+        output_root = self._resolved_path(output_path)
         try:
             relative = os.path.relpath(resolved, output_root).replace("\\", "/")
         except ValueError:
@@ -5922,15 +5973,15 @@ SECTIONS
         }
 
     def _vscode_workspace_root(self, output_path: Path) -> Path:
-        project_dir = self.project_dir.resolve(strict=False)
+        project_dir = self._resolved_path(self.project_dir)
         candidate = project_dir.parent
         try:
-            output_path.resolve(strict=False).relative_to(candidate)
+            self._resolved_path(output_path).relative_to(candidate)
         except ValueError:
             return output_path
 
         for source in self.source_files:
-            source_path = Path(source).resolve(strict=False)
+            source_path = self._resolved_path(source)
             try:
                 source_path.relative_to(candidate)
             except ValueError:
@@ -6115,7 +6166,7 @@ SECTIONS
         )
 
     def _relative_workspace_path(self, path: Path, output_path: Path) -> str:
-        return self._normalize_path(str(path.resolve(strict=False)), str(output_path))
+        return self._normalize_path(str(self._resolved_path(path)), str(output_path))
 
     def _artifact_path(
         self,
@@ -7037,8 +7088,7 @@ SECTIONS
         compatible_compile_options = self._gcc_compatible_compile_options()
         lto_default = "ON" if self._gcc_lto_enabled() else "OFF"
         inline_assembly_symbols = self._gcc_inline_assembly_symbols()
-        uses_printf_float = self._gcc_uses_printf_float()
-        uses_scanf_float = self._gcc_uses_scanf_float()
+        uses_printf_float, uses_scanf_float = self._gcc_formatted_io_float_requirements()
         copy_if_exists_script = Path(dest) / "cmake" / "copy_if_exists.cmake"
         self._write_text_file(
             copy_if_exists_script,
@@ -7415,6 +7465,8 @@ endif()
         output_path = Path(output_dir) if output_dir else self._default_output_path(options)
         output_path.mkdir(parents=True, exist_ok=True)
         previous_callback = self._generation_progress_callback
+        previous_resolved_paths = self._generation_resolved_paths
+        previous_source_analysis = self._generation_source_analysis
         self._generation_progress_callback = progress_callback
 
         try:
@@ -7422,10 +7474,13 @@ endif()
             self._copy_staged_source_mappings = []
             self._prepared_source_origins = {}
             self._lvgl_lazy_new_allocator_cache = None
+            self._repository_root_cache = None
             validation_report = output_path / "build-validation.json"
             if validation_report.is_file() or validation_report.is_symlink():
                 validation_report.unlink()
             self._clean_generated_cmake_assets(output_path)
+            self._generation_resolved_paths = {}
+            self._generation_source_analysis = {}
             with open(output_path / "CMakeLists.txt", "w", encoding="utf-8") as f:
                 self._write_cmake_content_with_options(f, str(output_path), options)
 
@@ -7472,6 +7527,8 @@ endif()
             self.include_paths = parsed_include_paths
             self.include_path_order = parsed_include_path_order
             self._generation_progress_callback = previous_callback
+            self._generation_resolved_paths = previous_resolved_paths
+            self._generation_source_analysis = previous_source_analysis
 
     def generate_cmake(
         self,
