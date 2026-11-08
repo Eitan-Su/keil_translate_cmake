@@ -578,6 +578,33 @@ AT32 的 2,804 个 SDK 文件、F30x 的 3,458 个 SDK 文件、E23x 的 624 个
 共五个目标全部通过，重复运行全部复用。记录在 `final-smoke/`、`smoke-timing.json`
 及 `final-audit.json`，详细统计见回归基线。
 
+## 2026-11-09 桌面交互与取消功能验证
+
+通过桌面界面从原始 Keil 工程执行转换和完整构建，验证阶段显示、实时日志、
+运行期间设置锁定、编译中取消和重新运行。
+
+| 工程 | 器件 | 验证结果 |
+| --- | --- | --- |
+| AT32F415 V2.1.8 `project/at_start_f415/examples/gpio/led_toggle/mdk_v5/led_toggle.uvprojx` | AT32F415RCT7 | 编译中取消，重新运行后配置、编译、链接及 ELF 生成通过 |
+| GD32E23x V2.5.0 `Template/Keil_project/Project.uvprojx` | GD32E230C8 | 配置、编译、链接及 ELF 生成通过 |
+
+AT32 来源为 `D:\singlechip\AT32\f415\AT32F415_Firmware_Library_V2.1.8`，
+GD32 来源为 `.cache/gd32-20261108/sdk/e23/content/GD32E23x_Firmware_Library_V2.5.0`。
+原始 SDK 文件及构建期间生成源码的 SHA-256 校验通过，未手工修改工程或源码。
+两项均为既有通过工程的重复验证，独立工程仍为 183 项，器件规格仍为 27 项；
+器件表工程数量与批量例程分类统计保持原值。
+
+验证环境为 Windows、CMake 4.3.1、MinGW Makefiles、GNU Make 4.4.1、
+Arm GNU Toolchain 13.3.Rel1 的 GCC 13.3.1 20240614。
+本轮将已有原生 `make.exe` 复制为项目内的 `mingw32-make.exe` 以供 CMake 自动发现。
+取消后的 AT32 完整运行耗时 10.386 秒，GD32 完整运行耗时 21.540 秒；
+时间包含 GUI 发起转换和构建，不代表单独的转换耗时。
+
+首次 Ninja 运行在本机环境停滞，深层 GD32 SDK 缓存出现 Windows GCC 头文件
+查找失败；相应测试产物保留，最终使用上述较短的既有 SDK 副本及 Make 完成验收。
+证据位于 `.cache/ui-interaction-20261109/exercise.json`，成功构建分别位于
+`at32f415-verified/` 和 `gd32e230-verified/`。未新增开发板硬件验证。
+
 ## 维护规则
 
 新增记录必须来源于真实构建结果。仅完成 XML 解析、CMake 文件生成或单个源文件编译的工程不能加入本清单。新增芯片或工程时，应同步记录器件名称、工程路径、工具链版本和最终固件类型。

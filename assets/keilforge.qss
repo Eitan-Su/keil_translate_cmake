@@ -31,6 +31,9 @@ QLabel#statusPill {
 QLabel#statusPill[state="running"] { color: #4b653a; background: #e4edd9; }
 QLabel#statusPill[state="success"] { color: #3d623c; background: #e1edda; }
 QLabel#statusPill[state="failed"] { color: #9d4d40; background: #f6eae2; }
+QLabel#statusPill[state="cancelled"] { color: #776f60; background: #efece4; }
+QLabel#fieldError { color: #9d4d40; font-size: 9pt; }
+QLineEdit[invalid="true"] { border-color: #b77765; }
 QFrame#pipeline, QFrame#stage { background: transparent; border: none; }
 QLabel#stageIndex {
     color: #7a866c; background: #e9ede2; border: none; border-radius: 11px;
@@ -40,6 +43,7 @@ QLabel#stageIndex {
 QLabel#stageIndex[state="pending"] { color: #8c967f; background: #edf0e7; }
 QLabel#stageIndex[state="running"], QLabel#stageIndex[state="complete"] { color: #ffffff; background: #697d55; }
 QLabel#stageIndex[state="failed"] { color: #ffffff; background: #aa6454; }
+QLabel#stageIndex[state="cancelled"] { color: #776f60; background: #e6e3da; }
 QLabel#stageName { color: #5d6e4e; font-size: 9pt; }
 QLabel#stageName[state="running"] { color: #3d5430; font-weight: 600; }
 QLabel#stageName[state="pending"] { color: #8a937f; }
@@ -110,13 +114,17 @@ QProgressBar#memoryBar { min-height: 4px; max-height: 4px; background: #dfe6d3; 
 QProgressBar#memoryBar::chunk { background: #91a479; border-radius: 2px; }
 QFrame#actionBar { background: #fffffc; border-top: 1px solid #e7e9e0; }
 QFrame#statusBar { background: #fffffc; border: none; }
-QProgressBar#mainProgress { min-height: 2px; max-height: 2px; border: none; background: #eff2e9; }
-QProgressBar#mainProgress::chunk { background: #82996a; }
+QFrame#taskPanel { background: #f3f5ec; border-top: 1px solid #e1e6d7; }
+QLabel#taskTitle { color: #3d5131; font-size: 11pt; font-weight: 600; }
+QProgressBar#mainProgress { min-height: 7px; max-height: 7px; border: none; border-radius: 3px; background: #e1e7d8; }
+QProgressBar#mainProgress::chunk { background: #82996a; border-radius: 3px; }
+QProgressBar#mainProgress[state="failed"] { background: #eddad1; }
+QProgressBar#mainProgress[state="cancelled"] { background: #e4e1d7; }
 QFrame#console { background: #fafaf6; border: none; }
 QLabel#consoleTitle { font-size: 26pt; color: #303f2f; font-weight: 500; }
 QPushButton#consoleButton { min-height: 32px; color: #79816f; background: transparent; border: none; padding: 0 10px; }
 QPushButton#consoleButton:hover { color: #34482a; background: #edf2e5; }
-QTextBrowser {
+QPlainTextEdit {
     color: #4c5943; background: #fffffd; border: 1px solid #e1e6d9; border-radius: 12px;
     padding: 16px; font-family: "Consolas", "Microsoft YaHei UI"; font-size: 9pt;
     selection-background-color: #dfe9d3;

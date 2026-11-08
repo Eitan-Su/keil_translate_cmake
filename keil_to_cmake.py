@@ -249,10 +249,24 @@ class CommandResult:
     stderr: str
     duration_seconds: float
     error: str = ""
+    cancelled: bool = False
 
     @property
     def succeeded(self) -> bool:
-        return self.return_code == 0 and not self.error
+        return self.return_code == 0 and not self.error and not self.cancelled
+
+
+class OperationCancelled(Exception):
+    """Stop conversion at a checkpoint without reporting a conversion failure."""
+
+
+@dataclass(frozen=True)
+class BuildActivity:
+    phase: str
+    message: str
+    current: int = 0
+    total: int = 0
+    unit: str = "steps"
 
 
 @dataclass
@@ -268,6 +282,56 @@ class BuildValidationReport:
     configure: CommandResult
     build: Optional[CommandResult]
     diagnostics: List[BuildDiagnostic]
+
+
+class _WindowsProcessJob:
+    """Keep cancellable builds and their descendants in one Windows job."""
+
+    def __init__(self, process):
+        import ctypes
+        from ctypes import wintypes
+
+        class Limits(ctypes.Structure):
+            _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+                        ("flags", wintypes.DWORD), ("min_working_set", ctypes.c_size_t),
+                        ("max_working_set", ctypes.c_size_t), ("active_processes", wintypes.DWORD),
+                        ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+                        ("scheduling", wintypes.DWORD)]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [("basic", Limits), ("io_counters", ctypes.c_uint64 * 6),
+                        ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                        ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t)]
+
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        self.kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        self.kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        self.kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.handle = self.kernel.CreateJobObjectW(None, None)
+        if not self.handle:
+            error = ctypes.get_last_error()
+            process.kill()
+            process.wait()
+            raise ctypes.WinError(error)
+        limits = ExtendedLimits()
+        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        try:
+            if not self.kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not self.kernel.AssignProcessToJobObject(self.handle, int(process._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except OSError:
+            self.close()
+            process.kill()
+            process.wait()
+            raise
+
+    def close(self):
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
 
 
 class BuildValidator:
@@ -296,10 +360,23 @@ class BuildValidator:
         self,
         timeout_seconds: int = 300,
         progress_callback: Optional[Callable[[int, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        activity_callback: Optional[Callable[[BuildActivity], None]] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
     ):
         self.timeout_seconds = timeout_seconds
         self.progress_callback = progress_callback
+        self.cancel_check = cancel_check
+        self.activity_callback = activity_callback
+        self.log_callback = log_callback
         self._last_progress = -1
+
+    def _cancel_requested(self) -> bool:
+        return self.cancel_check is not None and self.cancel_check()
+
+    def _activity(self, phase: str, message: str, current=0, total=0, unit="steps") -> None:
+        if self.activity_callback is not None:
+            self.activity_callback(BuildActivity(phase, message, current, total, unit))
 
     def _emit_progress(self, value: int, message: str) -> None:
         value = max(0, min(100, int(value)))
@@ -325,6 +402,8 @@ class BuildValidator:
         return None
 
     def _handle_stream_line(self, phase: str, line: str) -> None:
+        if self.log_callback is not None:
+            self.log_callback(line)
         if phase == "configure":
             if "Configuring done" in line:
                 self._emit_progress(6, "CMake 配置完成")
@@ -333,11 +412,16 @@ class BuildValidator:
             return
 
         progress = self._build_progress_from_line(line)
-        if progress is None:
-            return
-        current, total = progress
-        percent = 10 + round(88 * current / total)
-        self._emit_progress(percent, f"编译 {current}/{total}")
+        if progress is not None:
+            current, total = progress
+            percent = 10 + round(88 * current / total)
+            self._emit_progress(percent, f"编译 {current}/{total}")
+        # A build counter also counts link and post-build commands, not just sources.
+        if re.search(r"\bLinking\b|\barmlink(?:\.exe)?\b", line, re.I):
+            self._activity("link", "正在链接固件")
+        elif progress is not None:
+            unit = "percent" if re.search(r"\[\s*\d+%\s*\]", line) else "steps"
+            self._activity("compile", "正在编译", current, total, unit)
 
     @staticmethod
     def _process_group_options() -> Dict[str, Any]:
@@ -349,6 +433,11 @@ class BuildValidator:
 
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen) -> None:
+        job = process.__dict__.get("_keil_job")
+        if job is not None:
+            job.close()
+            process.wait(timeout=10)
+            return
         if process.poll() is not None:
             return
 
@@ -389,6 +478,8 @@ class BuildValidator:
         started = time.monotonic()
         stdout_parts: List[str] = []
         stderr_parts: List[str] = []
+        if self._cancel_requested():
+            return CommandResult(command, None, "", "", 0, "Cancelled by user", True)
         try:
             process = subprocess.Popen(
                 command,
@@ -401,6 +492,8 @@ class BuildValidator:
                 bufsize=1,
                 **self._process_group_options(),
             )
+            if os.name == "nt" and self.cancel_check is not None:
+                process._keil_job = _WindowsProcessJob(process)
         except OSError as exc:
             return CommandResult(
                 command=command,
@@ -438,26 +531,37 @@ class BuildValidator:
 
         completed_streams = 0
         error = ""
-        while completed_streams < len(readers) or process.poll() is None:
-            if time.monotonic() - started >= self.timeout_seconds:
+        cancelled = False
+        try:
+            while completed_streams < len(readers) or process.poll() is None:
+                if self._cancel_requested():
+                    cancelled = True
+                    error = "Cancelled by user"
+                    break
+                if time.monotonic() - started >= self.timeout_seconds:
+                    error = f"Command timed out after {self.timeout_seconds} seconds"
+                    break
+                try:
+                    stream_name, line = output_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    completed_streams += 1
+                    continue
+                if stream_name == "stdout":
+                    stdout_parts.append(line)
+                else:
+                    stderr_parts.append(line)
+                self._handle_stream_line(phase, line.rstrip())
+        finally:
+            # Cancellation and callback failures must both release child processes.
+            if process.poll() is None:
                 self._terminate_process_tree(process)
-                error = f"Command timed out after {self.timeout_seconds} seconds"
-                break
-            try:
-                stream_name, line = output_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if line is None:
-                completed_streams += 1
-                continue
-            if stream_name == "stdout":
-                stdout_parts.append(line)
-            else:
-                stderr_parts.append(line)
-            self._handle_stream_line(phase, line.rstrip())
-
-        for reader in readers:
-            reader.join(timeout=1)
+            job = process.__dict__.get("_keil_job")
+            if job is not None:
+                job.close()
+            for reader in readers:
+                reader.join(timeout=2)
         while True:
             try:
                 stream_name, line = output_queue.get_nowait()
@@ -469,6 +573,8 @@ class BuildValidator:
                 stdout_parts.append(line)
             else:
                 stderr_parts.append(line)
+            if self.log_callback is not None:
+                self.log_callback(line.rstrip())
 
         try:
             return_code = process.wait(timeout=10)
@@ -483,12 +589,15 @@ class BuildValidator:
             stderr="".join(stderr_parts),
             duration_seconds=round(time.monotonic() - started, 3),
             error=error,
+            cancelled=cancelled,
         )
 
     def _run(
         self, command: List[str], cwd: Path, phase: str = ""
     ) -> CommandResult:
-        if self.progress_callback is not None:
+        if any(callback is not None for callback in (
+            self.progress_callback, self.cancel_check, self.activity_callback, self.log_callback
+        )):
             return self._run_streaming(command, cwd, phase)
         started = time.monotonic()
         try:
@@ -534,6 +643,8 @@ class BuildValidator:
             )
 
     def _classify(self, phase: str, result: CommandResult) -> List[BuildDiagnostic]:
+        if result.cancelled:
+            return [BuildDiagnostic("cancelled", phase, "Cancelled by user")]
         if result.succeeded:
             return []
         text = "\n".join((result.error, result.stdout, result.stderr))
@@ -572,6 +683,7 @@ class BuildValidator:
     ) -> BuildValidationReport:
         self._last_progress = -1
         self._emit_progress(0, "准备 CMake 配置")
+        self._activity("configure", "正在配置 CMake")
         build_dir = source_dir / str(options.build_dir)
         configure_command = [
             "cmake",
@@ -584,17 +696,23 @@ class BuildValidator:
         ]
         configure = self._run(configure_command, source_dir, "configure")
         diagnostics = self._classify("configure", configure)
+        if configure.cancelled:
+            return BuildValidationReport("cancelled", configure, None, diagnostics)
         if not configure.succeeded:
             return BuildValidationReport("configure_failed", configure, None, diagnostics)
 
         self._emit_progress(10, "开始编译")
+        self._activity("compile", "正在启动编译")
         build_command = ["cmake", "--build", str(build_dir)]
         if _is_multi_config_generator(options.generator):
             build_command.extend(["--config", "Debug"])
         build = self._run(build_command, source_dir, "build")
         diagnostics.extend(self._classify("build", build))
+        if build.cancelled:
+            return BuildValidationReport("cancelled", configure, build, diagnostics)
         status = "success" if build.succeeded else "build_failed"
         if build.succeeded:
+            self._activity("artifact", "正在检查固件文件")
             missing_artifacts = [
                 artifact
                 for artifact in expected_artifacts or []
@@ -7720,6 +7838,8 @@ endif()
             self._emit_generation_progress(100, "CMake 工程生成完成")
 
             return True
+        except OperationCancelled:
+            raise
         except Exception as e:
             self.last_error = f"Error generating CMake files: {e}"
             print(self.last_error, file=sys.stderr)
@@ -7759,12 +7879,18 @@ endif()
         generation_options: GenerationOptions,
         timeout_seconds: int = 300,
         progress_callback: Optional[Callable[[int, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        activity_callback: Optional[Callable[[BuildActivity], None]] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
     ) -> BuildValidationReport:
         options = generation_options.normalized()
         output_path = Path(output_dir) if output_dir else self._default_output_path(options)
         validator = BuildValidator(
             timeout_seconds=timeout_seconds,
             progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            activity_callback=activity_callback,
+            log_callback=log_callback,
         )
         artifact_suffixes = (
             [".elf", ".hex", ".bin"] if options.compiler == "gcc" else [".axf"]

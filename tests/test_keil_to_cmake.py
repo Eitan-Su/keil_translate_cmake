@@ -3,6 +3,8 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import textwrap
 import unittest
 import xml.etree.ElementTree as ET
@@ -16,6 +18,7 @@ from keil_to_cmake import (
     CommandResult,
     GenerationOptions,
     KeilProjectToCMake,
+    OperationCancelled,
     SourceCompileSettings,
     SUPPORTED_DEBUG_BACKENDS,
     SUPPORTED_DEBUG_PROBES,
@@ -3064,6 +3067,107 @@ class KeilToCMakeTests(unittest.TestCase):
         self.assertTrue(result.succeeded)
         self.assertIn("[2/4] Building C object", result.stdout)
         self.assertIn((54, "编译 2/4"), events)
+
+    def test_validator_reports_stage_counts_and_live_plain_logs(self):
+        events, logs = [], []
+        validator = BuildValidator(activity_callback=events.append, log_callback=logs.append)
+        with TemporaryDirectory() as temp_dir:
+            result = validator._run(
+                [sys.executable, '-c', "print('[2/4] Building C object main.c'); print('[3/4] Linking C executable app.elf')"],
+                Path(temp_dir), 'build',
+            )
+        self.assertTrue(result.succeeded)
+        self.assertEqual((events[0].phase, events[0].current, events[0].total), ('compile', 2, 4))
+        self.assertEqual(events[-1].phase, 'link')
+        self.assertIn('main.c', logs[0])
+        validator._handle_stream_line('build', '[ 42%] Building C object')
+        self.assertEqual(events[-1].unit, 'percent')
+
+    def test_cancel_before_configure_never_spawns_a_process(self):
+        validator = BuildValidator(cancel_check=lambda: True)
+        with TemporaryDirectory() as temp_dir, patch('keil_to_cmake.subprocess.Popen') as spawn:
+            report = validator.validate(Path(temp_dir), GenerationOptions().normalized())
+        self.assertFalse(spawn.called)
+        self.assertEqual(report.status, 'cancelled')
+        self.assertTrue(report.configure.cancelled)
+        self.assertFalse(report.configure.succeeded)
+        self.assertIsNone(report.build)
+
+    def test_cancel_running_build_retains_logs_and_stops_promptly(self):
+        cancellation = threading.Event()
+        logs = []
+        def on_log(line):
+            logs.append(line)
+            if 'ready' in line:
+                cancellation.set()
+        validator = BuildValidator(cancel_check=cancellation.is_set, log_callback=on_log)
+        with TemporaryDirectory() as temp_dir:
+            started = time.monotonic()
+            result = validator._run([sys.executable, '-c',
+                "import time; print('ready', flush=True); time.sleep(30)"], Path(temp_dir), 'build')
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertTrue(result.cancelled)
+        self.assertIn('ready', result.stdout)
+        self.assertTrue(logs)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows process job test')
+    def test_cancel_stops_compiler_descendants_when_taskkill_is_unavailable(self):
+        import ctypes
+        from ctypes import wintypes
+        cancellation = threading.Event()
+        child_pid = []
+        def on_log(line):
+            if line.startswith('child='):
+                child_pid.append(int(line.split('=')[1]))
+                cancellation.set()
+        script = (
+            "import subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+            "print('child='+str(child.pid),flush=True); time.sleep(30)"
+        )
+        validator = BuildValidator(cancel_check=cancellation.is_set, log_callback=on_log)
+        with TemporaryDirectory() as temp_dir, patch('keil_to_cmake.subprocess.run', side_effect=OSError('blocked')):
+            result = validator._run([sys.executable, '-c', script], Path(temp_dir), 'build')
+        self.assertTrue(result.cancelled)
+        self.assertTrue(child_pid)
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, child_pid[0])
+        if handle:
+            try:
+                exit_code = wintypes.DWORD()
+                self.assertTrue(kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code)))
+                self.assertNotEqual(exit_code.value, 259)
+            finally:
+                kernel.CloseHandle(handle)
+
+    def test_cancel_generation_restores_parser_and_allows_retry(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project = self._write_minimal_project(root)
+            parser = KeilProjectToCMake(str(project), target_name='Second')
+            self.assertTrue(parser.parse())
+            sources = list(parser.source_files)
+            def cancel(value, message):
+                raise OperationCancelled()
+            with self.assertRaises(OperationCancelled):
+                parser.generate_cmake(str(root / 'cancel-output'), False, progress_callback=cancel)
+            self.assertEqual(parser.source_files, sources)
+            self.assertIsNone(parser._generation_progress_callback)
+            self.assertTrue(parser.generate_cmake(str(root / 'cancel-output'), False))
+
+    def test_log_callback_exception_terminates_running_process(self):
+        validator = BuildValidator(log_callback=lambda line: (_ for _ in ()).throw(ValueError('consumer failed')))
+        with TemporaryDirectory() as temp_dir, patch.object(
+            validator, '_terminate_process_tree', wraps=validator._terminate_process_tree
+        ) as terminate:
+            with self.assertRaisesRegex(ValueError, 'consumer failed'):
+                validator._run([sys.executable, '-c',
+                    "import time; print('ready', flush=True); time.sleep(30)"], Path(temp_dir), 'build')
+        terminate.assert_called_once()
 
     def test_generation_cleans_stale_cmake_assets_only(self):
         with TemporaryDirectory() as temp_dir:

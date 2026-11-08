@@ -2,7 +2,9 @@
 import os
 import re
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -42,7 +44,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
-    QTextBrowser,
+    QPlainTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -50,9 +52,11 @@ from PySide6.QtWidgets import (
 
 from get_keil_mdk_info import find_keil_mdk_root
 from keil_to_cmake import (
+    BuildActivity,
     DEFAULT_GENERATOR_BY_HOST,
     GenerationOptions,
     KeilProjectToCMake,
+    OperationCancelled,
     SUPPORTED_COMPILERS,
     SUPPORTED_DEBUG_BACKENDS,
     SUPPORTED_DEBUG_PROBES,
@@ -192,6 +196,8 @@ class ConversionWorker(QObject):
     progress = Signal(int, str)
     memory_usage = Signal(int, int, int, int)
     finished = Signal(bool, str, str, float)
+    cancelled = Signal(str, str, float)
+    activity = Signal(object)
 
     def __init__(
         self,
@@ -209,6 +215,17 @@ class ConversionWorker(QObject):
         self.target_name = target_name
         self.options = options
         self.validate_build = validate_build
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def _check_cancelled(self):
+        if self.cancel_event.is_set():
+            raise OperationCancelled()
+
+    def _build_log(self, line):
+        self.log.emit(line)
 
     @staticmethod
     def _map_progress(value, start, end):
@@ -216,8 +233,8 @@ class ConversionWorker(QObject):
         return start + round((end - start) * value / 100)
 
     def _generation_progress(self, value, message):
-        end = 45 if self.validate_build else 99
-        self.progress.emit(self._map_progress(value, 20, end), message)
+        self._check_cancelled()
+        self.activity.emit(BuildActivity("generate", message))
 
     def _validation_progress(self, value, message):
         self.progress.emit(self._map_progress(value, 45, 99), message)
@@ -343,37 +360,42 @@ class ConversionWorker(QObject):
     @Slot()
     def run(self):
         validation_started = None
+        output_started = False
         try:
+            self._check_cancelled()
             success_message = "CMake 工程生成完成。"
-            self.progress.emit(2, "初始化转换任务")
+            self.activity.emit(BuildActivity("parse", "正在解析 Keil 工程"))
             self.log.emit(
                 f"构建配置: 编译器={self.options.compiler} | "
                 f"生成器={self.options.generator} | 构建目录={self.options.build_dir}"
             )
-            self.progress.emit(5, "解析 Keil 工程")
             self.log.emit("解析 Keil 工程...")
             parser = KeilProjectToCMake(
                 self.project_file,
                 self.uv4_path or None,
                 target_name=self.target_name or None,
             )
-            if not parser.parse():
+            parsed = parser.parse()
+            self._check_cancelled()
+            if not parsed:
                 self.finished.emit(False, parser.last_error or "解析失败", "", -1.0)
                 return
 
-            self.progress.emit(20, "工程解析完成")
             self.log.emit(
                 f"目标: {parser.target_name} | 设备: {parser.device_name} | 源文件: {len(parser.source_files)}"
             )
             self.log.emit("生成 CMake、工具链和 VS Code 配置...")
+            self.activity.emit(BuildActivity("generate", "正在生成 CMake 工程"))
+            output_started = True
             if not parser.generate_cmake(
                 self.output_dir,
                 self.options.export_vsc_settings,
                 self.options,
                 progress_callback=self._generation_progress,
             ):
-                self.finished.emit(False, parser.last_error or "生成失败", "", -1.0)
+                self.finished.emit(False, parser.last_error or "生成失败", self.output_dir, -1.0)
                 return
+            self._check_cancelled()
 
             for warning in parser.warnings:
                 self.log.emit(f"警告: {warning}")
@@ -385,8 +407,13 @@ class ConversionWorker(QObject):
                     self.output_dir,
                     self.options,
                     timeout_seconds=600,
-                    progress_callback=self._validation_progress,
+                    cancel_check=self.cancel_event.is_set,
+                    activity_callback=self.activity.emit,
+                    log_callback=self._build_log,
                 )
+                if report.status == "cancelled":
+                    raise OperationCancelled()
+                self._check_cancelled()
                 if report.status != "success":
                     categories = ", ".join(
                         diagnostic.category for diagnostic in report.diagnostics
@@ -444,7 +471,6 @@ class ConversionWorker(QObject):
                     f"构建验证通过，{artifact_labels} 产物生成完成。"
                 )
 
-            self.progress.emit(100, "转换完成")
             validation_seconds = (
                 time.monotonic() - validation_started
                 if validation_started is not None
@@ -453,6 +479,12 @@ class ConversionWorker(QObject):
             self.finished.emit(
                 True, success_message, self.output_dir, validation_seconds
             )
+        except OperationCancelled:
+            self.cancelled.emit(
+                "任务取消。生成过程可能留下部分文件，重新运行将重新生成工程配置。",
+                self.output_dir if output_started else "",
+                time.monotonic() - validation_started if validation_started is not None else -1.0,
+            )
         except Exception as exc:
             validation_seconds = (
                 time.monotonic() - validation_started
@@ -460,7 +492,7 @@ class ConversionWorker(QObject):
                 else -1.0
             )
             self.finished.emit(
-                False, str(exc), self.output_dir, validation_seconds
+                False, str(exc), self.output_dir if output_started else "", validation_seconds
             )
 
 
@@ -473,13 +505,31 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.worker_thread = None
         self.worker = None
+        self._busy = False
+        self._cancel_requested = False
+        self._task_started = None
+        self._result_output_dir = ""
+        self._result_text = ""
+        self._result_state = ""
+        self._active_task = None
+        self._log_lines = deque(maxlen=5000)
+        self._pending_logs = []
+        self._updating_log = False
+        self.log_timer = QTimer(self)
+        self.log_timer.setSingleShot(True)
+        self.log_timer.setInterval(100)
+        self.log_timer.timeout.connect(self._flush_logs)
+        self.input_timer = QTimer(self)
+        self.input_timer.setSingleShot(True)
+        self.input_timer.setInterval(180)
+        self.input_timer.timeout.connect(self._validate_inputs)
         self.stage_badges = []
         self.stage_names = []
         self.stage_details = []
         self.current_stage = 0
         self.validation_started = None
         self.validation_timer = QTimer(self)
-        self.validation_timer.setInterval(100)
+        self.validation_timer.setInterval(250)
         self.validation_timer.timeout.connect(self._refresh_validation_elapsed)
         self._entrance_animation = None
         self.setWindowTitle("KeilForge")
@@ -563,6 +613,8 @@ class MainWindow(QMainWindow):
         self.convert_button.setIconSize(QSize(18, 18))
         self.convert_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.convert_button.setShortcut("Ctrl+Return")
+        self.cancel_button = QPushButton("取消任务", objectName="secondaryButton")
+        self.cancel_button.setVisible(False)
         shell_layout.addWidget(self.top_bar)
 
         self.progress = QProgressBar(objectName="mainProgress")
@@ -675,6 +727,10 @@ class MainWindow(QMainWindow):
         project_row.addWidget(self.project_edit, 1)
         project_row.addWidget(self.project_button)
         drop_layout.addLayout(project_row)
+        self.project_error = QLabel(objectName="fieldError")
+        self.project_error.setWordWrap(True)
+        self.project_error.setVisible(False)
+        drop_layout.addWidget(self.project_error)
         content_layout.addWidget(self.project_drop)
 
         file_grid = QGridLayout()
@@ -686,6 +742,10 @@ class MainWindow(QMainWindow):
             file_grid, 0, "保存到", "选择工程后自动填写输出目录"
         )
         content_layout.addLayout(file_grid)
+        self.output_error = QLabel(objectName="fieldError")
+        self.output_error.setWordWrap(True)
+        self.output_error.setVisible(False)
+        content_layout.addWidget(self.output_error)
 
         self.compiler_combo = self._combo(SUPPORTED_COMPILERS)
         self.host_combo = self._combo(SUPPORTED_HOST_SYSTEMS)
@@ -747,10 +807,10 @@ class MainWindow(QMainWindow):
         inspector_layout.addWidget(QLabel("固件占用", objectName="fieldLabel"))
         flash_row = QHBoxLayout()
         flash_row.addWidget(QLabel("FLASH", objectName="stageName"))
-        flash_row.addStretch(1)
         self.flash_usage_label = QLabel("构建后显示", objectName="muted")
         self.flash_usage_label.setWordWrap(True)
-        flash_row.addWidget(self.flash_usage_label)
+        self.flash_usage_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        flash_row.addWidget(self.flash_usage_label, 1)
         inspector_layout.addLayout(flash_row)
         self.flash_bar = QProgressBar(objectName="memoryBar")
         self.flash_bar.setRange(0, 100)
@@ -759,10 +819,10 @@ class MainWindow(QMainWindow):
         inspector_layout.addWidget(self.flash_bar)
         ram_row = QHBoxLayout()
         ram_row.addWidget(QLabel("RAM", objectName="stageName"))
-        ram_row.addStretch(1)
         self.ram_usage_label = QLabel("构建后显示", objectName="muted")
         self.ram_usage_label.setWordWrap(True)
-        ram_row.addWidget(self.ram_usage_label)
+        self.ram_usage_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        ram_row.addWidget(self.ram_usage_label, 1)
         inspector_layout.addLayout(ram_row)
         self.ram_bar = QProgressBar(objectName="memoryBar")
         self.ram_bar.setRange(0, 100)
@@ -891,14 +951,65 @@ class MainWindow(QMainWindow):
         self.clear_log_button = QPushButton("清空", objectName="consoleButton")
         console_header.addWidget(self.clear_log_button)
         console_layout.addLayout(console_header)
-        self.log_browser = QTextBrowser()
+        log_toolbar = QHBoxLayout()
+        self.log_errors_check = QCheckBox("仅看错误")
+        self.log_follow_check = QCheckBox("自动滚动")
+        self.log_follow_check.setChecked(True)
+        self.copy_log_button = QPushButton("复制日志", objectName="consoleButton")
+        log_toolbar.addWidget(self.log_errors_check)
+        log_toolbar.addWidget(self.log_follow_check)
+        log_toolbar.addStretch(1)
+        log_toolbar.addWidget(self.copy_log_button)
+        console_layout.addLayout(log_toolbar)
+        self.log_browser = QPlainTextEdit()
+        self.log_browser.setReadOnly(True)
+        self.log_browser.setMaximumBlockCount(5000)
         self.log_browser.setPlaceholderText("转换与构建过程将显示在这里。")
-        self.log_browser.setMinimumHeight(180)
+        self.log_browser.setMinimumHeight(80)
         console_layout.addWidget(self.log_browser, 1)
         self.page_stack.addWidget(console)
         shell_layout.addWidget(self.page_stack, 1)
 
+        self.task_panel = QFrame(objectName="taskPanel")
+        task_layout = QVBoxLayout(self.task_panel)
+        task_layout.setContentsMargins(32, 14, 32, 14)
+        task_layout.setSpacing(8)
+        task_heading = QHBoxLayout()
+        self.task_title = QLabel("准备转换", objectName="taskTitle")
+        self.task_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.task_elapsed = QLabel("耗时 0.0 秒", objectName="muted")
+        task_heading.addWidget(self.task_title, 1)
+        task_heading.addWidget(self.task_elapsed)
+        task_heading.addWidget(self.cancel_button)
+        task_layout.addLayout(task_heading)
+        task_layout.addWidget(self.progress)
+        self.task_detail = QLabel(objectName="muted")
+        self.task_detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        task_layout.addWidget(self.task_detail)
+        self.result_actions = QWidget()
+        result_actions = QHBoxLayout(self.result_actions)
+        result_actions.setContentsMargins(0, 0, 0, 0)
+        result_actions.setSpacing(6)
+        self.result_details_button = QPushButton("展开详情", objectName="secondaryButton")
+        self.result_details_button.setCheckable(True)
+        self.result_log_button = QPushButton("查看日志", objectName="secondaryButton")
+        self.result_copy_button = QPushButton("复制结果", objectName="secondaryButton")
+        self.result_open_button = QPushButton("打开目录", objectName="secondaryButton")
+        for button in (self.result_details_button, self.result_log_button, self.result_copy_button, self.result_open_button):
+            result_actions.addWidget(button)
+        result_actions.addStretch(1)
+        task_layout.addWidget(self.result_actions)
+        self.result_details = QPlainTextEdit()
+        self.result_details.setReadOnly(True)
+        self.result_details.setFixedHeight(100)
+        self.result_details.setVisible(False)
+        task_layout.addWidget(self.result_details)
+        self.task_panel.setVisible(False)
+        self.result_actions.setVisible(False)
+        shell_layout.addWidget(self.task_panel)
+
         action_bar = QFrame(objectName="actionBar")
+        self.action_bar = action_bar
         self.action_layout = QHBoxLayout(action_bar)
         self.action_layout.setContentsMargins(32, 16, 28, 16)
         self.action_layout.setSpacing(16)
@@ -907,9 +1018,9 @@ class MainWindow(QMainWindow):
         self.action_layout.addWidget(self.validate_check)
         self.action_layout.addWidget(self.convert_button)
         shell_layout.addWidget(action_bar)
-        shell_layout.addWidget(self.progress)
 
         status_bar = QFrame(objectName="statusBar")
+        self.status_bar = status_bar
         status_layout = QHBoxLayout(status_bar)
         status_layout.setContentsMargins(32, 7, 28, 7)
         self.progress_label = QLabel("选择工程后即可开始", objectName="railCaption")
@@ -998,15 +1109,26 @@ class MainWindow(QMainWindow):
         self.output_button.clicked.connect(self._browse_output)
         self.uv4_button.clicked.connect(self._browse_uv4)
         self.convert_button.clicked.connect(self._start_conversion)
+        self.cancel_button.clicked.connect(self._cancel_conversion)
         self.validate_check.toggled.connect(self._sync_validation_action)
         self.open_output_button.clicked.connect(self._open_output)
-        self.clear_log_button.clicked.connect(self.log_browser.clear)
+        self.clear_log_button.clicked.connect(self._clear_logs)
+        self.log_errors_check.toggled.connect(self._render_logs)
+        self.log_follow_check.toggled.connect(self._follow_logs)
+        self.log_browser.verticalScrollBar().valueChanged.connect(self._log_scroll_changed)
+        self.copy_log_button.clicked.connect(self._copy_logs)
+        self.result_details_button.toggled.connect(self._toggle_result_details)
+        self.result_log_button.clicked.connect(lambda: self._show_page(3))
+        self.result_copy_button.clicked.connect(lambda: QApplication.clipboard().setText(self._result_text))
+        self.result_open_button.clicked.connect(self._open_output)
         self.debug_open_output_button.clicked.connect(self._open_output)
         self.debug_open_vscode_button.clicked.connect(self._open_vscode)
         self.host_combo.currentIndexChanged.connect(self._update_generators)
         self.host_combo.currentIndexChanged.connect(self._sync_backends)
         self.probe_combo.currentIndexChanged.connect(self._sync_backends)
         self.project_edit.textChanged.connect(self._project_path_changed)
+        self.project_edit.textChanged.connect(lambda: self.input_timer.start())
+        self.output_edit.textChanged.connect(lambda: self.input_timer.start())
         self.compiler_combo.currentIndexChanged.connect(self._refresh_inspector)
         self.compiler_combo.currentIndexChanged.connect(self._sync_backends)
         self.vscode_check.toggled.connect(self._refresh_inspector)
@@ -1027,9 +1149,11 @@ class MainWindow(QMainWindow):
         return "转换并验证" if validate_build else "仅转换"
 
     def _sync_validation_action(self, validate_build):
-        self.convert_button.setText(
-            self._conversion_action_text(validate_build)
-        )
+        if not self._busy:
+            self.convert_button.setText(
+                "重新运行" if self._result_state in {"failed", "cancelled"}
+                else self._conversion_action_text(validate_build)
+            )
         self.convert_button.setToolTip(
             "生成 CMake 工程并执行编译验证。"
             if validate_build
@@ -1049,7 +1173,7 @@ class MainWindow(QMainWindow):
         )
         self.convert_button.setFixedWidth(152 if narrow else 174)
         self.shortcut_label.setVisible(not narrow)
-        self.pipeline.setVisible(self.height() >= 600)
+        self.pipeline.setVisible(self.height() >= 650 and not self._busy and not self._result_text)
         for detail in self.stage_details:
             detail.setVisible(False)
         for name in self.stage_names:
@@ -1114,6 +1238,7 @@ class MainWindow(QMainWindow):
     def _select_project(self, file_path):
         self.project_edit.setText(QDir.toNativeSeparators(file_path))
         self._remember_path(self.project_edit, file_path)
+        self._validate_inputs()
 
     @staticmethod
     def _default_output_directory(project_path):
@@ -1124,8 +1249,55 @@ class MainWindow(QMainWindow):
 
     def _project_path_changed(self, project_path):
         output = self._default_output_directory(project_path)
-        self.output_edit.setText(QDir.toNativeSeparators(output))
+        previous = getattr(self, "_automatic_output", "")
+        current = self.output_edit.text().strip()
+        if not current or os.path.normcase(current) == os.path.normcase(previous):
+            self.output_edit.setText(QDir.toNativeSeparators(output))
+        self._automatic_output = QDir.toNativeSeparators(output)
         self._refresh_inspector()
+
+    def _validate_inputs(self, reveal=False):
+        project = self.project_edit.text().strip()
+        output = self.output_edit.text().strip()
+        project_error = ""
+        output_error = ""
+        if not project:
+            project_error = "请选择 Keil 工程文件。" if reveal else ""
+        else:
+            try:
+                path = Path(project)
+                if path.suffix.lower() not in {".uvprojx", ".uvproj"} or not path.is_file():
+                    project_error = "请选择存在的 .uvprojx 或 .uvproj 文件。"
+            except (OSError, ValueError):
+                project_error = "工程文件位置无效。"
+        if not output:
+            output_error = "请选择生成工程的保存目录。" if reveal else ""
+        else:
+            try:
+                path = Path(output)
+                if not path.is_absolute():
+                    output_error = "请选择完整的输出目录。"
+                else:
+                    ancestor = path
+                    while not ancestor.exists() and ancestor != ancestor.parent:
+                        ancestor = ancestor.parent
+                    if not ancestor.is_dir():
+                        output_error = "输出位置或上级位置是文件，请选择目录。"
+                    elif not os.access(ancestor, os.W_OK):
+                        output_error = "输出目录缺少写入权限。"
+            except (OSError, ValueError):
+                output_error = "输出目录无效。"
+        for field, label, error in ((self.project_edit, self.project_error, project_error),
+                                    (self.output_edit, self.output_error, output_error)):
+            label.setText(error)
+            label.setVisible(bool(error))
+            field.setProperty("invalid", bool(error))
+            self._refresh_dynamic_style(field)
+        valid = bool(project and output) and not project_error and not output_error
+        self.convert_button.setEnabled(valid and not self._busy)
+        if not self._busy and not self._result_text:
+            self.progress_label.setText("准备就绪" if valid else "选择有效工程和保存目录后即可开始")
+        return valid
 
     def _browse_output(self):
         directory = QFileDialog.getExistingDirectory(
@@ -1262,17 +1434,70 @@ class MainWindow(QMainWindow):
         self.current_stage = stage_index
 
     def _handle_worker_log(self, message):
-        if "解析 Keil 工程" in message:
-            self._advance_stage(0)
-        elif "目标:" in message:
-            self._advance_stage(1)
-        elif "生成 CMake" in message:
-            self._advance_stage(2)
-        elif "编译验证" in message or "构建验证" in message:
-            self._advance_stage(3)
-            if message.startswith("执行 CMake 配置与编译验证"):
-                self._start_validation_timer()
         self._log(message)
+
+    @Slot(object)
+    def _handle_activity(self, activity):
+        if self._cancel_requested:
+            return
+        titles = {"parse": "正在解析工程", "generate": "正在生成工程", "configure": "正在配置 CMake",
+                  "compile": "正在编译", "link": "正在链接固件", "artifact": "正在检查固件"}
+        title = titles.get(activity.phase, activity.message)
+        self.task_title.setText(title)
+        self.inspector_status.setText(title)
+        self._set_status(title, "running")
+        self._advance_stage({"parse": 1, "generate": 2}.get(activity.phase, 3))
+        if activity.phase == "configure":
+            self._start_validation_timer()
+        if activity.total > 0:
+            current = max(0, min(activity.current, activity.total))
+            percent = round(100 * current / activity.total)
+            self.progress.setRange(0, 100)
+            self.progress.setValue(percent)
+            detail = (f"构建进度 {percent}%" if activity.unit == "percent"
+                      else f"构建任务 {current} / {activity.total} · {percent}%")
+        else:
+            self.progress.setRange(0, 0)
+            detail = activity.message
+        self.task_detail.setText(detail)
+        self.task_detail.setToolTip(detail)
+        self.progress_label.setText(title + " · " + detail)
+
+    def _set_running(self, running):
+        self._busy = running
+        self.action_bar.setVisible(not running)
+        self.status_bar.setVisible(not running and not self._result_text)
+        for widget in (self.project_drop, self.output_edit, self.output_button,
+                       self.uv4_edit, self.uv4_button, self.compiler_combo, self.host_combo,
+                       self.generator_combo, self.target_edit, self.build_dir_edit,
+                       self.probe_combo, self.backend_combo, self.vscode_check, self.validate_check):
+            widget.setEnabled(not running)
+        self.cancel_button.setVisible(running)
+        self.cancel_button.setEnabled(running and not self._cancel_requested)
+        self.convert_button.setEnabled(False)
+        if running:
+            self.convert_button.setText("任务运行中")
+        else:
+            self._sync_validation_action(self.validate_check.isChecked())
+            self._validate_inputs()
+        for button in (self.open_output_button, self.debug_open_output_button, self.result_open_button):
+            button.setEnabled(not running and bool(self._result_output_dir))
+        self.debug_open_vscode_button.setEnabled(
+            not running and bool(self._result_output_dir)
+            and (Path(self._result_output_dir) / ".vscode").is_dir()
+        )
+        self._update_compact_layout()
+
+    def _cancel_conversion(self):
+        if not self._busy or self._cancel_requested or self.worker is None:
+            return
+        self._cancel_requested = True
+        self.worker.cancel()
+        self.cancel_button.setEnabled(False)
+        self.task_title.setText("正在停止任务")
+        self.task_detail.setText("等待当前转换步骤结束或编译进程退出。")
+        self.progress_label.setText("正在停止任务")
+        self._set_status("正在停止", "running")
 
     @staticmethod
     def _format_duration(seconds):
@@ -1302,6 +1527,9 @@ class MainWindow(QMainWindow):
         self.validation_timer.start()
 
     def _refresh_validation_elapsed(self):
+        if self._task_started is not None:
+            elapsed = time.monotonic() - self._task_started
+            self.task_elapsed.setText("耗时 " + self._format_duration(elapsed))
         if self.validation_started is None:
             return
         elapsed = time.monotonic() - self.validation_started
@@ -1319,12 +1547,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int, str)
     def _update_conversion_progress(self, value, message):
-        value = max(0, min(100, value))
-        self.progress.setRange(0, 100)
-        self.progress.setValue(value)
-        self.progress.setFormat(f"{value}% · {message}")
-        self.progress_label.setText(f"{message} · {value}%")
-        self.progress_label.setToolTip(message)
+        self._handle_activity(BuildActivity("compile", message, value, 100, "percent"))
 
     def _options(self):
         return GenerationOptions(
@@ -1339,14 +1562,13 @@ class MainWindow(QMainWindow):
         ).normalized()
 
     def _start_conversion(self):
+        if self._busy or self.worker_thread is not None:
+            return
+        if not self._validate_inputs(reveal=True):
+            self._show_page(0)
+            return
         project_file = self.project_edit.text().strip()
         output_dir = self.output_edit.text().strip()
-        if not project_file or not Path(project_file).is_file():
-            QMessageBox.critical(self, "工程无效", "请选择有效的 Keil 工程文件。")
-            return
-        if not output_dir:
-            QMessageBox.critical(self, "输出目录无效", "请选择输出目录。")
-            return
 
         try:
             options = self._options()
@@ -1357,14 +1579,30 @@ class MainWindow(QMainWindow):
         self._remember_path(self.project_edit, project_file)
         self._remember_path(self.output_edit, output_dir)
         self._save_config()
-        self.convert_button.setEnabled(False)
-        self.project_drop.setEnabled(False)
-        self.validate_check.setEnabled(False)
-        self.open_output_button.setEnabled(False)
+        self._cancel_requested = False
+        self._result_output_dir = ""
+        self._result_text = ""
+        self._result_state = ""
+        self._active_task = {
+            "project": project_file, "output": output_dir, "uv4": self.uv4_edit.text().strip(),
+            "target": self.target_edit.text().strip(), "options": options,
+            "validate": self.validate_check.isChecked(),
+        }
+        self.task_panel.setVisible(True)
+        self.result_actions.setVisible(False)
+        self.result_details_button.setChecked(False)
+        self.result_details.setVisible(False)
+        self.progress.setVisible(True)
+        self.progress.setProperty("state", "running")
+        self._refresh_dynamic_style(self.progress)
+        self._task_started = time.monotonic()
+        self._set_running(True)
         self._set_status("转换中", "running")
         self.inspector_status.setText("正在转换")
         self.validation_timer.stop()
         self.validation_started = None
+        self.validation_timer.start()
+        self._refresh_validation_elapsed()
         self.inspector_validation_time.setText(
             "等待开始" if self.validate_check.isChecked() else "未执行"
         )
@@ -1374,11 +1612,8 @@ class MainWindow(QMainWindow):
         self.flash_bar.setValue(0)
         self.ram_bar.setValue(0)
         self._reset_stages()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setFormat("0% · 准备转换")
-        self.progress_label.setText("准备转换 · 0%")
-        self.log_browser.clear()
+        self._handle_activity(BuildActivity("parse", "准备解析 Keil 工程"))
+        self._clear_logs()
         self._log(f"输入: {project_file}")
         self._log(f"输出: {output_dir}")
         self._log(
@@ -1387,13 +1622,10 @@ class MainWindow(QMainWindow):
         self._log(f"CMake 生成器: {options.generator}")
 
         self.worker_thread = QThread(self)
+        task = self._active_task
         self.worker = ConversionWorker(
-            project_file,
-            output_dir,
-            self.uv4_edit.text().strip(),
-            self.target_edit.text().strip(),
-            options,
-            self.validate_check.isChecked(),
+            task["project"], task["output"], task["uv4"], task["target"],
+            task["options"], task["validate"],
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -1402,6 +1634,9 @@ class MainWindow(QMainWindow):
         self.worker.memory_usage.connect(self._update_memory_usage)
         self.worker.finished.connect(self._conversion_finished)
         self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.cancelled.connect(self._conversion_cancelled)
+        self.worker.cancelled.connect(self.worker_thread.quit)
+        self.worker.activity.connect(self._handle_activity)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.finished.connect(self._release_worker)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
@@ -1412,6 +1647,7 @@ class MainWindow(QMainWindow):
         if self.sender() is self.worker_thread:
             self.worker_thread = None
             self.worker = None
+            self._set_running(False)
 
     @staticmethod
     def _completion_status(success, validation_seconds):
@@ -1424,27 +1660,11 @@ class MainWindow(QMainWindow):
 
     @Slot(bool, str, str, float)
     def _conversion_finished(self, success, message, output_dir, validation_seconds):
-        self._stop_validation_timer(validation_seconds)
-        message = self._with_validation_duration(message, validation_seconds)
-        self.progress.setRange(0, 100)
-        if success:
-            self.progress.setValue(100)
-            self.progress.setFormat("100% · 转换完成")
-        else:
-            self.progress.setFormat(f"{self.progress.value()}% · 转换失败")
-        self.convert_button.setEnabled(True)
-        self.project_drop.setEnabled(True)
-        self.validate_check.setEnabled(True)
-        self.open_output_button.setEnabled(bool(output_dir))
-        self._set_status(
-            "成功" if success else "失败",
-            "success" if success else "failed",
-        )
         inspector_text, validation_completed = self._completion_status(
             success, validation_seconds
         )
-        self.inspector_status.setText(inspector_text)
-        self.progress_label.setText(inspector_text)
+        self._finish_task("success" if success else "failed", inspector_text, message,
+                          output_dir, validation_seconds)
         if success:
             for index in range(len(self.stage_badges)):
                 state = (
@@ -1456,23 +1676,61 @@ class MainWindow(QMainWindow):
                 self._set_stage_state(index, state)
         else:
             self._set_stage_state(self.current_stage, "failed")
-            if self.flash_usage_label.text() == "正在构建":
-                self.flash_usage_label.setText("构建失败")
-                self.ram_usage_label.setText("构建失败")
-        self._log(message)
-        if success:
-            QMessageBox.information(self, "转换完成", message)
-        else:
-            self._show_page(3)
-            QMessageBox.critical(self, "转换失败", message)
+
+    @Slot(str, str, float)
+    def _conversion_cancelled(self, message, output_dir, validation_seconds):
+        self._finish_task("cancelled", "任务取消", message, output_dir, validation_seconds)
+        self._set_stage_state(self.current_stage, "cancelled")
+
+    def _finish_task(self, state, title, message, output_dir, validation_seconds):
+        self._refresh_validation_elapsed()
+        self._stop_validation_timer(validation_seconds)
+        elapsed = time.monotonic() - self._task_started if self._task_started is not None else 0.0
+        self._task_started = None
+        self._result_state = state
+        self._result_output_dir = output_dir
+        self._result_text = self._with_validation_duration(message, validation_seconds)
+        self._result_text += "\n\n总耗时\n" + self._format_duration(elapsed)
+        self.result_details.setPlainText(self._result_text)
+        self.result_copy_button.setText("复制错误" if state == "failed" else "复制结果")
+        self.task_panel.setVisible(True)
+        self.result_actions.setVisible(True)
+        self.cancel_button.setVisible(False)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100 if state == "success" else 0)
+        self.progress.setProperty("state", state)
+        self._refresh_dynamic_style(self.progress)
+        self.task_title.setText(title)
+        lines = [line for line in message.splitlines() if line.strip()]
+        summary = next((line for line in lines if state == "failed" and self._is_error_log(line)
+                        and not line.startswith("构建验证失败")), lines[0] if lines else title)
+        self.task_detail.setText(summary)
+        self.task_detail.setToolTip(message)
+        self.task_elapsed.setText("耗时 " + self._format_duration(elapsed))
+        self._set_status(title, state)
+        self.inspector_status.setText(title)
+        self.progress_label.setText(title)
+        if state != "success":
+            self.flash_usage_label.setText("本次未完成验证")
+            self.ram_usage_label.setText("本次未完成验证")
+        self._log(("错误: " if state == "failed" else "") + message)
+        self._flush_logs()
+        if self.worker_thread is None:
+            self._set_running(False)
+
+    def _toggle_result_details(self, expanded):
+        self.result_details.setVisible(expanded)
+        self.result_details_button.setText("收起详情" if expanded else "展开详情")
 
     def _open_output(self):
-        output = self.output_edit.text().strip()
-        if output:
+        output = self._result_output_dir
+        if output and not self._busy:
             QDesktopServices.openUrl(QUrl.fromLocalFile(output))
 
     def _open_vscode(self):
-        output = Path(self.output_edit.text().strip())
+        if not self._result_output_dir or self._busy:
+            return
+        output = Path(self._result_output_dir)
         vscode_dir = output / ".vscode"
         if vscode_dir.is_dir():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(vscode_dir)))
@@ -1483,8 +1741,66 @@ class MainWindow(QMainWindow):
             "完成转换后可打开输出目录中的 .vscode 配置。",
         )
 
+    @staticmethod
+    def _is_error_log(line):
+        return bool(re.search(r"\berror\b|\bfatal\b|\bfailed\b|undefined reference|错误|失败", line, re.I))
+
     def _log(self, message):
-        self.log_browser.append(message)
+        clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(message))
+        lines = clean.splitlines() or [""]
+        self._log_lines.extend(lines)
+        self._pending_logs.extend(lines)
+        if len(self._pending_logs) > 5000:
+            del self._pending_logs[:-5000]
+        if not self.log_timer.isActive():
+            self.log_timer.start()
+
+    def _flush_logs(self):
+        self.log_timer.stop()
+        pending, self._pending_logs = self._pending_logs, []
+        if self.log_errors_check.isChecked():
+            pending = [line for line in pending if self._is_error_log(line)]
+        if not pending:
+            return
+        bar = self.log_browser.verticalScrollBar()
+        previous = bar.value()
+        self._updating_log = True
+        try:
+            self.log_browser.appendPlainText("\n".join(pending[-5000:]))
+            bar.setValue(bar.maximum() if self.log_follow_check.isChecked() else previous)
+        finally:
+            self._updating_log = False
+
+    def _render_logs(self):
+        self._pending_logs.clear()
+        lines = [line for line in self._log_lines if not self.log_errors_check.isChecked() or self._is_error_log(line)]
+        self._updating_log = True
+        try:
+            self.log_browser.setPlainText("\n".join(lines))
+            if self.log_follow_check.isChecked():
+                self.log_browser.verticalScrollBar().setValue(self.log_browser.verticalScrollBar().maximum())
+        finally:
+            self._updating_log = False
+
+    def _follow_logs(self, enabled):
+        if enabled:
+            self.log_browser.verticalScrollBar().setValue(self.log_browser.verticalScrollBar().maximum())
+
+    def _log_scroll_changed(self, value):
+        if not self._updating_log and value < self.log_browser.verticalScrollBar().maximum():
+            self.log_follow_check.setChecked(False)
+
+    def _copy_logs(self):
+        self._flush_logs()
+        QApplication.clipboard().setText(self.log_browser.toPlainText())
+
+    def _clear_logs(self):
+        self.log_timer.stop()
+        self._pending_logs.clear()
+        self._log_lines.clear()
+        self._updating_log = True
+        self.log_browser.clear()
+        self._updating_log = False
 
     @staticmethod
     def _history_values(value):
@@ -1556,6 +1872,7 @@ class MainWindow(QMainWindow):
         self._update_nav_labels()
         self._update_compact_layout()
         self._refresh_inspector()
+        self._set_running(False)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1603,7 +1920,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._save_config()
         if self.worker_thread and self.worker_thread.isRunning():
-            QMessageBox.information(self, "任务运行中", "转换完成后再关闭窗口。")
+            self.task_detail.setText("任务仍在运行，可先取消任务，再关闭窗口。")
             event.ignore()
             return
         event.accept()

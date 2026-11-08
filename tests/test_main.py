@@ -1,5 +1,6 @@
 import unittest
 import os
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QBoxLayout
 from PySide6.QtCore import QEventLoop, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
-from keil_to_cmake import GenerationOptions
+from keil_to_cmake import BuildActivity, GenerationOptions
 from main import APP_STYLE, CHECKBOX_CHECK_ICON, ConversionWorker, MainWindow, ProjectDropArea
 
 
@@ -399,9 +400,11 @@ class MainWindowInteractionTests(unittest.TestCase):
         self.assertEqual(window.progress_label.text(), "转换完成")
         self.assertTrue(window.open_output_button.isEnabled())
         self.assertEqual(window.stage_badges[-1].property("state"), "pending")
-        with patch("main.QMessageBox.critical"):
+        with patch("main.QMessageBox.critical") as modal:
             window._conversion_finished(False, "编译失败", self.temporary.name, 2)
-        self.assertEqual(window.page_stack.currentIndex(), 3)
+        self.assertEqual(window.page_stack.currentIndex(), 0)
+        self.assertFalse(modal.called)
+        self.assertTrue(window.result_actions.isVisible())
         self.assertEqual(window.progress_label.text(), "构建失败")
 
     def test_finished_worker_releases_thread_before_window_closes(self):
@@ -410,6 +413,7 @@ class MainWindowInteractionTests(unittest.TestCase):
         project.write_text("<Project />", encoding="utf-8")
         window.project_edit.setText(str(project))
         window.validate_check.setChecked(False)
+        window._validate_inputs()
         parser = SimpleNamespace(parse=lambda: True, generate_cmake=lambda *a, **k: True,
                                  target_name="Demo", device_name="STM32F103C8", source_files=[], warnings=[])
         with patch("main.KeilProjectToCMake", return_value=parser), patch("main.QMessageBox.information"):
@@ -422,6 +426,128 @@ class MainWindowInteractionTests(unittest.TestCase):
         self.assertIsNone(window.worker_thread)
         self.assertIsNone(window.worker)
         self.assertTrue(window.close())
+
+    def test_phase_progress_separates_activity_from_build_counts(self):
+        window = self.window
+        window._handle_activity(BuildActivity("configure", "配置 CMake"))
+        self.assertEqual(window.progress.maximum(), 0)
+        window._handle_activity(BuildActivity("compile", "编译", 83, 142))
+        self.assertEqual(window.progress.value(), 58)
+        self.assertIn("83 / 142", window.task_detail.text())
+        window._handle_activity(BuildActivity("compile", "编译", 42, 100, "percent"))
+        self.assertIn("42%", window.task_detail.text())
+        self.assertNotIn("/", window.task_detail.text())
+        window._handle_activity(BuildActivity("link", "链接固件"))
+        self.assertEqual(window.progress.maximum(), 0)
+        self.assertEqual(window.task_title.text(), "正在链接固件")
+
+    def test_input_errors_are_inline_and_manual_output_is_preserved(self):
+        window = self.window
+        window.project_edit.setText(str(Path(self.temporary.name) / "missing.uvprojx"))
+        self.assertFalse(window._validate_inputs())
+        self.assertFalse(window.convert_button.isEnabled())
+        self.assertFalse(window.project_error.isHidden())
+        output = str(Path(self.temporary.name) / "custom")
+        window.output_edit.setText(output)
+        project = Path(self.temporary.name) / "valid.uvprojx"
+        project.touch()
+        window._select_project(str(project))
+        self.assertEqual(window.output_edit.text(), output)
+        self.assertTrue(window.convert_button.isEnabled())
+        blocker = Path(self.temporary.name) / "file.txt"
+        blocker.touch()
+        window.output_edit.setText(str(blocker / "child"))
+        self.assertFalse(window._validate_inputs())
+        self.assertFalse(window.output_error.isHidden())
+
+    def test_completed_output_is_independent_of_next_input(self):
+        window = self.window
+        actual = str(Path(self.temporary.name) / "actual")
+        window._conversion_finished(True, "完成", actual, -1)
+        window.output_edit.setText(str(Path(self.temporary.name) / "next"))
+        with patch("main.QDesktopServices.openUrl") as open_url:
+            window.open_output_button.click()
+        self.assertEqual(Path(open_url.call_args.args[0].toLocalFile()), Path(actual))
+
+    def test_cancel_keeps_settings_locked_until_thread_exits(self):
+        window = self.window
+        project = Path(self.temporary.name) / "cancel.uvprojx"
+        project.touch()
+        window._select_project(str(project))
+        window.validate_check.setChecked(False)
+        release_parse = threading.Event()
+        parser = SimpleNamespace(parse=lambda: release_parse.wait(3))
+        with patch("main.KeilProjectToCMake", return_value=parser):
+            window._start_conversion()
+            thread = window.worker_thread
+            window._start_conversion()
+            self.assertIs(window.worker_thread, thread)
+            for field in (window.output_edit, window.output_button, window.compiler_combo,
+                          window.target_edit, window.probe_combo, window.validate_check):
+                self.assertFalse(field.isEnabled())
+            window.cancel_button.click()
+            self.assertEqual(window.task_title.text(), "正在停止任务")
+            self.assertTrue(window._busy)
+            self.assertFalse(window.cancel_button.isEnabled())
+            loop = QEventLoop()
+            thread.finished.connect(loop.quit)
+            release_parse.set()
+            QTimer.singleShot(4000, loop.quit)
+            loop.exec()
+            self.app.processEvents()
+        self.assertIsNone(window.worker_thread)
+        self.assertFalse(window._busy)
+        self.assertEqual(window.task_title.text(), "任务取消")
+        self.assertEqual(window.convert_button.text(), "重新运行")
+        self.assertTrue(window.compiler_combo.isEnabled())
+        self.assertFalse(window.open_output_button.isEnabled())
+
+    def test_cancel_controls_remain_visible_in_small_window(self):
+        window = self.window
+        window.resize(560, 520)
+        window.task_panel.setVisible(True)
+        window._set_running(True)
+        window._handle_activity(BuildActivity('compile', '编译', 10, 50))
+        self.app.processEvents()
+        self.assertFalse(window.action_bar.isVisible())
+        for widget in (window.cancel_button, window.task_title, window.progress):
+            position = widget.mapTo(window.centralWidget(), QPoint(0, 0))
+            self.assertTrue(window.centralWidget().rect().contains(widget.rect().translated(position)))
+        window._conversion_cancelled('任务取消', '', -1)
+        self.app.processEvents()
+        self.assertTrue(window.action_bar.isVisible())
+        self.assertEqual(window.progress.maximum(), 100)
+
+    def test_log_filter_keeps_plain_text_and_full_history(self):
+        window = self.window
+        window._log('build <main.c>\nerror: missing <sdk.h>\nnext step')
+        window._flush_logs()
+        self.assertIn('<main.c>', window.log_browser.toPlainText())
+        window.log_errors_check.setChecked(True)
+        self.assertEqual(window.log_browser.toPlainText(), 'error: missing <sdk.h>')
+        window._copy_logs()
+        self.assertEqual(self.app.clipboard().text(), 'error: missing <sdk.h>')
+        window.log_errors_check.setChecked(False)
+        self.assertIn('next step', window.log_browser.toPlainText())
+        window._log('\n'.join('line ' + str(i) for i in range(6000)))
+        window._flush_logs()
+        self.assertLessEqual(len(window._log_lines), 5000)
+        self.assertLessEqual(window.log_browser.document().blockCount(), 5000)
+
+    def test_scrolling_up_pauses_log_follow(self):
+        window = self.window
+        window._show_page(3)
+        window._log('\n'.join('line ' + str(i) for i in range(100)))
+        window._flush_logs()
+        self.app.processEvents()
+        bar = window.log_browser.verticalScrollBar()
+        bar.setValue(0)
+        self.assertFalse(window.log_follow_check.isChecked())
+        window._log('new line')
+        window._flush_logs()
+        self.assertEqual(bar.value(), 0)
+        window.log_follow_check.setChecked(True)
+        self.assertEqual(bar.value(), bar.maximum())
 
 
 if __name__ == "__main__":
